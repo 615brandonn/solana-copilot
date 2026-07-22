@@ -124,14 +124,16 @@
 @utility pulse-dot {
   position: relative;
 }
-@utility pulse-dot::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: 9999px;
-  background: currentColor;
-  opacity: 0.6;
-  animation: pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+@utility pulse-dot {
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 9999px;
+    background: currentColor;
+    opacity: 0.6;
+    animation: pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
 }
 
 @keyframes pulse-ring {
