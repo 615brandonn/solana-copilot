@@ -119,7 +119,7 @@ function Dashboard() {
         <footer className="mt-10 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-6 text-[11px] text-muted-foreground">
           <span className="mono">helix · self-hosted · supabase + cloudflare + jito</span>
           <span className="mono">
-            worker endpoint: <span className="text-foreground">{import.meta.env.VITE_WORKER_URL ?? "not configured"}</span>
+            worker endpoint: <span className="text-foreground">{import.meta.env.PUBLIC_WORKER_URL ?? "not configured"}</span>
           </span>
         </footer>
       </div>
