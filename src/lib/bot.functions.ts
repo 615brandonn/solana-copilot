@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
-import type { Database } from "@/integrations/supabase/types";
+import type { Database } from "./supabase-types";
 import type { BotConfig } from "./bot-config";
 
 const userId = () => process.env.HELIX_USER_ID ?? "00000000-0000-0000-0000-000000000000";
