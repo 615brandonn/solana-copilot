@@ -2,8 +2,9 @@ import "dotenv/config";
 import { z } from "zod";
 
 const Env = z.object({
-  SUPABASE_URL: z.string().url(),
-  SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
+  // Your own Supabase backend (renamed to avoid reserved Lovable prefixes)
+  BOT_SUPABASE_URL: z.string().url(),
+  BOT_SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
 
   // Solana infra
   RPC_URL: z.string().url(),                // Helius/Triton mainnet
@@ -22,6 +23,9 @@ const Env = z.object({
 
   // Auth for worker HTTP API called by the dashboard
   WORKER_API_TOKEN: z.string().min(16),
+
+  // Single user this bot instance manages (matches the dashboard user)
+  HELIX_USER_ID: z.string().uuid().default("00000000-0000-0000-0000-000000000000"),
 
   LOG_LEVEL: z.string().default("info"),
 });

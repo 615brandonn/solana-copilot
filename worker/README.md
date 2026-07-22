@@ -20,8 +20,8 @@ bun run dev             # or `npm run dev`
 
 | Name | What it is |
 |------|-----------|
-| `SUPABASE_URL` | Your Supabase project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | Server-only key (never ship to browser) |
+| `BOT_SUPABASE_URL` | Your Supabase project URL |
+| `BOT_SUPABASE_SERVICE_ROLE_KEY` | Server-only key (never ship to browser) |
 | `RPC_URL` | Helius / Triton / QuickNode mainnet endpoint |
 | `YELLOWSTONE_GRPC_URL` | Geyser gRPC endpoint (Helius / Triton / Shyft) |
 | `YELLOWSTONE_TOKEN` | Auth token if your provider requires one |

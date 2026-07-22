@@ -7,9 +7,10 @@ type Props = {
   workerConnected: boolean;
   activePositions: number;
   monitoredWallets: number;
+  syncing?: boolean;
 };
 
-export function StatusHeader({ enabled, onToggle, workerConnected, activePositions, monitoredWallets }: Props) {
+export function StatusHeader({ enabled, onToggle, workerConnected, activePositions, monitoredWallets, syncing }: Props) {
   return (
     <header className="glass-card rounded-2xl px-6 py-5 flex flex-wrap items-center justify-between gap-6">
       <div className="flex items-center gap-4">
@@ -35,6 +36,7 @@ export function StatusHeader({ enabled, onToggle, workerConnected, activePositio
           <span className="text-xs font-medium uppercase tracking-wider">
             {enabled ? "Bot armed" : "Bot idle"}
           </span>
+          {syncing && <span className="text-[10px] text-muted-foreground">syncing…</span>}
           <Switch checked={enabled} onCheckedChange={onToggle} />
         </div>
       </div>

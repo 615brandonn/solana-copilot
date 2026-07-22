@@ -1,7 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { env } from "./env.js";
 
-export const db = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+export const db = createClient(env.BOT_SUPABASE_URL, env.BOT_SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
