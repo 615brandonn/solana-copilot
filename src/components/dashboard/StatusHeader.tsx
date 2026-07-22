@@ -36,6 +36,7 @@ export function StatusHeader({ enabled, onToggle, workerConnected, activePositio
           <span className="text-xs font-medium uppercase tracking-wider">
             {enabled ? "Bot armed" : "Bot idle"}
           </span>
+          {syncing && <span className="text-[10px] text-muted-foreground">syncing…</span>}
           <Switch checked={enabled} onCheckedChange={onToggle} />
         </div>
       </div>
