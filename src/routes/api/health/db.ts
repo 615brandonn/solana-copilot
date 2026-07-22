@@ -22,7 +22,7 @@ export const Route = createFileRoute("/api/health/db")({
           const db = createClient<Database>(url, key, {
             auth: { persistSession: false, autoRefreshToken: false },
           });
-          const { error } = await db.from("bot_config").select("id", { count: "exact", head: true });
+          const { count, error } = await db.from("bot_config").select("*", { count: "exact", head: true });
           if (error) {
             return Response.json({
               ok: false,
@@ -31,7 +31,7 @@ export const Route = createFileRoute("/api/health/db")({
               hint: "Check that schema.sql was run and the service role key is correct.",
             });
           }
-          return Response.json({ ok: true, message: "Connected to Supabase" });
+          return Response.json({ ok: true, message: "Connected to Supabase", rowCount: count });
         } catch (e: any) {
           return Response.json({ ok: false, error: e.message });
         }
