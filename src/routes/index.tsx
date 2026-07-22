@@ -57,7 +57,9 @@ function Dashboard() {
         await saveBotConfig({ data: cfg });
         toast.success("Settings synced to Supabase");
       } catch (e) {
-        toast.error("Could not sync to Supabase. Check your server env vars.");
+        const msg = e instanceof Error ? e.message : "Unknown error";
+        console.error("Supabase sync failed:", msg);
+        toast.error(`Could not sync: ${msg}`);
       } finally {
         setSyncing(false);
       }
