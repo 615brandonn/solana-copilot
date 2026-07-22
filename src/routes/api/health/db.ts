@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { createClient } from "@supabase/supabase-js";
 import type { Database } from "@/lib/supabase-types";
+import { normalizeSupabaseUrl } from "@/lib/supabase-url";
 
 export const Route = createFileRoute("/api/health/db")({
   server: {
@@ -19,7 +20,7 @@ export const Route = createFileRoute("/api/health/db")({
         }
 
         try {
-          const db = createClient<Database>(url, key, {
+          const db = createClient<Database>(normalizeSupabaseUrl(url), key, {
             auth: { persistSession: false, autoRefreshToken: false },
           });
           const { count, error } = await db.from("bot_config").select("*", { count: "exact", head: true });
