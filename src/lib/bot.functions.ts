@@ -7,10 +7,21 @@ import { normalizeSupabaseUrl } from "./supabase-url";
 
 const userId = () => process.env.HELIX_USER_ID ?? "00000000-0000-0000-0000-000000000000";
 
+function serviceRoleKey(): string {
+  const key = process.env.SERVER_SUPABASE_SERVICE_ROLE_KEY ?? "";
+  // Catch the common mistake of pasting the publishable/anon key into the service role field.
+  if (key.startsWith("sb_publishable_")) {
+    throw new Error(
+      "SERVER_SUPABASE_SERVICE_ROLE_KEY is the publishable (anon) key. In Supabase, copy the Secret key (service role) instead.",
+    );
+  }
+  return key;
+}
+
 function adminClient() {
   return createClient<Database>(
     normalizeSupabaseUrl(process.env.SERVER_SUPABASE_URL!),
-    process.env.SERVER_SUPABASE_SERVICE_ROLE_KEY!,
+    serviceRoleKey(),
     {
       auth: { persistSession: false, autoRefreshToken: false },
     },

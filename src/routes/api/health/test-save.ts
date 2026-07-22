@@ -40,12 +40,12 @@ export const Route = createFileRoute("/api/health/test-save")({
             stop_loss_pct: 30,
             proportional_follower_sells: true,
           };
-          const { data, error } = await db.from("bot_config").insert(row as any).select("id");
+          const { data, error } = await db.from("bot_config").upsert(row as any, { onConflict: "user_id" } as any).select("id");
 
           if (error) {
             return Response.json({ ok: false, error: error.message, code: error.code, details: error });
           }
-          return Response.json({ ok: true, message: "Insert worked", data });
+          return Response.json({ ok: true, message: "Upsert worked", data });
         } catch (e: any) {
           return Response.json({ ok: false, error: e.message, stack: e.stack });
         }
