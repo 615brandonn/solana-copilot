@@ -12,4 +12,8 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  vite: {
+    // Expose both VITE_* and PUBLIC_* env vars to the browser bundle.
+    envPrefix: ["VITE_", "PUBLIC_"],
+  },
 });
