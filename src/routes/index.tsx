@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { toast, Toaster } from "sonner";
 
 import { DEFAULT_CONFIG, loadConfig, saveConfig, type BotConfig } from "@/lib/bot-config";
+import { getBotConfig, saveBotConfig } from "@/lib/bot.functions";
 import { StatusHeader } from "@/components/dashboard/StatusHeader";
 import { WalletPanel } from "@/components/dashboard/WalletPanel";
 import { SettingsPanel } from "@/components/dashboard/SettingsPanel";
@@ -18,21 +19,50 @@ export const Route = createFileRoute("/")({
       { property: "og:description", content: "Sub-second Solana copy trading with follower-wallet monitoring." },
     ],
   }),
+  loader: async () => {
+    try {
+      const remote = await getBotConfig();
+      return { remote: remote ?? DEFAULT_CONFIG };
+    } catch {
+      return { remote: DEFAULT_CONFIG };
+    }
+  },
   component: Dashboard,
+  errorComponent: () => <div className="p-8 text-center">Failed to load bot config. Refresh to retry.</div>,
+  notFoundComponent: () => <div className="p-8 text-center">Dashboard not found.</div>,
 });
 
 function Dashboard() {
-  const [cfg, setCfg] = useState<BotConfig>(DEFAULT_CONFIG);
+  const { remote } = Route.useLoaderData();
+  const [cfg, setCfg] = useState<BotConfig>(remote);
   const [hydrated, setHydrated] = useState(false);
   const [keySaved, setKeySaved] = useState(false);
+  const [syncing, setSyncing] = useState(false);
 
   useEffect(() => {
-    setCfg(loadConfig());
+    // Merge local settings with remote (local wins for in-memory preferences).
+    const local = loadConfig();
+    setCfg((r) => ({ ...r, ...local }));
     setHydrated(true);
   }, []);
 
   useEffect(() => {
-    if (hydrated) saveConfig(cfg);
+    if (!hydrated) return;
+    // Persist non-sensitive settings locally for fast startup.
+    saveConfig(cfg);
+    // Sync to your own Supabase.
+    const timeout = setTimeout(async () => {
+      setSyncing(true);
+      try {
+        await saveBotConfig({ data: cfg });
+        toast.success("Settings synced to Supabase");
+      } catch (e) {
+        toast.error("Could not sync to Supabase. Check your server env vars.");
+      } finally {
+        setSyncing(false);
+      }
+    }, 600);
+    return () => clearTimeout(timeout);
   }, [cfg, hydrated]);
 
   const update = (patch: Partial<BotConfig>) => setCfg((c) => ({ ...c, ...patch }));
@@ -65,6 +95,7 @@ function Dashboard() {
           workerConnected={hydrated}
           activePositions={cfg.enabled ? 2 : 0}
           monitoredWallets={monitored}
+          syncing={syncing}
         />
 
         <main className="mt-8 grid gap-6 lg:grid-cols-3">
