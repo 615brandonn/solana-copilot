@@ -10,12 +10,18 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ApiHealthUrlCheckRouteImport } from './routes/api/health/url-check'
 import { Route as ApiHealthTestSaveRouteImport } from './routes/api/health/test-save'
 import { Route as ApiHealthDbRouteImport } from './routes/api/health/db'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiHealthUrlCheckRoute = ApiHealthUrlCheckRouteImport.update({
+  id: '/api/health/url-check',
+  path: '/api/health/url-check',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiHealthTestSaveRoute = ApiHealthTestSaveRouteImport.update({
@@ -33,30 +39,43 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/health/db': typeof ApiHealthDbRoute
   '/api/health/test-save': typeof ApiHealthTestSaveRoute
+  '/api/health/url-check': typeof ApiHealthUrlCheckRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/health/db': typeof ApiHealthDbRoute
   '/api/health/test-save': typeof ApiHealthTestSaveRoute
+  '/api/health/url-check': typeof ApiHealthUrlCheckRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/health/db': typeof ApiHealthDbRoute
   '/api/health/test-save': typeof ApiHealthTestSaveRoute
+  '/api/health/url-check': typeof ApiHealthUrlCheckRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/health/db' | '/api/health/test-save'
+  fullPaths:
+    | '/'
+    | '/api/health/db'
+    | '/api/health/test-save'
+    | '/api/health/url-check'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/health/db' | '/api/health/test-save'
-  id: '__root__' | '/' | '/api/health/db' | '/api/health/test-save'
+  to: '/' | '/api/health/db' | '/api/health/test-save' | '/api/health/url-check'
+  id:
+    | '__root__'
+    | '/'
+    | '/api/health/db'
+    | '/api/health/test-save'
+    | '/api/health/url-check'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiHealthDbRoute: typeof ApiHealthDbRoute
   ApiHealthTestSaveRoute: typeof ApiHealthTestSaveRoute
+  ApiHealthUrlCheckRoute: typeof ApiHealthUrlCheckRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -66,6 +85,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/health/url-check': {
+      id: '/api/health/url-check'
+      path: '/api/health/url-check'
+      fullPath: '/api/health/url-check'
+      preLoaderRoute: typeof ApiHealthUrlCheckRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/health/test-save': {
@@ -89,7 +115,18 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiHealthDbRoute: ApiHealthDbRoute,
   ApiHealthTestSaveRoute: ApiHealthTestSaveRoute,
+  ApiHealthUrlCheckRoute: ApiHealthUrlCheckRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
+
+import type { getRouter } from './router.tsx'
+import type { startInstance } from './start.ts'
+declare module '@tanstack/react-start' {
+  interface Register {
+    ssr: true
+    router: Awaited<ReturnType<typeof getRouter>>
+    config: Awaited<ReturnType<typeof startInstance.getOptions>>
+  }
+}
