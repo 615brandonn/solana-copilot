@@ -109,7 +109,7 @@ export const saveBotConfig = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const db = adminClient();
     const row = configToRow(data as BotConfig);
-    const { error } = await db.from("bot_config").upsert(row, { onConflict: "user_id" });
+    const { error } = await db.from("bot_config").upsert(row as any, { onConflict: "user_id" });
     if (error) throw new Error(error.message);
     return { ok: true };
   });
