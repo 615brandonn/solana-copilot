@@ -3,12 +3,13 @@ import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { Database } from "./supabase-types";
 import type { BotConfig } from "./bot-config";
+import { normalizeSupabaseUrl } from "./supabase-url";
 
 const userId = () => process.env.HELIX_USER_ID ?? "00000000-0000-0000-0000-000000000000";
 
 function adminClient() {
   return createClient<Database>(
-    process.env.SERVER_SUPABASE_URL!,
+    normalizeSupabaseUrl(process.env.SERVER_SUPABASE_URL!),
     process.env.SERVER_SUPABASE_SERVICE_ROLE_KEY!,
     {
       auth: { persistSession: false, autoRefreshToken: false },
