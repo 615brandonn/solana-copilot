@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiHealthUrlCheckRouteImport } from './routes/api/health/url-check'
 import { Route as ApiHealthTestSaveRouteImport } from './routes/api/health/test-save'
+import { Route as ApiHealthKeyRoleRouteImport } from './routes/api/health/key-role'
 import { Route as ApiHealthDbRouteImport } from './routes/api/health/db'
 
 const IndexRoute = IndexRouteImport.update({
@@ -29,6 +30,11 @@ const ApiHealthTestSaveRoute = ApiHealthTestSaveRouteImport.update({
   path: '/api/health/test-save',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiHealthKeyRoleRoute = ApiHealthKeyRoleRouteImport.update({
+  id: '/api/health/key-role',
+  path: '/api/health/key-role',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiHealthDbRoute = ApiHealthDbRouteImport.update({
   id: '/api/health/db',
   path: '/api/health/db',
@@ -38,12 +44,14 @@ const ApiHealthDbRoute = ApiHealthDbRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/health/db': typeof ApiHealthDbRoute
+  '/api/health/key-role': typeof ApiHealthKeyRoleRoute
   '/api/health/test-save': typeof ApiHealthTestSaveRoute
   '/api/health/url-check': typeof ApiHealthUrlCheckRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/health/db': typeof ApiHealthDbRoute
+  '/api/health/key-role': typeof ApiHealthKeyRoleRoute
   '/api/health/test-save': typeof ApiHealthTestSaveRoute
   '/api/health/url-check': typeof ApiHealthUrlCheckRoute
 }
@@ -51,6 +59,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/health/db': typeof ApiHealthDbRoute
+  '/api/health/key-role': typeof ApiHealthKeyRoleRoute
   '/api/health/test-save': typeof ApiHealthTestSaveRoute
   '/api/health/url-check': typeof ApiHealthUrlCheckRoute
 }
@@ -59,14 +68,21 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/api/health/db'
+    | '/api/health/key-role'
     | '/api/health/test-save'
     | '/api/health/url-check'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/health/db' | '/api/health/test-save' | '/api/health/url-check'
+  to:
+    | '/'
+    | '/api/health/db'
+    | '/api/health/key-role'
+    | '/api/health/test-save'
+    | '/api/health/url-check'
   id:
     | '__root__'
     | '/'
     | '/api/health/db'
+    | '/api/health/key-role'
     | '/api/health/test-save'
     | '/api/health/url-check'
   fileRoutesById: FileRoutesById
@@ -74,6 +90,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiHealthDbRoute: typeof ApiHealthDbRoute
+  ApiHealthKeyRoleRoute: typeof ApiHealthKeyRoleRoute
   ApiHealthTestSaveRoute: typeof ApiHealthTestSaveRoute
   ApiHealthUrlCheckRoute: typeof ApiHealthUrlCheckRoute
 }
@@ -101,6 +118,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiHealthTestSaveRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/health/key-role': {
+      id: '/api/health/key-role'
+      path: '/api/health/key-role'
+      fullPath: '/api/health/key-role'
+      preLoaderRoute: typeof ApiHealthKeyRoleRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/health/db': {
       id: '/api/health/db'
       path: '/api/health/db'
@@ -114,6 +138,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiHealthDbRoute: ApiHealthDbRoute,
+  ApiHealthKeyRoleRoute: ApiHealthKeyRoleRoute,
   ApiHealthTestSaveRoute: ApiHealthTestSaveRoute,
   ApiHealthUrlCheckRoute: ApiHealthUrlCheckRoute,
 }
