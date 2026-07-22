@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { createClient } from "@supabase/supabase-js";
+import { normalizeSupabaseUrl } from "@/lib/supabase-url";
 
 export const Route = createFileRoute("/api/health/test-save")({
   server: {
@@ -12,7 +13,7 @@ export const Route = createFileRoute("/api/health/test-save")({
         }
 
         try {
-          const db = createClient(url, key, {
+          const db = createClient(normalizeSupabaseUrl(url), key, {
             auth: { persistSession: false, autoRefreshToken: false },
           });
           const userId = process.env.HELIX_USER_ID ?? "00000000-0000-0000-0000-000000000000";
