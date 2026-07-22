@@ -109,9 +109,17 @@ export const saveBotConfig = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const db = adminClient();
     const row = configToRow(data as BotConfig);
-    const { error } = await db.from("bot_config").upsert(row as any, { onConflict: "user_id" });
-    if (error) throw new Error(error.message);
-    return { ok: true };
+    try {
+      const { error } = await db.from("bot_config").upsert(row as any, { onConflict: "user_id" });
+      if (error) {
+        console.error("[saveBotConfig] Supabase error", error);
+        throw new Error(`Supabase: ${error.message} (${error.code ?? "no code"})`);
+      }
+      return { ok: true };
+    } catch (e: any) {
+      console.error("[saveBotConfig] exception", e);
+      throw new Error(e.message ?? "Unknown save error");
+    }
   });
 
 export const getTrades = createServerFn({ method: "GET" }).handler(async () => {

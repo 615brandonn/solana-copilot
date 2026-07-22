@@ -10,17 +10,11 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as ApiHealthTestSaveRouteImport } from './routes/api/health/test-save'
 import { Route as ApiHealthDbRouteImport } from './routes/api/health/db'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ApiHealthTestSaveRoute = ApiHealthTestSaveRouteImport.update({
-  id: '/api/health/test-save',
-  path: '/api/health/test-save',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiHealthDbRoute = ApiHealthDbRouteImport.update({
@@ -32,31 +26,27 @@ const ApiHealthDbRoute = ApiHealthDbRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/health/db': typeof ApiHealthDbRoute
-  '/api/health/test-save': typeof ApiHealthTestSaveRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/health/db': typeof ApiHealthDbRoute
-  '/api/health/test-save': typeof ApiHealthTestSaveRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/health/db': typeof ApiHealthDbRoute
-  '/api/health/test-save': typeof ApiHealthTestSaveRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/health/db' | '/api/health/test-save'
+  fullPaths: '/' | '/api/health/db'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/health/db' | '/api/health/test-save'
-  id: '__root__' | '/' | '/api/health/db' | '/api/health/test-save'
+  to: '/' | '/api/health/db'
+  id: '__root__' | '/' | '/api/health/db'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiHealthDbRoute: typeof ApiHealthDbRoute
-  ApiHealthTestSaveRoute: typeof ApiHealthTestSaveRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -66,13 +56,6 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/api/health/test-save': {
-      id: '/api/health/test-save'
-      path: '/api/health/test-save'
-      fullPath: '/api/health/test-save'
-      preLoaderRoute: typeof ApiHealthTestSaveRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/health/db': {
@@ -88,7 +71,6 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiHealthDbRoute: ApiHealthDbRoute,
-  ApiHealthTestSaveRoute: ApiHealthTestSaveRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
