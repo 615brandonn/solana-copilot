@@ -24,7 +24,7 @@ export type ExecuteInput = {
   jitoTipSol: number;
 };
 
-export type ExecuteResult = { txSig: string; latencyMs: number; route: "jito" | "rpc" };
+export type ExecuteResult = { txSig: string; latencyMs: number; route: "jito" | "rpc"; outUiAmount?: number };
 
 export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   const t0 = Date.now();
