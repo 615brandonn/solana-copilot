@@ -174,45 +174,100 @@ export class GeyserFeed {
   private async handleMessage(msg: any) {
     const tx = msg?.transaction?.transaction;
     if (!tx) return;
-
-    const event = this.decodeSwapEvent(msg, tx);
-    if (event) await this.onSwap(event);
+    const events = this.decodeEvents(msg, tx);
+    for (const ev of events) await this.onSwap(ev);
   }
 
-  private decodeSwapEvent(msg: any, tx: any): SwapEvent | null {
+  private decodeEvents(msg: any, tx: any): FeedEvent[] {
+    const out: FeedEvent[] = [];
     const slot: number = Number(msg.transaction.slot ?? 0);
     const meta = tx.meta ?? tx.transaction?.meta ?? msg.transaction.meta;
-    const message = tx.transaction?.message ?? tx.message;
-    const accountKeys = this.decodeAccountKeys(message?.accountKeys ?? []);
     const txSig = this.decodeSignature(tx.signature ?? tx.transaction?.signatures?.[0]);
 
-    for (const wallet of this.watched) {
-      const tokenDelta = this.findLargestTokenDelta(meta, wallet);
-      if (!tokenDelta || tokenDelta.mint === WSOL_MINT) continue;
-
-      const walletIndex = accountKeys.indexOf(wallet);
-      const solDeltaLamports = walletIndex >= 0
-        ? Number(meta?.postBalances?.[walletIndex] ?? 0) - Number(meta?.preBalances?.[walletIndex] ?? 0)
-        : 0;
-
-      const side = tokenDelta.delta > 0 ? "buy" : "sell";
-      if (side === "buy" && tokenDelta.delta <= 0) continue;
-      if (side === "sell" && tokenDelta.delta >= 0) continue;
-
-      return {
-        wallet,
-        side,
-        tokenMint: tokenDelta.mint,
-        amountTokens: Math.abs(tokenDelta.delta),
-        amountUsd: undefined,
-        slot,
-        txSig,
-        timestampMs: Date.now(),
-        isPumpFun: tokenDelta.mint.endsWith("pump"),
-      };
+    // Build per-(owner,mint) delta table across the whole tx.
+    const table = this.buildOwnerMintDeltas(meta);
+    // For fast lookup: mint -> [{owner, pre, post, decimals}]
+    const byMint = new Map<string, Array<{ owner: string; pre: number; post: number; decimals: number }>>();
+    for (const row of table) {
+      const list = byMint.get(row.mint) ?? [];
+      list.push(row);
+      byMint.set(row.mint, list);
     }
 
-    return null;
+    for (const wallet of this.watched) {
+      // Consider each mint the wallet is involved in
+      const walletRows = table.filter((r) => r.owner === wallet);
+      for (const row of walletRows) {
+        if (row.mint === WSOL_MINT) continue;
+        const delta = row.post - row.pre;
+        if (Math.abs(delta) < 1e-12) continue;
+
+        // Is this a transfer? Look for a counterparty on the same mint with opposite-sign delta of ~equal magnitude.
+        const peers = (byMint.get(row.mint) ?? []).filter((p) => p.owner !== wallet);
+        const transferPeer = peers.find((p) => {
+          const pd = p.post - p.pre;
+          return Math.sign(pd) === -Math.sign(delta) && Math.abs(pd + delta) / Math.max(Math.abs(delta), 1e-9) < 0.02;
+        });
+
+        if (transferPeer && delta < 0) {
+          // Target sent tokens to a peer wallet.
+          out.push({
+            kind: "transfer",
+            from: wallet,
+            to: transferPeer.owner,
+            tokenMint: row.mint,
+            amountTokens: Math.abs(delta),
+            decimals: row.decimals,
+            slot,
+            txSig,
+            timestampMs: Date.now(),
+          });
+          continue;
+        }
+
+        // Otherwise treat as swap (buy or sell). Skip pure incoming transfers we don't own the sender for.
+        if (transferPeer && delta > 0 && !this.watched.has(transferPeer.owner)) {
+          // We're the recipient of an unrelated transfer — ignore as swap.
+          continue;
+        }
+
+        const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
+        out.push({
+          kind: "swap",
+          wallet,
+          side,
+          tokenMint: row.mint,
+          amountTokens: Math.abs(delta),
+          decimals: row.decimals,
+          amountUsd: undefined,
+          slot,
+          txSig,
+          timestampMs: Date.now(),
+          isPumpFun: row.mint.endsWith("pump"),
+        });
+      }
+    }
+
+    return out;
+  }
+
+  private buildOwnerMintDeltas(meta: any): Array<{ owner: string; mint: string; pre: number; post: number; decimals: number }> {
+    const key = (owner: string, mint: string) => `${owner}::${mint}`;
+    const m = new Map<string, { owner: string; mint: string; pre: number; post: number; decimals: number }>();
+    const ingest = (balances: any[], field: "pre" | "post") => {
+      for (const b of balances ?? []) {
+        if (!b?.owner || !b?.mint) continue;
+        const k = key(b.owner, b.mint);
+        const row = m.get(k) ?? { owner: b.owner, mint: b.mint, pre: 0, post: 0, decimals: Number(b.uiTokenAmount?.decimals ?? 0) };
+        const amt = Number(b.uiTokenAmount?.uiAmountString ?? b.uiTokenAmount?.uiAmount ?? 0);
+        row[field] += amt;
+        row.decimals = Number(b.uiTokenAmount?.decimals ?? row.decimals);
+        m.set(k, row);
+      }
+    };
+    ingest(meta?.preTokenBalances ?? [], "pre");
+    ingest(meta?.postTokenBalances ?? [], "post");
+    return Array.from(m.values());
   }
 
   private decodeAccountKeys(keys: unknown[]): string[] {
@@ -231,27 +286,5 @@ export class GeyserFeed {
     if (Array.isArray(sig)) return bs58.encode(Buffer.from(sig));
     return "";
   }
-
-  private findLargestTokenDelta(meta: any, owner: string): { mint: string; delta: number } | null {
-    const balances = new Map<string, { pre: number; post: number }>();
-    for (const balance of meta?.preTokenBalances ?? []) {
-      if (balance.owner !== owner || !balance.mint) continue;
-      const row = balances.get(balance.mint) ?? { pre: 0, post: 0 };
-      row.pre += Number(balance.uiTokenAmount?.uiAmountString ?? balance.uiTokenAmount?.uiAmount ?? 0);
-      balances.set(balance.mint, row);
-    }
-    for (const balance of meta?.postTokenBalances ?? []) {
-      if (balance.owner !== owner || !balance.mint) continue;
-      const row = balances.get(balance.mint) ?? { pre: 0, post: 0 };
-      row.post += Number(balance.uiTokenAmount?.uiAmountString ?? balance.uiTokenAmount?.uiAmount ?? 0);
-      balances.set(balance.mint, row);
-    }
-
-    let largest: { mint: string; delta: number } | null = null;
-    for (const [mint, row] of balances) {
-      const delta = row.post - row.pre;
-      if (!largest || Math.abs(delta) > Math.abs(largest.delta)) largest = { mint, delta };
-    }
-    return largest && Math.abs(largest.delta) > 0 ? largest : null;
-  }
 }
+
