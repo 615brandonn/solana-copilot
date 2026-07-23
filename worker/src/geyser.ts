@@ -2,13 +2,18 @@
 // We subscribe to transactions that include the target wallet OR any active
 // follower wallet, decode swap instructions, and hand each event to the executor.
 
-import Client, { CommitmentLevel, SubscribeRequest } from "@triton-one/yellowstone-grpc";
+import YellowstoneClient, { CommitmentLevel, type SubscribeRequest } from "@triton-one/yellowstone-grpc";
 import bs58 from "bs58";
 import pino from "pino";
 import { env } from "./env.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
+const ClientCtor = (
+  typeof YellowstoneClient === "function"
+    ? YellowstoneClient
+    : ((YellowstoneClient as unknown as { default?: typeof YellowstoneClient }).default ?? YellowstoneClient)
+) as typeof YellowstoneClient;
 
 export type SwapEvent = {
   wallet: string;
@@ -25,16 +30,16 @@ export type SwapEvent = {
 export type OnSwap = (e: SwapEvent) => Promise<void> | void;
 
 export class GeyserFeed {
-  private client: Client;
+  private client: InstanceType<typeof YellowstoneClient>;
   private watched = new Set<string>();
-  private stream?: Awaited<ReturnType<Client["subscribe"]>>;
+  private stream?: Awaited<ReturnType<InstanceType<typeof YellowstoneClient>["subscribe"]>>;
   private onSwap: OnSwap;
   private reconnectTimer?: NodeJS.Timeout;
   private reconnecting = false;
   private stopped = false;
 
   constructor(onSwap: OnSwap) {
-    this.client = new Client(env.YELLOWSTONE_GRPC_URL, env.YELLOWSTONE_TOKEN, {
+    this.client = new ClientCtor(env.YELLOWSTONE_GRPC_URL, env.YELLOWSTONE_TOKEN, {
       grpcMaxDecodingMessageSize: 64 * 1024 * 1024,
     });
     this.onSwap = onSwap;
