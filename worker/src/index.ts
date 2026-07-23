@@ -25,12 +25,25 @@ const log = pino({ level: env.LOG_LEVEL });
 async function loadConfig(userId: string): Promise<BotConfigRow | null> {
   const byUser = await db.from("bot_config").select("*").eq("user_id", userId).maybeSingle();
   if (byUser.error) log.error({ err: byUser.error }, "bot_config query error (by user_id)");
-  if (byUser.data) return byUser.data as BotConfigRow;
-  const any = await db.from("bot_config").select("*").limit(1);
+  if (byUser.data?.target_wallet) return byUser.data as BotConfigRow;
+
+  // Single-user deploy safety: if HELIX_USER_ID is wrong, or an older blank row
+  // exists, prefer the newest row that actually has a target wallet configured.
+  const any = await db
+    .from("bot_config")
+    .select("*")
+    .not("target_wallet", "is", null)
+    .neq("target_wallet", "")
+    .order("updated_at", { ascending: false })
+    .limit(1);
   if (any.error) log.error({ err: any.error }, "bot_config query error (fallback)");
   const row = any.data?.[0];
   if (row) log.info({ found_user_id: row.user_id, target: row.target_wallet }, "using fallback bot_config row");
   return (row as BotConfigRow) ?? null;
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function loadSigner(userId: string): Promise<string | null> {
@@ -70,10 +83,25 @@ async function main() {
 
   const feed = new GeyserFeed(async (event) => handle(event));
   const monitor = new FollowerMonitor(feed);
-  await feed.start([cfg.target_wallet!]);
+  while (true) {
+    try {
+      await feed.start([cfg.target_wallet!]);
+      break;
+    } catch (err) {
+      log.error({ err }, "geyser start failed — retrying in 2s");
+      await delay(2000);
+    }
+  }
 
   // Poll config every 3s — cheap and simple. Swap for Supabase Realtime later.
-  setInterval(async () => { cfg = (await loadConfig(ACTIVE_USER_ID)) ?? cfg; }, 3000);
+  setInterval(async () => {
+    try {
+      const next = await loadConfig(ACTIVE_USER_ID);
+      if (next?.target_wallet) cfg = next;
+    } catch (err) {
+      log.error({ err }, "config refresh failed — keeping last good config");
+    }
+  }, 3000);
 
   async function handle(event: SwapEvent) {
     if (!cfg) return;
@@ -147,4 +175,7 @@ async function main() {
   }
 }
 
-main().catch((e) => { log.error(e); process.exit(1); });
+process.on("unhandledRejection", (err) => log.error({ err }, "unhandled rejection"));
+process.on("uncaughtException", (err) => log.error({ err }, "uncaught exception"));
+
+main().catch((e) => { log.error(e, "worker crashed before startup completed"); process.exit(1); });
