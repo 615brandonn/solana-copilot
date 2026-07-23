@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx src/index.ts",
+    "watch": "tsx watch src/index.ts",
     "start": "node --loader tsx dist/index.js",
     "build": "tsc -p tsconfig.json"
   },

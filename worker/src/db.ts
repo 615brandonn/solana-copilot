@@ -1,8 +1,27 @@
 import { createClient } from "@supabase/supabase-js";
+import { fetch, WebSocket } from "undici";
 import { env } from "./env.js";
 
 export const db = createClient(env.BOT_SUPABASE_URL, env.BOT_SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
+  realtime: { transport: WebSocket as unknown as typeof globalThis.WebSocket },
+  global: {
+    fetch: (input, init) => {
+      const headers = new Headers(init?.headers);
+      headers.set("apikey", env.BOT_SUPABASE_SERVICE_ROLE_KEY);
+
+      // New-format sb_secret_* keys are opaque, not JWTs. PostgREST accepts
+      // them as apikey, but not as an Authorization bearer token.
+      if (
+        env.BOT_SUPABASE_SERVICE_ROLE_KEY.startsWith("sb_") &&
+        headers.get("Authorization") === `Bearer ${env.BOT_SUPABASE_SERVICE_ROLE_KEY}`
+      ) {
+        headers.delete("Authorization");
+      }
+
+      return fetch(input, { ...init, headers });
+    },
+  },
 });
 
 export type BotConfigRow = {
