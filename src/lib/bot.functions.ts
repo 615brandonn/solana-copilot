@@ -159,3 +159,36 @@ export const getPositions = createServerFn({ method: "GET" }).handler(async () =
   if (error) throw new Error(error.message);
   return data ?? [];
 });
+
+export const getFollowers = createServerFn({ method: "GET" }).handler(async () => {
+  const db = adminClient();
+  const { data: positions, error: posErr } = await db
+    .from("positions")
+    .select("id, token_mint")
+    .eq("user_id", userId())
+    .is("closed_at", null);
+  if (posErr) throw new Error(posErr.message);
+  if (!positions || positions.length === 0) return [];
+
+  const posIds = positions.map((p) => p.id);
+  const mintByPos = new Map(positions.map((p) => [p.id, p.token_mint]));
+
+  const { data: fws, error: fwErr } = await db
+    .from("follower_wallets")
+    .select("wallet, position_id, initial_amount, current_amount, last_updated")
+    .in("position_id", posIds)
+    .order("last_updated", { ascending: false });
+  if (fwErr) throw new Error(fwErr.message);
+
+  return (fws ?? []).map((f) => {
+    const initial = Number(f.initial_amount) || 0;
+    const current = Number(f.current_amount) || 0;
+    const heldPct = initial > 0 ? Math.max(0, Math.min(100, (current / initial) * 100)) : 0;
+    return {
+      wallet: f.wallet,
+      token_mint: mintByPos.get(f.position_id) ?? "",
+      held_pct: heldPct,
+      last_updated: f.last_updated,
+    };
+  });
+});
