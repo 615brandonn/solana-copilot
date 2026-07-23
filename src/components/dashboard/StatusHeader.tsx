@@ -28,7 +28,7 @@ export function StatusHeader({ enabled, onToggle, workerConnected, activePositio
           <p className="text-xs text-muted-foreground">Sub-second copy trading · follower propagation exits</p>
         </div>
         <div
-          className={`ml-2 hidden md:flex items-center gap-2 rounded-lg border px-3 py-1.5 ${
+          className={`ml-2 flex items-center gap-2 rounded-lg border px-3 py-1.5 ${
             ready
               ? "border-success/40 bg-success/10 text-success"
               : "border-border bg-muted/40 text-muted-foreground"
