@@ -3,7 +3,8 @@ import { useEffect, useMemo, useState } from "react";
 import { toast, Toaster } from "sonner";
 
 import { DEFAULT_CONFIG, loadConfig, saveConfig, type BotConfig } from "@/lib/bot-config";
-import { getBotConfig, saveBotConfig } from "@/lib/bot.functions";
+import { getBotConfig, saveBotConfig, getPositions, getFollowers } from "@/lib/bot.functions";
+import { useQuery } from "@tanstack/react-query";
 import { StatusHeader } from "@/components/dashboard/StatusHeader";
 import { WalletPanel } from "@/components/dashboard/WalletPanel";
 import { SettingsPanel } from "@/components/dashboard/SettingsPanel";
