@@ -22,9 +22,9 @@ bun run dev             # or `npm run dev`
 |------|-----------|
 | `BOT_SUPABASE_URL` | Your Supabase project URL |
 | `BOT_SUPABASE_SERVICE_ROLE_KEY` | Server-only key (never ship to browser) |
-| `RPC_URL` | Helius / Triton / QuickNode mainnet endpoint |
-| `YELLOWSTONE_GRPC_URL` | Geyser gRPC endpoint (Helius / Triton / Shyft) |
-| `YELLOWSTONE_TOKEN` | Auth token if your provider requires one |
+| `RPC_URL` | Helius / Triton / QuickNode mainnet HTTPS RPC endpoint |
+| `YELLOWSTONE_GRPC_URL` | Helius Laserstream or Yellowstone gRPC endpoint (e.g. `https://laserstream-mainnet-ewr.helius-rpc.com`) |
+| `YELLOWSTONE_TOKEN` | Helius API key (used as the gRPC auth token) |
 | `JITO_BLOCK_ENGINE_URL` | e.g. `https://amsterdam.mainnet.block-engine.jito.wtf` |
 | `JITO_TIP_ACCOUNTS` | CSV of the 8 Jito tip accounts (see Jito docs) |
 | `KEY_ENCRYPTION_KEY` | 32-byte AES key, base64. Generate with `openssl rand -base64 32` |
