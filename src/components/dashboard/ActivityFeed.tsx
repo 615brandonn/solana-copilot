@@ -2,6 +2,7 @@ import { ArrowDownRight, ArrowUpRight, Radio } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { SectionCard } from "./SettingRow";
 import { getTrades } from "@/lib/bot.functions";
+import type { TradeRow } from "@/lib/supabase-types";
 
 function short(mint: string) {
   if (!mint) return "";
