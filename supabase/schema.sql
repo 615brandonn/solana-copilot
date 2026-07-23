@@ -53,7 +53,10 @@ create table if not exists public.positions (
   opened_at timestamptz not null default now(),
   closed_at timestamptz
 );
+alter table public.positions add column if not exists decimals int not null default 0;
+alter table public.positions add column if not exists mirrored_sold_fraction numeric not null default 0;
 create index if not exists positions_user_open_idx on public.positions (user_id) where closed_at is null;
+create index if not exists positions_open_by_mint_idx on public.positions (token_mint) where closed_at is null;
 
 -- Follower wallets we monitor for a given token/position
 create table if not exists public.follower_wallets (
