@@ -24,7 +24,7 @@ export type ExecuteInput = {
   jitoTipSol: number;
 };
 
-export type ExecuteResult = { txSig: string; latencyMs: number; route: "jito" | "rpc" };
+export type ExecuteResult = { txSig: string; latencyMs: number; route: "jito" | "rpc"; outUiAmount?: number };
 
 export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   const t0 = Date.now();
@@ -54,12 +54,18 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   const tx = VersionedTransaction.deserialize(Buffer.from(swapResp.swapTransaction, "base64"));
   tx.sign([signer]);
 
+  // Jupiter returns outAmount (raw) + outputDecimals via the quote.
+  const outAmountRaw = Number(quote?.outAmount ?? 0);
+  const outDecimals = Number(quote?.outputDecimals ?? swapResp?.outputDecimals ?? 0);
+  const outUiAmount = outDecimals > 0 ? outAmountRaw / Math.pow(10, outDecimals) : outAmountRaw;
+
   if (input.route === "jito" && JITO_TIP_ACCOUNTS.length > 0) {
-    return await sendViaJito(tx, signer, input.jitoTipSol, t0);
+    const r = await sendViaJito(tx, signer, input.jitoTipSol, t0);
+    return { ...r, outUiAmount };
   }
   const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 0 });
   log.info({ sig, ms: Date.now() - t0 }, "rpc sent");
-  return { txSig: sig, latencyMs: Date.now() - t0, route: "rpc" };
+  return { txSig: sig, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
 }
 
 async function sendViaJito(tx: VersionedTransaction, signer: Keypair, tipSol: number, t0: number): Promise<ExecuteResult> {
