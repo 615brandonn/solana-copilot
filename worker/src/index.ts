@@ -23,8 +23,14 @@ import { checkEntry, loadTokenMeta } from "./filters.js";
 const log = pino({ level: env.LOG_LEVEL });
 
 async function loadConfig(userId: string): Promise<BotConfigRow | null> {
-  const { data } = await db.from("bot_config").select("*").eq("user_id", userId).maybeSingle();
-  return data as BotConfigRow | null;
+  const byUser = await db.from("bot_config").select("*").eq("user_id", userId).maybeSingle();
+  if (byUser.error) log.error({ err: byUser.error }, "bot_config query error (by user_id)");
+  if (byUser.data) return byUser.data as BotConfigRow;
+  const any = await db.from("bot_config").select("*").limit(1);
+  if (any.error) log.error({ err: any.error }, "bot_config query error (fallback)");
+  const row = any.data?.[0];
+  if (row) log.info({ found_user_id: row.user_id, target: row.target_wallet }, "using fallback bot_config row");
+  return (row as BotConfigRow) ?? null;
 }
 
 async function loadSigner(userId: string): Promise<string | null> {
