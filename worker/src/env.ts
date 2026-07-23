@@ -7,9 +7,9 @@ const Env = z.object({
   BOT_SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
 
   // Solana infra
-  RPC_URL: z.string().url(),                // Helius/Triton mainnet
-  YELLOWSTONE_GRPC_URL: z.string().url(),   // Geyser gRPC
-  YELLOWSTONE_TOKEN: z.string().optional(),
+  RPC_URL: z.string().url(),                // Helius/Triton mainnet HTTPS RPC
+  YELLOWSTONE_GRPC_URL: z.string().url(),   // Helius Laserstream / Yellowstone gRPC endpoint
+  YELLOWSTONE_TOKEN: z.string().optional(),  // Helius API key (x-token) for gRPC auth
 
   // Jito
   JITO_BLOCK_ENGINE_URL: z.string().url().default("https://mainnet.block-engine.jito.wtf"),
