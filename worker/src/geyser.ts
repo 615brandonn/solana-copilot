@@ -27,6 +27,9 @@ export class GeyserFeed {
   private watched = new Set<string>();
   private stream?: Awaited<ReturnType<Client["subscribe"]>>;
   private onSwap: OnSwap;
+  private reconnectTimer?: NodeJS.Timeout;
+  private reconnecting = false;
+  private stopped = false;
 
   constructor(onSwap: OnSwap) {
     this.client = new Client(env.YELLOWSTONE_GRPC_URL, env.YELLOWSTONE_TOKEN, {
@@ -37,13 +40,8 @@ export class GeyserFeed {
 
   async start(initialWallets: string[]) {
     initialWallets.forEach((w) => this.watched.add(w));
-    this.stream = await this.client.subscribe();
-
-    this.stream.on("data", (msg) => this.handleMessage(msg).catch((e) => log.error(e)));
-    this.stream.on("error", (e) => log.error({ err: e }, "geyser stream error"));
-
-    await this.push();
-    log.info({ n: this.watched.size }, "geyser subscribed");
+    this.stopped = false;
+    await this.connect();
   }
 
   async watch(wallet: string) {
@@ -79,6 +77,41 @@ export class GeyserFeed {
       commitment: CommitmentLevel.PROCESSED,
     };
     await new Promise<void>((res, rej) => this.stream!.write(req, (err: unknown) => (err ? rej(err) : res())));
+  }
+
+  private async connect() {
+    if (this.reconnecting || this.stopped) return;
+    this.reconnecting = true;
+    try {
+      this.stream?.removeAllListeners();
+      this.stream?.end?.();
+      this.stream = await this.client.subscribe();
+
+      this.stream.on("data", (msg) => this.handleMessage(msg).catch((e) => log.error(e)));
+      this.stream.on("error", (e) => {
+        log.error({ err: e }, "geyser stream error");
+        this.scheduleReconnect("stream error");
+      });
+      this.stream.on("end", () => this.scheduleReconnect("stream ended"));
+      this.stream.on("close", () => this.scheduleReconnect("stream closed"));
+
+      await this.push();
+      log.info({ n: this.watched.size }, "geyser subscribed");
+    } finally {
+      this.reconnecting = false;
+    }
+  }
+
+  private scheduleReconnect(reason: string) {
+    if (this.stopped || this.reconnectTimer) return;
+    log.warn({ reason }, "geyser reconnect scheduled");
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.connect().catch((err) => {
+        log.error({ err }, "geyser reconnect failed");
+        this.scheduleReconnect("reconnect failed");
+      });
+    }, 1000);
   }
 
   private async handleMessage(msg: any) {
