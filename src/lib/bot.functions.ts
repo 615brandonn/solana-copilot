@@ -162,25 +162,33 @@ export const getPositions = createServerFn({ method: "GET" }).handler(async () =
 
 export const getFollowers = createServerFn({ method: "GET" }).handler(async () => {
   const db = adminClient();
-  const { data: positions, error: posErr } = await db
+  const { data: positionsRaw, error: posErr } = await db
     .from("positions")
     .select("id, token_mint")
     .eq("user_id", userId())
     .is("closed_at", null);
   if (posErr) throw new Error(posErr.message);
-  if (!positions || positions.length === 0) return [];
+  const positions = (positionsRaw ?? []) as Array<{ id: string; token_mint: string }>;
+  if (positions.length === 0) return [];
 
   const posIds = positions.map((p) => p.id);
   const mintByPos = new Map(positions.map((p) => [p.id, p.token_mint]));
 
-  const { data: fws, error: fwErr } = await db
+  const { data: fwsRaw, error: fwErr } = await (db as any)
     .from("follower_wallets")
     .select("wallet, position_id, initial_amount, current_amount, last_updated")
     .in("position_id", posIds)
     .order("last_updated", { ascending: false });
   if (fwErr) throw new Error(fwErr.message);
+  const fws = (fwsRaw ?? []) as Array<{
+    wallet: string;
+    position_id: string;
+    initial_amount: number | string;
+    current_amount: number | string;
+    last_updated: string;
+  }>;
 
-  return (fws ?? []).map((f) => {
+  return fws.map((f) => {
     const initial = Number(f.initial_amount) || 0;
     const current = Number(f.current_amount) || 0;
     const heldPct = initial > 0 ? Math.max(0, Math.min(100, (current / initial) * 100)) : 0;
