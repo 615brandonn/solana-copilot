@@ -3,10 +3,12 @@
 // follower wallet, decode swap instructions, and hand each event to the executor.
 
 import Client, { CommitmentLevel, SubscribeRequest } from "@triton-one/yellowstone-grpc";
+import bs58 from "bs58";
 import pino from "pino";
 import { env } from "./env.js";
 
 const log = pino({ level: env.LOG_LEVEL });
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
 export type SwapEvent = {
   wallet: string;
@@ -117,23 +119,84 @@ export class GeyserFeed {
   private async handleMessage(msg: any) {
     const tx = msg?.transaction?.transaction;
     if (!tx) return;
-    // TODO: decode via SPL Token / Raydium / Pump.fun IDLs to reconstruct SwapEvent.
-    // Placeholder shape so the executor path is exercised end-to-end.
-    const slot: number = Number(msg.transaction.slot ?? 0);
-    const txSig: string = tx?.signature ? Buffer.from(tx.signature).toString("hex") : "";
-    const wallet = tx?.meta?.loadedWritableAddresses?.[0] ?? "";
-    if (!wallet) return;
 
-    const event: SwapEvent = {
-      wallet,
-      side: "buy",           // decode from instruction
-      tokenMint: "",         // decode from post token balances diff
-      amountTokens: 0,
-      slot,
-      txSig,
-      timestampMs: Date.now(),
-      isPumpFun: false,
-    };
-    await this.onSwap(event);
+    const event = this.decodeSwapEvent(msg, tx);
+    if (event) await this.onSwap(event);
+  }
+
+  private decodeSwapEvent(msg: any, tx: any): SwapEvent | null {
+    const slot: number = Number(msg.transaction.slot ?? 0);
+    const meta = tx.meta ?? tx.transaction?.meta ?? msg.transaction.meta;
+    const message = tx.transaction?.message ?? tx.message;
+    const accountKeys = this.decodeAccountKeys(message?.accountKeys ?? []);
+    const txSig = this.decodeSignature(tx.signature ?? tx.transaction?.signatures?.[0]);
+
+    for (const wallet of this.watched) {
+      const tokenDelta = this.findLargestTokenDelta(meta, wallet);
+      if (!tokenDelta || tokenDelta.mint === WSOL_MINT) continue;
+
+      const walletIndex = accountKeys.indexOf(wallet);
+      const solDeltaLamports = walletIndex >= 0
+        ? Number(meta?.postBalances?.[walletIndex] ?? 0) - Number(meta?.preBalances?.[walletIndex] ?? 0)
+        : 0;
+
+      const side = tokenDelta.delta > 0 ? "buy" : "sell";
+      if (side === "buy" && tokenDelta.delta <= 0) continue;
+      if (side === "sell" && tokenDelta.delta >= 0) continue;
+
+      return {
+        wallet,
+        side,
+        tokenMint: tokenDelta.mint,
+        amountTokens: Math.abs(tokenDelta.delta),
+        amountUsd: undefined,
+        slot,
+        txSig,
+        timestampMs: Date.now(),
+        isPumpFun: tokenDelta.mint.endsWith("pump"),
+      };
+    }
+
+    return null;
+  }
+
+  private decodeAccountKeys(keys: unknown[]): string[] {
+    return keys.map((key) => {
+      if (typeof key === "string") return key;
+      if (key instanceof Uint8Array || Buffer.isBuffer(key)) return bs58.encode(Buffer.from(key));
+      if (Array.isArray(key)) return bs58.encode(Buffer.from(key));
+      return "";
+    }).filter(Boolean);
+  }
+
+  private decodeSignature(sig: unknown): string {
+    if (!sig) return "";
+    if (typeof sig === "string") return sig;
+    if (sig instanceof Uint8Array || Buffer.isBuffer(sig)) return bs58.encode(Buffer.from(sig));
+    if (Array.isArray(sig)) return bs58.encode(Buffer.from(sig));
+    return "";
+  }
+
+  private findLargestTokenDelta(meta: any, owner: string): { mint: string; delta: number } | null {
+    const balances = new Map<string, { pre: number; post: number }>();
+    for (const balance of meta?.preTokenBalances ?? []) {
+      if (balance.owner !== owner || !balance.mint) continue;
+      const row = balances.get(balance.mint) ?? { pre: 0, post: 0 };
+      row.pre += Number(balance.uiTokenAmount?.uiAmountString ?? balance.uiTokenAmount?.uiAmount ?? 0);
+      balances.set(balance.mint, row);
+    }
+    for (const balance of meta?.postTokenBalances ?? []) {
+      if (balance.owner !== owner || !balance.mint) continue;
+      const row = balances.get(balance.mint) ?? { pre: 0, post: 0 };
+      row.post += Number(balance.uiTokenAmount?.uiAmountString ?? balance.uiTokenAmount?.uiAmount ?? 0);
+      balances.set(balance.mint, row);
+    }
+
+    let largest: { mint: string; delta: number } | null = null;
+    for (const [mint, row] of balances) {
+      const delta = row.post - row.pre;
+      if (!largest || Math.abs(delta) > Math.abs(largest.delta)) largest = { mint, delta };
+    }
+    return largest && Math.abs(largest.delta) > 0 ? largest : null;
   }
 }
