@@ -1,9 +1,10 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { toast, Toaster } from "sonner";
 
 import { DEFAULT_CONFIG, loadConfig, saveConfig, type BotConfig } from "@/lib/bot-config";
-import { getBotConfig, saveBotConfig } from "@/lib/bot.functions";
+import { getBotConfig, saveBotConfig, getPositions, getFollowers } from "@/lib/bot.functions";
+import { useQuery } from "@tanstack/react-query";
 import { StatusHeader } from "@/components/dashboard/StatusHeader";
 import { WalletPanel } from "@/components/dashboard/WalletPanel";
 import { SettingsPanel } from "@/components/dashboard/SettingsPanel";
@@ -85,7 +86,10 @@ function Dashboard() {
     }
   };
 
-  const monitored = useMemo(() => (cfg.enabled ? 3 : 0), [cfg.enabled]);
+  const positionsQ = useQuery({ queryKey: ["positions"], queryFn: () => getPositions(), refetchInterval: 3000 });
+  const followersQ = useQuery({ queryKey: ["followers"], queryFn: () => getFollowers(), refetchInterval: 3000 });
+  const activePositions = (positionsQ.data as unknown as any[] | undefined)?.length ?? 0;
+  const monitored = (followersQ.data as unknown as any[] | undefined)?.length ?? 0;
 
   return (
     <div className="min-h-screen">
@@ -95,12 +99,13 @@ function Dashboard() {
           enabled={cfg.enabled}
           onToggle={(v) => update({ enabled: v })}
           workerConnected={hydrated}
-          activePositions={cfg.enabled ? 2 : 0}
+          activePositions={activePositions}
           monitoredWallets={monitored}
           syncing={syncing}
           targetWalletValid={/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(cfg.targetWallet || "")}
           fundingKeySaved={keySaved}
         />
+
 
         <main className="mt-8 grid gap-6 lg:grid-cols-3">
           <div className="lg:col-span-2 space-y-6">
