@@ -51,6 +51,10 @@ const BotConfigSchema = z.object({
   proportionalFollowerSells: z.boolean(),
 });
 
+const FundingKeySchema = z.object({
+  privateKey: z.string().min(32),
+});
+
 function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row"]): BotConfig {
   return {
     enabled: row.enabled,
@@ -81,7 +85,7 @@ function configToRow(cfg: BotConfig): Omit<Database["public"]["Tables"]["bot_con
   return {
     user_id: userId(),
     enabled: cfg.enabled,
-    target_wallet: cfg.targetWallet || null,
+    target_wallet: cfg.targetWallet.trim() || null,
     execution_route: cfg.executionRoute,
     jito_tip_sol: cfg.jitoTipSol,
     fixed_buy_usd: cfg.fixedBuyUsd,
@@ -132,6 +136,31 @@ export const saveBotConfig = createServerFn({ method: "POST" })
       console.error("[saveBotConfig] exception", e);
       throw new Error(e.message ?? "Unknown save error");
     }
+  });
+
+export const saveFundingKey = createServerFn({ method: "POST" })
+  .inputValidator((data) => FundingKeySchema.parse(data))
+  .handler(async ({ data }) => {
+    const { createCipheriv, randomBytes } = await import("node:crypto");
+    const raw = process.env.SERVER_KEY_ENCRYPTION_KEY ?? process.env.KEY_ENCRYPTION_KEY ?? "";
+    const key = Buffer.from(raw, "base64");
+    if (key.length !== 32) {
+      throw new Error("Missing SERVER_KEY_ENCRYPTION_KEY. Use the same 32-byte base64 key as your worker KEY_ENCRYPTION_KEY.");
+    }
+    const iv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", key, iv);
+    const ct = Buffer.concat([cipher.update(data.privateKey, "utf8"), cipher.final()]);
+    const ciphertext = Buffer.concat([iv, cipher.getAuthTag(), ct]).toString("base64");
+
+    const db = adminClient();
+    const row = {
+      user_id: userId(),
+      wallet_pubkey: "pending",
+      ciphertext,
+    };
+    const { error } = await db.from("funding_keys").upsert(row as any, { onConflict: "user_id" });
+    if (error) throw new Error(error.message);
+    return { ok: true };
   });
 
 export const getTrades = createServerFn({ method: "GET" }).handler(async () => {

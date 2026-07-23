@@ -2,18 +2,55 @@
 // We subscribe to transactions that include the target wallet OR any active
 // follower wallet, decode swap instructions, and hand each event to the executor.
 
-import YellowstoneClient, { CommitmentLevel, type SubscribeRequest } from "@triton-one/yellowstone-grpc";
+import { createRequire } from "node:module";
+import type { SubscribeRequest } from "@triton-one/yellowstone-grpc";
 import bs58 from "bs58";
 import pino from "pino";
 import { env } from "./env.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
-const ClientCtor = (
-  typeof YellowstoneClient === "function"
-    ? YellowstoneClient
-    : ((YellowstoneClient as unknown as { default?: typeof YellowstoneClient }).default ?? YellowstoneClient)
-) as typeof YellowstoneClient;
+const require = createRequire(import.meta.url);
+const YellowstoneGrpc = require("@triton-one/yellowstone-grpc") as Record<string, any>;
+const CommitmentLevel = YellowstoneGrpc.CommitmentLevel ?? YellowstoneGrpc.default?.CommitmentLevel ?? { PROCESSED: 0 };
+
+function resolveClientCtor() {
+  const candidates = [
+    YellowstoneGrpc.Client,
+    YellowstoneGrpc.default,
+    YellowstoneGrpc.default?.Client,
+    YellowstoneGrpc.YellowstoneClient,
+    YellowstoneGrpc.default?.default,
+  ];
+  const ctor = candidates.find((candidate) => typeof candidate === "function");
+  if (!ctor) {
+    log.error(
+      {
+        exports: Object.keys(YellowstoneGrpc),
+        defaultExports: YellowstoneGrpc.default ? Object.keys(YellowstoneGrpc.default) : [],
+      },
+      "could not find Yellowstone gRPC Client export",
+    );
+    throw new Error("Yellowstone gRPC Client export not found");
+  }
+  return ctor;
+}
+
+function createClient() {
+  const ClientCtor = resolveClientCtor();
+  try {
+    return new ClientCtor(env.YELLOWSTONE_GRPC_URL, env.YELLOWSTONE_TOKEN, {
+      grpcMaxDecodingMessageSize: 64 * 1024 * 1024,
+    });
+  } catch (err) {
+    if (err instanceof TypeError && /constructor/i.test(err.message)) {
+      return ClientCtor(env.YELLOWSTONE_GRPC_URL, env.YELLOWSTONE_TOKEN, {
+        grpcMaxDecodingMessageSize: 64 * 1024 * 1024,
+      });
+    }
+    throw err;
+  }
+}
 
 export type SwapEvent = {
   wallet: string;
@@ -30,18 +67,16 @@ export type SwapEvent = {
 export type OnSwap = (e: SwapEvent) => Promise<void> | void;
 
 export class GeyserFeed {
-  private client: InstanceType<typeof YellowstoneClient>;
+  private client: any;
   private watched = new Set<string>();
-  private stream?: Awaited<ReturnType<InstanceType<typeof YellowstoneClient>["subscribe"]>>;
+  private stream?: any;
   private onSwap: OnSwap;
   private reconnectTimer?: NodeJS.Timeout;
   private reconnecting = false;
   private stopped = false;
 
   constructor(onSwap: OnSwap) {
-    this.client = new ClientCtor(env.YELLOWSTONE_GRPC_URL, env.YELLOWSTONE_TOKEN, {
-      grpcMaxDecodingMessageSize: 64 * 1024 * 1024,
-    });
+    this.client = createClient();
     this.onSwap = onSwap;
   }
 

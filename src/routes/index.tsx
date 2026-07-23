@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { toast, Toaster } from "sonner";
 
 import { DEFAULT_CONFIG, loadConfig, saveConfig, type BotConfig } from "@/lib/bot-config";
-import { getBotConfig, saveBotConfig, getPositions, getFollowers } from "@/lib/bot.functions";
+import { getBotConfig, saveBotConfig, getPositions, getFollowers, saveFundingKey } from "@/lib/bot.functions";
 import { useQuery } from "@tanstack/react-query";
 import { StatusHeader } from "@/components/dashboard/StatusHeader";
 import { WalletPanel } from "@/components/dashboard/WalletPanel";
@@ -18,6 +18,8 @@ export const Route = createFileRoute("/")({
       { name: "description", content: "Configure sub-second Solana copy trades, follower propagation exits, and risk filters." },
       { property: "og:title", content: "Helix — Solana Copy Trading Bot" },
       { property: "og:description", content: "Sub-second Solana copy trading with follower-wallet monitoring." },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
     ],
   }),
   loader: async () => {
@@ -74,19 +76,15 @@ function Dashboard() {
   const update = (patch: Partial<BotConfig>) => setCfg((c) => ({ ...c, ...patch }));
 
   const handleSaveKey = async () => {
-    // In production this POSTs to your worker's /keys endpoint over HTTPS.
-    // The worker encrypts with its master key (env var) and stores ciphertext in Supabase.
-    // We never write the raw key to localStorage.
     try {
-      // Placeholder: fetch("/api/keys", { method: "POST", body: JSON.stringify({ sk: cfg.fundingPrivateKey }) })
-      await new Promise((r) => setTimeout(r, 400));
+      await saveFundingKey({ data: { privateKey: cfg.fundingPrivateKey } });
       setKeySaved(true);
       if (typeof window !== "undefined") localStorage.setItem("helix_key_saved", "1");
-      toast.success("Private key encrypted and sent to worker");
-      // clear in-memory copy after transmission
+      toast.success("Private key encrypted and saved");
       setCfg((c) => ({ ...c, fundingPrivateKey: "" }));
     } catch (e) {
-      toast.error("Failed to reach worker. Is your VPS endpoint configured?");
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      toast.error(`Key save failed: ${msg}`);
     }
   };
 
