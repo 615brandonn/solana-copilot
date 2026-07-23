@@ -29,7 +29,7 @@ export function ActivityFeed() {
     refetchOnWindowFocus: true,
   });
 
-  const trades = data ?? [];
+  const trades = (data ?? []) as TradeRow[];
 
   return (
     <SectionCard title="Activity" description="Live trade feed from your worker" icon={<Radio className="h-4 w-4" />}>
