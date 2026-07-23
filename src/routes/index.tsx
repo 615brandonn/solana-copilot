@@ -44,6 +44,9 @@ function Dashboard() {
     // Merge local settings with remote (local wins for in-memory preferences).
     const local = loadConfig();
     setCfg((r) => ({ ...r, ...local }));
+    if (typeof window !== "undefined" && localStorage.getItem("helix_key_saved") === "1") {
+      setKeySaved(true);
+    }
     setHydrated(true);
   }, []);
 
@@ -78,6 +81,7 @@ function Dashboard() {
       // Placeholder: fetch("/api/keys", { method: "POST", body: JSON.stringify({ sk: cfg.fundingPrivateKey }) })
       await new Promise((r) => setTimeout(r, 400));
       setKeySaved(true);
+      if (typeof window !== "undefined") localStorage.setItem("helix_key_saved", "1");
       toast.success("Private key encrypted and sent to worker");
       // clear in-memory copy after transmission
       setCfg((c) => ({ ...c, fundingPrivateKey: "" }));
