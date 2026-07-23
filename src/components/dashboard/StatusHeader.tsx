@@ -1,4 +1,4 @@
-import { Activity, Power, Zap } from "lucide-react";
+import { Activity, Power, Zap, CheckCircle2, AlertCircle } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 
 type Props = {
@@ -8,9 +8,12 @@ type Props = {
   activePositions: number;
   monitoredWallets: number;
   syncing?: boolean;
+  targetWalletValid?: boolean;
+  fundingKeySaved?: boolean;
 };
 
-export function StatusHeader({ enabled, onToggle, workerConnected, activePositions, monitoredWallets, syncing }: Props) {
+export function StatusHeader({ enabled, onToggle, workerConnected, activePositions, monitoredWallets, syncing, targetWalletValid, fundingKeySaved }: Props) {
+  const ready = !!(targetWalletValid && fundingKeySaved);
   return (
     <header className="glass-card rounded-2xl px-6 py-5 flex flex-wrap items-center justify-between gap-6">
       <div className="flex items-center gap-4">
