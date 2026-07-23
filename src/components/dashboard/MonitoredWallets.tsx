@@ -1,6 +1,6 @@
 import { Users } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { SectionCard } from "./SectionCard-shim";
+import { SectionCard } from "./SettingRow";
 import { getFollowers } from "@/lib/bot.functions";
 
 type Follower = { wallet: string; token_mint: string; held_pct: number; last_updated: string };
