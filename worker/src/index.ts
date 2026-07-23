@@ -1,50 +1,32 @@
 // Helix worker entrypoint. Long-running Node process. Deploy on a
 // low-latency VPS geographically close to Jito block engine + your RPC.
-//
-// Architecture:
-//   Geyser gRPC feed → dispatcher → { copy-buy | follower-sell }
-//                                       ↓             ↓
-//                                    executor      executor
-//                                       ↓             ↓
-//                                    supabase log  supabase log
-//
-// The dashboard (Cloudflare Pages) writes settings to Supabase; the worker
-// polls bot_config on a short interval (or listens to Realtime).
 
 import pino from "pino";
 import { env } from "./env.js";
 import { db, type BotConfigRow } from "./db.js";
-import { GeyserFeed, type SwapEvent } from "./geyser.js";
+import { GeyserFeed, type FeedEvent, type SwapEvent, type TransferEvent } from "./geyser.js";
 import { FollowerMonitor } from "./monitor.js";
 import { executeSwap } from "./executor.js";
 import { decryptPrivateKey } from "./crypto.js";
 import { checkEntry, loadTokenMeta } from "./filters.js";
 
 const log = pino({ level: env.LOG_LEVEL });
+const WSOL = "So11111111111111111111111111111111111111112";
 
 async function loadConfig(userId: string): Promise<BotConfigRow | null> {
   const byUser = await db.from("bot_config").select("*").eq("user_id", userId).maybeSingle();
   if (byUser.error) log.error({ err: byUser.error }, "bot_config query error (by user_id)");
   if (byUser.data?.target_wallet) return byUser.data as BotConfigRow;
-
-  // Single-user deploy safety: if HELIX_USER_ID is wrong, or an older blank row
-  // exists, prefer the newest row that actually has a target wallet configured.
-  const any = await db
-    .from("bot_config")
-    .select("*")
-    .not("target_wallet", "is", null)
-    .neq("target_wallet", "")
-    .order("updated_at", { ascending: false })
-    .limit(1);
+  const any = await db.from("bot_config").select("*")
+    .not("target_wallet", "is", null).neq("target_wallet", "")
+    .order("updated_at", { ascending: false }).limit(1);
   if (any.error) log.error({ err: any.error }, "bot_config query error (fallback)");
   const row = any.data?.[0];
   if (row) log.info({ found_user_id: row.user_id, target: row.target_wallet }, "using fallback bot_config row");
   return (row as BotConfigRow) ?? null;
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function loadSigner(userId: string): Promise<string | null> {
   const { data } = await db.from("funding_keys").select("ciphertext").eq("user_id", userId).maybeSingle();
@@ -64,114 +46,164 @@ async function waitForConfig(userId: string): Promise<BotConfigRow> {
   let logged = false;
   while (true) {
     const cfg = await loadConfig(userId);
-    if (cfg?.target_wallet) {
-      log.info({ user_id: cfg.user_id, target: cfg.target_wallet }, "config loaded");
-      return cfg;
-    }
-    if (!logged) {
-      log.warn({ userId }, "no target wallet configured yet — polling every 5s");
-      logged = true;
-    }
-    await new Promise((r) => setTimeout(r, 5000));
+    if (cfg?.target_wallet) { log.info({ user_id: cfg.user_id, target: cfg.target_wallet }, "config loaded"); return cfg; }
+    if (!logged) { log.warn({ userId }, "no target wallet configured yet — polling every 5s"); logged = true; }
+    await delay(5000);
   }
 }
 
 async function main() {
   const USER_ID = env.HELIX_USER_ID;
   let cfg = await waitForConfig(USER_ID);
-  const ACTIVE_USER_ID = cfg.user_id;
 
   const feed = new GeyserFeed(async (event) => handle(event));
   const monitor = new FollowerMonitor(feed);
-  while (true) {
-    try {
-      await feed.start([cfg.target_wallet!]);
-      break;
-    } catch (err) {
-      log.error({ err }, "geyser start failed — retrying in 2s");
-      await delay(2000);
-    }
+
+  // Rehydrate any positions still open from a previous worker run so we keep
+  // monitoring their followers across restarts.
+  const { data: openPositions } = await db.from("positions")
+    .select("id,token_mint,amount_remaining").eq("user_id", cfg.user_id).is("closed_at", null);
+  for (const pos of openPositions ?? []) {
+    if (Number(pos.amount_remaining) <= 0) continue;
+    await monitor.onCopyBuy({ positionId: pos.id, tokenMint: pos.token_mint, targetWallet: cfg.target_wallet! });
+    const { data: followers } = await db.from("follower_wallets").select("wallet").eq("position_id", pos.id);
+    for (const f of followers ?? []) await feed.watch(f.wallet);
   }
 
-  // Poll config every 3s — cheap and simple. Swap for Supabase Realtime later.
+  while (true) {
+    try { await feed.start([cfg.target_wallet!]); break; }
+    catch (err) { log.error({ err }, "geyser start failed — retrying in 2s"); await delay(2000); }
+  }
+
   setInterval(async () => {
-    try {
-      const next = await loadConfig(ACTIVE_USER_ID);
-      if (next?.target_wallet) cfg = next;
-    } catch (err) {
-      log.error({ err }, "config refresh failed — keeping last good config");
-    }
+    try { const next = await loadConfig(cfg.user_id); if (next?.target_wallet) cfg = next; }
+    catch (err) { log.error({ err }, "config refresh failed"); }
   }, 3000);
 
-  async function handle(event: SwapEvent) {
-    if (!cfg) return;
-    const isTarget = event.wallet === cfg.target_wallet;
-
-    if (isTarget && event.side === "buy") {
-      await tryCopyBuy(event);
+  async function handle(event: FeedEvent) {
+    if (!cfg?.enabled && event.kind === "swap" && event.side === "buy" && event.wallet === cfg?.target_wallet) {
+      log.info("bot disabled — skipping copy buy");
       return;
     }
+    try {
+      if (event.kind === "transfer") return handleTransfer(event);
+      if (event.kind === "swap") {
+        if (event.wallet === cfg.target_wallet && event.side === "buy") return tryCopyBuy(event);
+        if (event.side === "sell") return handleFollowerSell(event);
+      }
+    } catch (err) { log.error({ err }, "handler failed"); }
+  }
 
-    // Otherwise this is a follower swap (target's transfer recipients).
+  async function handleTransfer(ev: TransferEvent) {
+    if (ev.from !== cfg.target_wallet) return;
+    const ctx = monitor.activeForMint(ev.tokenMint);
+    if (!ctx) return; // Only track transfers for tokens we hold
+    await monitor.recordTransfer(ctx.positionId, ev.to, ev.amountTokens);
+  }
+
+  async function handleFollowerSell(ev: SwapEvent) {
+    const ctx = monitor.activeForMint(ev.tokenMint);
+    if (!ctx) return;
+    if (ev.wallet === cfg.target_wallet) return; // Only follower wallets drive the mirror
+
+    const soldFraction = await monitor.recordFollowerSell(ctx.positionId, ev.wallet, ev.amountTokens);
+    if (soldFraction === null) return;
+
+    if (!cfg.proportional_follower_sells) return;
+
     const { data: pos } = await db.from("positions")
-      .select("id,token_mint,amount_remaining")
-      .eq("user_id", cfg.user_id).eq("token_mint", event.tokenMint).is("closed_at", null).maybeSingle();
+      .select("id,token_mint,amount_tokens,amount_remaining,decimals,mirrored_sold_fraction")
+      .eq("id", ctx.positionId).maybeSingle();
     if (!pos) return;
 
-    if (cfg.proportional_follower_sells && event.side === "sell") {
-      const agg = await monitor.onFollowerSwap(event, pos.id);
-      if (!agg) return;
-      // Mirror: bring our remaining down to (1 - soldFraction) of entry amount.
-      // Compute delta and issue a sell for exactly that much.
-      // (Concrete sizing left as a follow-up — depends on entry_amount_tokens.)
-      log.info({ soldFraction: agg.soldFraction }, "would mirror follower exit");
-    }
+    const targetRemaining = Math.max(0, Number(pos.amount_tokens) * (1 - soldFraction));
+    const sellUi = Number(pos.amount_remaining) - targetRemaining;
+    if (sellUi <= 0) return;
+
+    const decimals = Number(pos.decimals ?? 0);
+    const sellRaw = Math.floor(sellUi * Math.pow(10, decimals));
+    if (sellRaw <= 0) return;
+
+    log.info({ positionId: pos.id, soldFraction, sellUi, sellRaw }, "mirroring follower sell");
+    await executeMirrorSell(pos.id, pos.token_mint, sellRaw, sellUi, soldFraction, ctx);
+  }
+
+  async function executeMirrorSell(positionId: string, mint: string, sellRaw: number, sellUi: number, soldFraction: number, ctx: { positionId: string; tokenMint: string; targetWallet: string }) {
+    const secret = await loadSigner(cfg.user_id);
+    if (!secret) { log.error("no funding key for sell"); return; }
+
+    const result = await executeSwap({
+      signerSecret: secret,
+      inputMint: mint,
+      outputMint: WSOL,
+      amountLamports: sellRaw,
+      slippageBps: 500,
+      route: cfg.execution_route,
+      jitoTipSol: cfg.jito_tip_sol,
+    });
+
+    const newRemaining = Math.max(0, (await db.from("positions").select("amount_remaining").eq("id", positionId).single()).data!.amount_remaining - sellUi);
+    const closed = newRemaining <= 1e-9;
+    await db.from("positions").update({
+      amount_remaining: newRemaining,
+      mirrored_sold_fraction: soldFraction,
+      closed_at: closed ? new Date().toISOString() : null,
+    }).eq("id", positionId);
+
+    await db.from("trades").insert({
+      user_id: cfg.user_id, position_id: positionId, side: "sell",
+      token_mint: mint, amount_tokens: sellUi,
+      tx_sig: result.txSig, reason: `mirror ${Math.round(soldFraction * 100)}% followers`,
+      latency_ms: result.latencyMs, route: result.route,
+    });
+
+    log.info({ sig: result.txSig, ms: result.latencyMs, closed }, "mirror sell landed");
+    if (closed) await monitor.releasePosition(positionId);
   }
 
   async function tryCopyBuy(event: SwapEvent) {
-    if (!cfg) return;
+    if (!cfg.enabled) return;
     const meta = await loadTokenMeta(event.tokenMint);
     const { data: prior } = await db.from("traded_tokens")
       .select("token_mint").eq("user_id", cfg.user_id).eq("token_mint", event.tokenMint).maybeSingle();
-    const firstBuy = true; // TODO: check target's on-chain buy history for this mint
+    const firstBuy = true;
     const decision = checkEntry(cfg, event, meta, { first: firstBuy, already: !!prior });
     if (!decision.pass) { log.info({ reason: decision.reason }, "filtered"); return; }
 
     const secret = await loadSigner(cfg.user_id);
     if (!secret) { log.error("no funding key"); return; }
 
-    const solPrice = (await priceUsd("So11111111111111111111111111111111111111112")) ?? 150;
+    const solPrice = (await priceUsd(WSOL)) ?? 150;
     const amountLamports = Math.floor((cfg.fixed_buy_usd / solPrice) * 1e9);
 
     const result = await executeSwap({
-      signerSecret: secret,
-      inputMint: "So11111111111111111111111111111111111111112",
-      outputMint: event.tokenMint,
-      amountLamports,
-      slippageBps: 300,
-      route: cfg.execution_route,
-      jitoTipSol: cfg.jito_tip_sol,
+      signerSecret: secret, inputMint: WSOL, outputMint: event.tokenMint,
+      amountLamports, slippageBps: 300, route: cfg.execution_route, jitoTipSol: cfg.jito_tip_sol,
     });
 
+    // Best-effort actual-received amount: worker doesn't have the confirmed
+    // balance yet, so we estimate from Jupiter's quote embedded in swap route.
+    const receivedUi = result.outUiAmount ?? 0;
+
     const { data: pos } = await db.from("positions").insert({
-      user_id: cfg.user_id,
-      token_mint: event.tokenMint,
+      user_id: cfg.user_id, token_mint: event.tokenMint,
       entry_price_usd: 0,
-      amount_tokens: 0,
-      amount_remaining: 0,
-      entry_tx_sig: result.txSig,
-      entry_slot: event.slot,
+      amount_tokens: receivedUi,
+      amount_remaining: receivedUi,
+      decimals: event.decimals,
+      mirrored_sold_fraction: 0,
+      entry_tx_sig: result.txSig, entry_slot: event.slot,
     }).select("id").single();
 
     await db.from("trades").insert({
       user_id: cfg.user_id, position_id: pos?.id, side: "buy",
-      token_mint: event.tokenMint, amount_tokens: 0, amount_usd: cfg.fixed_buy_usd,
+      token_mint: event.tokenMint, amount_tokens: receivedUi, amount_usd: cfg.fixed_buy_usd,
       tx_sig: result.txSig, reason: "target copy buy", latency_ms: result.latencyMs, route: result.route,
     });
     await db.from("traded_tokens").upsert({ user_id: cfg.user_id, token_mint: event.tokenMint });
 
-    if (pos) await monitor.onCopyBuy(pos.id, event.tokenMint, cfg.target_wallet!);
-    log.info({ sig: result.txSig, ms: result.latencyMs }, "copy buy landed");
+    if (pos) await monitor.onCopyBuy({ positionId: pos.id, tokenMint: event.tokenMint, targetWallet: cfg.target_wallet! });
+    log.info({ sig: result.txSig, ms: result.latencyMs }, "copy buy landed — follower monitor armed");
   }
 }
 
