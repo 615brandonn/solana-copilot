@@ -2,7 +2,15 @@ import { createClient } from "@supabase/supabase-js";
 import { fetch, WebSocket } from "undici";
 import { env } from "./env.js";
 
-export const db = createClient(env.BOT_SUPABASE_URL, env.BOT_SUPABASE_SERVICE_ROLE_KEY, {
+function normalizeSupabaseUrl(url: string): string {
+  let trimmed = url.trim();
+  while (trimmed.endsWith("/")) trimmed = trimmed.slice(0, -1);
+  if (trimmed.toLowerCase().endsWith("/rest/v1")) trimmed = trimmed.slice(0, -"/rest/v1".length);
+  while (trimmed.endsWith("/")) trimmed = trimmed.slice(0, -1);
+  return trimmed;
+}
+
+export const db = createClient(normalizeSupabaseUrl(env.BOT_SUPABASE_URL), env.BOT_SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
   realtime: { transport: WebSocket as unknown as typeof globalThis.WebSocket },
   global: {

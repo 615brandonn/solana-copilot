@@ -81,7 +81,7 @@ function configToRow(cfg: BotConfig): Omit<Database["public"]["Tables"]["bot_con
   return {
     user_id: userId(),
     enabled: cfg.enabled,
-    target_wallet: cfg.targetWallet || null,
+    target_wallet: cfg.targetWallet.trim() || null,
     execution_route: cfg.executionRoute,
     jito_tip_sol: cfg.jitoTipSol,
     fixed_buy_usd: cfg.fixedBuyUsd,

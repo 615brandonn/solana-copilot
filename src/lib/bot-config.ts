@@ -48,14 +48,14 @@ export const DEFAULT_CONFIG: BotConfig = {
 
 const KEY = "helix.bot.config.v1";
 
-export function loadConfig(): BotConfig {
-  if (typeof window === "undefined") return DEFAULT_CONFIG;
+export function loadConfig(): Partial<BotConfig> {
+  if (typeof window === "undefined") return {};
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return DEFAULT_CONFIG;
-    return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
+    if (!raw) return {};
+    return JSON.parse(raw) as Partial<BotConfig>;
   } catch {
-    return DEFAULT_CONFIG;
+    return {};
   }
 }
 
