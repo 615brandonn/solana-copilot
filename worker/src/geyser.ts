@@ -30,7 +30,7 @@ export class GeyserFeed {
 
   constructor(onSwap: OnSwap) {
     this.client = new Client(env.YELLOWSTONE_GRPC_URL, env.YELLOWSTONE_TOKEN, {
-      "grpc.max_receive_message_length": 64 * 1024 * 1024,
+      grpcMaxDecodingMessageSize: 64 * 1024 * 1024,
     });
     this.onSwap = onSwap;
   }
