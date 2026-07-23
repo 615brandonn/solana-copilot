@@ -98,6 +98,8 @@ function Dashboard() {
           activePositions={cfg.enabled ? 2 : 0}
           monitoredWallets={monitored}
           syncing={syncing}
+          targetWalletValid={/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(cfg.targetWallet || "")}
+          fundingKeySaved={keySaved}
         />
 
         <main className="mt-8 grid gap-6 lg:grid-cols-3">

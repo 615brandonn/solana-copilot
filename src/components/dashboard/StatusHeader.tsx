@@ -1,4 +1,4 @@
-import { Activity, Power, Zap } from "lucide-react";
+import { Activity, Power, Zap, CheckCircle2, AlertCircle } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 
 type Props = {
@@ -8,9 +8,12 @@ type Props = {
   activePositions: number;
   monitoredWallets: number;
   syncing?: boolean;
+  targetWalletValid?: boolean;
+  fundingKeySaved?: boolean;
 };
 
-export function StatusHeader({ enabled, onToggle, workerConnected, activePositions, monitoredWallets, syncing }: Props) {
+export function StatusHeader({ enabled, onToggle, workerConnected, activePositions, monitoredWallets, syncing, targetWalletValid, fundingKeySaved }: Props) {
+  const ready = !!(targetWalletValid && fundingKeySaved);
   return (
     <header className="glass-card rounded-2xl px-6 py-5 flex flex-wrap items-center justify-between gap-6">
       <div className="flex items-center gap-4">
@@ -23,6 +26,23 @@ export function StatusHeader({ enabled, onToggle, workerConnected, activePositio
             <span className="mono text-[10px] uppercase tracking-widest text-muted-foreground">v0.1 · solana</span>
           </div>
           <p className="text-xs text-muted-foreground">Sub-second copy trading · follower propagation exits</p>
+        </div>
+        <div
+          className={`ml-2 hidden md:flex items-center gap-2 rounded-lg border px-3 py-1.5 ${
+            ready
+              ? "border-success/40 bg-success/10 text-success"
+              : "border-border bg-muted/40 text-muted-foreground"
+          }`}
+          title={
+            ready
+              ? "Target wallet + funding key accepted. Bot is ready to copy trades."
+              : `${targetWalletValid ? "" : "Target wallet missing. "}${fundingKeySaved ? "" : "Funding key missing."}`.trim()
+          }
+        >
+          {ready ? <CheckCircle2 className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+          <span className="text-[11px] font-semibold uppercase tracking-wider">
+            {ready ? "Ready" : "Setup needed"}
+          </span>
         </div>
       </div>
 
