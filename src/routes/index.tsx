@@ -18,6 +18,8 @@ export const Route = createFileRoute("/")({
       { name: "description", content: "Configure sub-second Solana copy trades, follower propagation exits, and risk filters." },
       { property: "og:title", content: "Helix — Solana Copy Trading Bot" },
       { property: "og:description", content: "Sub-second Solana copy trading with follower-wallet monitoring." },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
     ],
   }),
   loader: async () => {
