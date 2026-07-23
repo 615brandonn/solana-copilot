@@ -57,6 +57,14 @@ export type TradeRow = {
   created_at: string;
 };
 
+export type FundingKeyRow = {
+  id: string;
+  user_id: string;
+  wallet_pubkey: string;
+  ciphertext: string;
+  created_at: string;
+};
+
 // Minimal Database shape for createClient<Database>
 export type Database = {
   public: {
@@ -65,6 +73,11 @@ export type Database = {
         Row: BotConfigRow;
         Insert: Omit<BotConfigRow, "id" | "updated_at">;
         Update: Partial<BotConfigRow>;
+      };
+      funding_keys: {
+        Row: FundingKeyRow;
+        Insert: Omit<FundingKeyRow, "id" | "created_at">;
+        Update: Partial<FundingKeyRow>;
       };
       positions: {
         Row: PositionRow;
