@@ -41,17 +41,33 @@ async function priceUsd(mint: string): Promise<number | undefined> {
   } catch { return undefined; }
 }
 
+async function waitForConfig(userId: string): Promise<BotConfigRow> {
+  let logged = false;
+  while (true) {
+    const cfg = await loadConfig(userId);
+    if (cfg?.target_wallet) {
+      log.info({ user_id: cfg.user_id, target: cfg.target_wallet }, "config loaded");
+      return cfg;
+    }
+    if (!logged) {
+      log.warn({ userId }, "no target wallet configured yet — polling every 5s");
+      logged = true;
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+}
+
 async function main() {
-  const USER_ID = process.env.HELIX_USER_ID!; // single-user deploy; parameterize for multi-tenant
-  let cfg = await loadConfig(USER_ID);
-  if (!cfg?.target_wallet) { log.error("no target wallet configured"); process.exit(1); }
+  const USER_ID = env.HELIX_USER_ID;
+  let cfg = await waitForConfig(USER_ID);
+  const ACTIVE_USER_ID = cfg.user_id;
 
   const feed = new GeyserFeed(async (event) => handle(event));
   const monitor = new FollowerMonitor(feed);
-  await feed.start([cfg.target_wallet]);
+  await feed.start([cfg.target_wallet!]);
 
   // Poll config every 3s — cheap and simple. Swap for Supabase Realtime later.
-  setInterval(async () => { cfg = (await loadConfig(USER_ID)) ?? cfg; }, 3000);
+  setInterval(async () => { cfg = (await loadConfig(ACTIVE_USER_ID)) ?? cfg; }, 3000);
 
   async function handle(event: SwapEvent) {
     if (!cfg) return;
