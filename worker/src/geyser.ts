@@ -53,10 +53,12 @@ function createClient() {
 }
 
 export type SwapEvent = {
+  kind: "swap";
   wallet: string;
   side: "buy" | "sell";
   tokenMint: string;
   amountTokens: number;
+  decimals: number;
   amountUsd?: number;
   slot: number;
   txSig: string;
@@ -64,7 +66,20 @@ export type SwapEvent = {
   isPumpFun: boolean;
 };
 
-export type OnSwap = (e: SwapEvent) => Promise<void> | void;
+export type TransferEvent = {
+  kind: "transfer";
+  from: string;               // sender (must be a watched wallet)
+  to: string;                 // recipient
+  tokenMint: string;
+  amountTokens: number;
+  decimals: number;
+  slot: number;
+  txSig: string;
+  timestampMs: number;
+};
+
+export type FeedEvent = SwapEvent | TransferEvent;
+export type OnSwap = (e: FeedEvent) => Promise<void> | void;
 
 export class GeyserFeed {
   private client: any;
