@@ -123,6 +123,7 @@ alter table public.positions enable row level security;
 alter table public.follower_wallets enable row level security;
 alter table public.trades enable row level security;
 alter table public.traded_tokens enable row level security;
+alter table public.target_traded_tokens enable row level security;
 
 create policy "own config" on public.bot_config
   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
