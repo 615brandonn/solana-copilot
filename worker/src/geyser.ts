@@ -196,6 +196,10 @@ export class GeyserFeed {
     }
 
     for (const wallet of this.watched) {
+      // SOL/WSOL delta for this wallet in this tx (best-effort; native SOL changes are not in token balances)
+      const solRow = table.find((r) => r.owner === wallet && r.mint === WSOL_MINT);
+      const solDelta = (solRow?.post ?? 0) - (solRow?.pre ?? 0);
+
       // Consider each mint the wallet is involved in
       const walletRows = table.filter((r) => r.owner === wallet);
       for (const row of walletRows) {
@@ -241,6 +245,7 @@ export class GeyserFeed {
           amountTokens: Math.abs(delta),
           decimals: row.decimals,
           amountUsd: undefined,
+          solDelta,
           slot,
           txSig,
           timestampMs: Date.now(),
