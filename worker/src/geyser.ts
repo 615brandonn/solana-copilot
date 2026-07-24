@@ -145,8 +145,8 @@ export class GeyserFeed {
       this.stream?.end?.();
       this.stream = await this.client.subscribe();
 
-      this.stream.on("data", (msg) => this.handleMessage(msg).catch((e) => log.error(e)));
-      this.stream.on("error", (e) => {
+      this.stream.on("data", (msg: any) => this.handleMessage(msg).catch((e: any) => log.error(e)));
+      this.stream.on("error", (e: any) => {
         log.error({ err: e }, "geyser stream error");
         this.scheduleReconnect("stream error");
       });
