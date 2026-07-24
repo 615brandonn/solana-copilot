@@ -81,8 +81,8 @@ async function main() {
   }, 3000);
 
   async function handle(event: FeedEvent) {
-    if (!cfg?.enabled && event.kind === "swap" && event.side === "buy" && event.wallet === cfg?.target_wallet) {
-      log.info("bot disabled — skipping copy buy");
+    if (!cfg?.enabled) {
+      log.info("bot disabled — skipping event");
       return;
     }
     try {
