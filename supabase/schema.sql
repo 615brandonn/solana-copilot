@@ -125,23 +125,29 @@ alter table public.trades enable row level security;
 alter table public.traded_tokens enable row level security;
 alter table public.target_traded_tokens enable row level security;
 
+drop policy if exists "own config" on public.bot_config;
 create policy "own config" on public.bot_config
   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
 
 -- funding_keys never accessible to authenticated role (service_role only)
+drop policy if exists "own positions" on public.positions;
 create policy "own positions" on public.positions
   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
 
+drop policy if exists "own trades" on public.trades;
 create policy "own trades" on public.trades
   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
 
+drop policy if exists "own traded tokens" on public.traded_tokens;
 create policy "own traded tokens" on public.traded_tokens
   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
 
+drop policy if exists "own target traded tokens" on public.target_traded_tokens;
 create policy "own target traded tokens" on public.target_traded_tokens
   for all to authenticated using (target_wallet = (select target_wallet from public.bot_config where user_id = auth.uid()))
   with check (target_wallet = (select target_wallet from public.bot_config where user_id = auth.uid()));
 
+drop policy if exists "own follower rows" on public.follower_wallets;
 create policy "own follower rows" on public.follower_wallets
   for all to authenticated
   using (exists (select 1 from public.positions p where p.id = position_id and p.user_id = auth.uid()))
