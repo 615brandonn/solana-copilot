@@ -81,8 +81,8 @@ async function main() {
   }, 3000);
 
   async function handle(event: FeedEvent) {
-    if (!cfg?.enabled && event.kind === "swap" && event.side === "buy" && event.wallet === cfg?.target_wallet) {
-      log.info("bot disabled — skipping copy buy");
+    if (!cfg?.enabled) {
+      log.info("bot disabled — skipping event");
       return;
     }
     try {
@@ -166,14 +166,20 @@ async function main() {
     const meta = await loadTokenMeta(event.tokenMint);
     const { data: prior } = await db.from("traded_tokens")
       .select("token_mint").eq("user_id", cfg.user_id).eq("token_mint", event.tokenMint).maybeSingle();
-    const firstBuy = true;
+    // Best-effort USD size of the target's buy using the wallet's WSOL/SOL delta in this tx.
+    const solPrice = (await priceUsd(WSOL)) ?? 150;
+    const targetBuyUsd = Math.abs(event.solDelta) * solPrice;
+    event.amountUsd = targetBuyUsd;
+    // First-buy tracking: "first buy of this mint by this target since the bot started monitoring".
+    const { data: targetPrior } = await db.from("target_traded_tokens")
+      .select("token_mint").eq("target_wallet", cfg.target_wallet!).eq("token_mint", event.tokenMint).maybeSingle();
+    const firstBuy = !targetPrior;
     const decision = checkEntry(cfg, event, meta, { first: firstBuy, already: !!prior });
     if (!decision.pass) { log.info({ reason: decision.reason }, "filtered"); return; }
 
     const secret = await loadSigner(cfg.user_id);
     if (!secret) { log.error("no funding key"); return; }
 
-    const solPrice = (await priceUsd(WSOL)) ?? 150;
     const amountLamports = Math.floor((cfg.fixed_buy_usd / solPrice) * 1e9);
 
     const result = await executeSwap({
@@ -201,9 +207,10 @@ async function main() {
       tx_sig: result.txSig, reason: "target copy buy", latency_ms: result.latencyMs, route: result.route,
     });
     await db.from("traded_tokens").upsert({ user_id: cfg.user_id, token_mint: event.tokenMint });
+    await db.from("target_traded_tokens").upsert({ target_wallet: cfg.target_wallet!, token_mint: event.tokenMint });
 
     if (pos) await monitor.onCopyBuy({ positionId: pos.id, tokenMint: event.tokenMint, targetWallet: cfg.target_wallet! });
-    log.info({ sig: result.txSig, ms: result.latencyMs }, "copy buy landed — follower monitor armed");
+    log.info({ sig: result.txSig, ms: result.latencyMs, targetBuyUsd: targetBuyUsd.toFixed(2) }, "copy buy landed — follower monitor armed");
   }
 }
 

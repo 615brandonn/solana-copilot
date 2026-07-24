@@ -60,6 +60,7 @@ export type SwapEvent = {
   amountTokens: number;
   decimals: number;
   amountUsd?: number;
+  solDelta: number; // WSOL/SOL change for this wallet in this tx (negative = spent, positive = received)
   slot: number;
   txSig: string;
   timestampMs: number;
@@ -144,8 +145,8 @@ export class GeyserFeed {
       this.stream?.end?.();
       this.stream = await this.client.subscribe();
 
-      this.stream.on("data", (msg) => this.handleMessage(msg).catch((e) => log.error(e)));
-      this.stream.on("error", (e) => {
+      this.stream.on("data", (msg: any) => this.handleMessage(msg).catch((e: any) => log.error(e)));
+      this.stream.on("error", (e: any) => {
         log.error({ err: e }, "geyser stream error");
         this.scheduleReconnect("stream error");
       });
@@ -195,6 +196,10 @@ export class GeyserFeed {
     }
 
     for (const wallet of this.watched) {
+      // SOL/WSOL delta for this wallet in this tx (best-effort; native SOL changes are not in token balances)
+      const solRow = table.find((r) => r.owner === wallet && r.mint === WSOL_MINT);
+      const solDelta = (solRow?.post ?? 0) - (solRow?.pre ?? 0);
+
       // Consider each mint the wallet is involved in
       const walletRows = table.filter((r) => r.owner === wallet);
       for (const row of walletRows) {
@@ -240,6 +245,7 @@ export class GeyserFeed {
           amountTokens: Math.abs(delta),
           decimals: row.decimals,
           amountUsd: undefined,
+          solDelta,
           slot,
           txSig,
           timestampMs: Date.now(),

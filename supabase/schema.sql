@@ -97,14 +97,24 @@ create table if not exists public.traded_tokens (
   primary key (user_id, token_mint)
 );
 
+-- Tokens the target wallet has bought (for "only first buy ever" filter)
+create table if not exists public.target_traded_tokens (
+  target_wallet text not null,
+  token_mint text not null,
+  first_seen_at timestamptz not null default now(),
+  primary key (target_wallet, token_mint)
+);
+
 -- Grants (Supabase Data API needs explicit grants on public schema)
 grant select, insert, update, delete on public.bot_config to authenticated;
 grant select, insert, update, delete on public.positions to authenticated;
 grant select, insert, update, delete on public.follower_wallets to authenticated;
 grant select, insert, update, delete on public.trades to authenticated;
 grant select, insert, update, delete on public.traded_tokens to authenticated;
+grant select, insert, update, delete on public.target_traded_tokens to authenticated;
 grant all on public.bot_config, public.funding_keys, public.positions,
-              public.follower_wallets, public.trades, public.traded_tokens to service_role;
+              public.follower_wallets, public.trades, public.traded_tokens,
+              public.target_traded_tokens to service_role;
 
 -- RLS: user isolation
 alter table public.bot_config enable row level security;
@@ -113,6 +123,7 @@ alter table public.positions enable row level security;
 alter table public.follower_wallets enable row level security;
 alter table public.trades enable row level security;
 alter table public.traded_tokens enable row level security;
+alter table public.target_traded_tokens enable row level security;
 
 create policy "own config" on public.bot_config
   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
@@ -126,6 +137,10 @@ create policy "own trades" on public.trades
 
 create policy "own traded tokens" on public.traded_tokens
   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+create policy "own target traded tokens" on public.target_traded_tokens
+  for all to authenticated using (target_wallet = (select target_wallet from public.bot_config where user_id = auth.uid()))
+  with check (target_wallet = (select target_wallet from public.bot_config where user_id = auth.uid()));
 
 create policy "own follower rows" on public.follower_wallets
   for all to authenticated
