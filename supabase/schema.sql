@@ -137,6 +137,10 @@ create policy "own trades" on public.trades
 create policy "own traded tokens" on public.traded_tokens
   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
 
+create policy "own target traded tokens" on public.target_traded_tokens
+  for all to authenticated using (target_wallet = (select target_wallet from public.bot_config where user_id = auth.uid()))
+  with check (target_wallet = (select target_wallet from public.bot_config where user_id = auth.uid()));
+
 create policy "own follower rows" on public.follower_wallets
   for all to authenticated
   using (exists (select 1 from public.positions p where p.id = position_id and p.user_id = auth.uid()))
