@@ -60,6 +60,7 @@ export type SwapEvent = {
   amountTokens: number;
   decimals: number;
   amountUsd?: number;
+  solDelta: number; // WSOL/SOL change for this wallet in this tx (negative = spent, positive = received)
   slot: number;
   txSig: string;
   timestampMs: number;
