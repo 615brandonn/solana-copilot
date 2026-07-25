@@ -192,13 +192,16 @@ async function main() {
     // balance yet, so we estimate from Jupiter's quote embedded in swap route.
     const receivedUi = result.outUiAmount ?? 0;
 
+    const entryPrice = (await priceUsd(event.tokenMint)) ?? (receivedUi > 0 ? cfg.fixed_buy_usd / receivedUi : 0);
+
     const { data: pos } = await db.from("positions").insert({
       user_id: cfg.user_id, token_mint: event.tokenMint,
-      entry_price_usd: 0,
+      entry_price_usd: entryPrice,
       amount_tokens: receivedUi,
       amount_remaining: receivedUi,
       decimals: event.decimals,
       mirrored_sold_fraction: 0,
+      tp_taken: false,
       entry_tx_sig: result.txSig, entry_slot: event.slot,
     }).select("id").single();
 
