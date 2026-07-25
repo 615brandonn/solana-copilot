@@ -59,24 +59,37 @@ async function main() {
   const feed = new GeyserFeed(async (event) => handle(event));
   const monitor = new FollowerMonitor(feed);
 
+  const initialTargetWallet = cfg.target_wallet;
+  if (!initialTargetWallet) throw new Error("config loaded without a target wallet");
+
   // Rehydrate any positions still open from a previous worker run so we keep
   // monitoring their followers across restarts.
   const { data: openPositions } = await db.from("positions")
     .select("id,token_mint,amount_remaining").eq("user_id", cfg.user_id).is("closed_at", null);
   for (const pos of openPositions ?? []) {
     if (Number(pos.amount_remaining) <= 0) continue;
-    await monitor.onCopyBuy({ positionId: pos.id, tokenMint: pos.token_mint, targetWallet: cfg.target_wallet! });
+    await monitor.onCopyBuy({ positionId: pos.id, tokenMint: pos.token_mint, targetWallet: initialTargetWallet });
     const { data: followers } = await db.from("follower_wallets").select("wallet").eq("position_id", pos.id);
     for (const f of followers ?? []) await feed.watch(f.wallet);
   }
 
   while (true) {
-    try { await feed.start([cfg.target_wallet!]); break; }
+    try { await feed.start([initialTargetWallet]); break; }
     catch (err) { log.error({ err }, "geyser start failed — retrying in 2s"); await delay(2000); }
   }
 
   setInterval(async () => {
-    try { const next = await loadConfig(cfg.user_id); if (next?.target_wallet) cfg = next; }
+    try {
+      const previousTarget = cfg.target_wallet;
+      const next = await loadConfig(cfg.user_id);
+      if (!next?.target_wallet) return;
+      cfg = next;
+      if (previousTarget && previousTarget !== next.target_wallet) {
+        await feed.unwatch(previousTarget);
+        await feed.watch(next.target_wallet);
+        log.info({ previousTarget, nextTarget: next.target_wallet }, "target wallet subscription updated");
+      }
+    }
     catch (err) { log.error({ err }, "config refresh failed"); }
   }, 3000);
 
@@ -204,7 +217,12 @@ async function main() {
       jitoTipSol: cfg.jito_tip_sol,
     });
 
-    const newRemaining = Math.max(0, (await db.from("positions").select("amount_remaining").eq("id", positionId).single()).data!.amount_remaining - sellUi);
+    const { data: currentPosition, error: currentPositionError } = await db.from("positions").select("amount_remaining").eq("id", positionId).single();
+    if (currentPositionError || !currentPosition) {
+      log.error({ err: currentPositionError, positionId }, "could not load position after mirror sell");
+      return;
+    }
+    const newRemaining = Math.max(0, Number(currentPosition.amount_remaining) - sellUi);
     const closed = newRemaining <= 1e-9;
     await db.from("positions").update({
       amount_remaining: newRemaining,
@@ -225,6 +243,18 @@ async function main() {
 
   async function tryCopyBuy(event: SwapEvent) {
     if (!cfg.enabled) return;
+    const targetWallet = cfg.target_wallet;
+    if (!targetWallet) {
+      log.warn("target buy skipped because config target wallet is empty");
+      return;
+    }
+    log.info({
+      target: event.wallet,
+      mint: event.tokenMint,
+      tokenAmount: event.amountTokens,
+      solDelta: event.solDelta,
+      txSig: event.txSig,
+    }, "target buy candidate");
     const meta = await loadTokenMeta(event.tokenMint);
     const { data: prior } = await db.from("traded_tokens")
       .select("token_mint").eq("user_id", cfg.user_id).eq("token_mint", event.tokenMint).maybeSingle();
@@ -234,15 +264,22 @@ async function main() {
     event.amountUsd = targetBuyUsd;
     // First-buy tracking: "first buy of this mint by this target since the bot started monitoring".
     const { data: targetPrior } = await db.from("target_traded_tokens")
-      .select("token_mint").eq("target_wallet", cfg.target_wallet!).eq("token_mint", event.tokenMint).maybeSingle();
+      .select("token_mint").eq("target_wallet", targetWallet).eq("token_mint", event.tokenMint).maybeSingle();
     const firstBuy = !targetPrior;
     const decision = checkEntry(cfg, event, meta, { first: firstBuy, already: !!prior });
-    if (!decision.pass) { log.info({ reason: decision.reason }, "filtered"); return; }
+    if (!decision.pass) { log.info({ reason: decision.reason, mint: event.tokenMint, targetBuyUsd: targetBuyUsd.toFixed(2) }, "filtered"); return; }
 
     const secret = await loadSigner(cfg.user_id);
-    if (!secret) { log.error("no funding key"); return; }
+    if (!secret) { log.error({ user_id: cfg.user_id }, "no funding key saved for this config user"); return; }
 
     const amountLamports = Math.floor((cfg.fixed_buy_usd / solPrice) * 1e9);
+    log.info({
+      mint: event.tokenMint,
+      fixedBuyUsd: cfg.fixed_buy_usd,
+      solPrice,
+      amountLamports,
+      route: cfg.execution_route,
+    }, "submitting copy buy");
 
     const result = await executeSwap({
       signerSecret: secret, inputMint: WSOL, outputMint: event.tokenMint,
@@ -273,9 +310,9 @@ async function main() {
       tx_sig: result.txSig, reason: "target copy buy", latency_ms: result.latencyMs, route: result.route,
     });
     await db.from("traded_tokens").upsert({ user_id: cfg.user_id, token_mint: event.tokenMint });
-    await db.from("target_traded_tokens").upsert({ target_wallet: cfg.target_wallet!, token_mint: event.tokenMint });
+    await db.from("target_traded_tokens").upsert({ target_wallet: targetWallet, token_mint: event.tokenMint });
 
-    if (pos) await monitor.onCopyBuy({ positionId: pos.id, tokenMint: event.tokenMint, targetWallet: cfg.target_wallet! });
+    if (pos) await monitor.onCopyBuy({ positionId: pos.id, tokenMint: event.tokenMint, targetWallet });
     log.info({ sig: result.txSig, ms: result.latencyMs, targetBuyUsd: targetBuyUsd.toFixed(2) }, "copy buy landed — follower monitor armed");
   }
 }

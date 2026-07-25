@@ -114,7 +114,8 @@ export class GeyserFeed {
   }
 
   private async push() {
-    if (!this.stream) return;
+    const stream = this.stream;
+    if (!stream) return;
     const req: SubscribeRequest = {
       accounts: {},
       slots: {},
@@ -134,7 +135,7 @@ export class GeyserFeed {
       accountsDataSlice: [],
       commitment: CommitmentLevel.PROCESSED,
     };
-    await new Promise<void>((res, rej) => this.stream!.write(req, (err: unknown) => (err ? rej(err) : res())));
+    await new Promise<void>((res, rej) => stream.write(req, (err: unknown) => (err ? rej(err) : res())));
   }
 
   private async connect() {
@@ -193,6 +194,15 @@ export class GeyserFeed {
 
     // Build per-(owner,mint) delta table across the whole tx.
     const table = this.buildOwnerMintDeltas(meta);
+    const logMessages = (meta?.logMessages ?? []).map((line: unknown) => String(line).toLowerCase());
+    const hasSwapSignal = logMessages.some((line: string) =>
+      line.includes("instruction: buy") ||
+      line.includes("instruction: sell") ||
+      line.includes("instruction: swap") ||
+      line.includes("instruction: route") ||
+      line.includes("sharedaccountsroute") ||
+      line.includes("exactoutroute"),
+    );
 
     // Native SOL deltas per account key (lamports).
     const message = tx.transaction?.message ?? tx.message;
@@ -219,16 +229,28 @@ export class GeyserFeed {
       const hasSolMove = Math.abs(solDelta) > 0.0005; // > 0.0005 SOL rules out fee-only
 
       const walletRows = table.filter((r) => r.owner === wallet && r.mint !== WSOL_MINT);
+      if (walletRows.length > 0) {
+        log.info({
+          wallet,
+          txSig,
+          solDelta,
+          hasSolMove,
+          hasSwapSignal,
+          tokenDeltas: walletRows.map((r) => ({ mint: r.mint, delta: Number((r.post - r.pre).toFixed(12)), decimals: r.decimals })),
+        }, "watched wallet token delta");
+      }
       for (const row of walletRows) {
         const delta = row.post - row.pre;
         if (Math.abs(delta) < 1e-12) continue;
 
-        if (hasSolMove) {
-          // SOL moved on this wallet in this tx → it's a swap, not a transfer.
+        if (hasSolMove || hasSwapSignal) {
+          // SOL movement is the strongest signal. Some providers omit loaded
+          // account keys, so we also accept explicit DEX/pump swap logs.
           const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
+          // When we have a real SOL delta, require signs to match:
           // Buy: token+ and SOL-. Sell: token- and SOL+.
-          if ((side === "buy" && solDelta > 0) || (side === "sell" && solDelta < 0)) {
-            // Signs don't match a swap; skip.
+          if (hasSolMove && ((side === "buy" && solDelta > 0) || (side === "sell" && solDelta < 0))) {
+            log.info({ wallet, txSig, mint: row.mint, side, solDelta, tokenDelta: delta }, "swap sign mismatch — skipped");
             continue;
           }
           out.push({
@@ -276,6 +298,22 @@ export class GeyserFeed {
     if (typeof v === "string") return v;
     if (v instanceof Uint8Array || Buffer.isBuffer(v)) return bs58.encode(Buffer.from(v as any));
     if (Array.isArray(v)) return bs58.encode(Buffer.from(v as any));
+    if (typeof v === "object") {
+      const obj = v as Record<string, unknown>;
+      if (Array.isArray(obj.data)) return bs58.encode(Buffer.from(obj.data));
+      if (obj.type === "Buffer" && Array.isArray(obj.data)) return bs58.encode(Buffer.from(obj.data));
+      for (const key of ["pubkey", "publicKey", "key", "value", "bytes"]) {
+        const decoded = this.toBase58(obj[key]);
+        if (decoded) return decoded;
+      }
+      if (typeof obj.toBase58 === "function") {
+        try { return String(obj.toBase58()); } catch { return ""; }
+      }
+      if (typeof obj.toString === "function") {
+        const s = obj.toString();
+        if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(s)) return s;
+      }
+    }
     return "";
   }
 
@@ -302,12 +340,7 @@ export class GeyserFeed {
   }
 
   private decodeAccountKeys(keys: unknown[]): string[] {
-    return keys.map((key) => {
-      if (typeof key === "string") return key;
-      if (key instanceof Uint8Array || Buffer.isBuffer(key)) return bs58.encode(Buffer.from(key));
-      if (Array.isArray(key)) return bs58.encode(Buffer.from(key));
-      return "";
-    }).filter(Boolean);
+    return keys.map((key) => this.toBase58(key)).filter(Boolean);
   }
 
   private decodeSignature(sig: unknown): string {

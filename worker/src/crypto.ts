@@ -3,6 +3,7 @@ import { env } from "./env.js";
 
 // AES-256-GCM. Ciphertext layout: [12-byte IV | 16-byte tag | ciphertext] base64
 function key(): Buffer {
+  if (!env.KEY_ENCRYPTION_KEY) return serviceKey();
   const buf = Buffer.from(env.KEY_ENCRYPTION_KEY, "base64");
   if (buf.length !== 32) throw new Error("KEY_ENCRYPTION_KEY must decode to 32 bytes");
   return buf;

@@ -15,8 +15,9 @@ const Env = z.object({
   JITO_BLOCK_ENGINE_URL: z.string().url().default("https://mainnet.block-engine.jito.wtf"),
   JITO_TIP_ACCOUNTS: z.string().optional(), // csv of pubkeys; jito-ts also ships defaults
 
-  // Encryption master key for funding-wallet private keys (32-byte base64)
-  KEY_ENCRYPTION_KEY: z.string().min(43),
+  // Optional legacy encryption master key. New dashboard-saved keys are
+  // encrypted from the Supabase service key so no extra setup is required.
+  KEY_ENCRYPTION_KEY: z.string().min(43).optional(),
 
   // Price feed (Birdeye/Jupiter)
   PRICE_API_URL: z.string().url().default("https://price.jup.ag/v6/price"),
