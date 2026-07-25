@@ -198,7 +198,14 @@ export class GeyserFeed {
     if (!tx) return;
     const events = this.decodeEvents(msg, tx);
     if (events.length === 0) {
-      log.debug({ slot: msg?.transaction?.slot }, "tx seen but no events decoded");
+      const txSig = this.decodeSignature(tx.signature ?? tx.transaction?.signatures?.[0]);
+      const message = tx.transaction?.message ?? tx.message;
+      const accountKeys = this.decodeAccountKeys([
+        ...(message?.accountKeys ?? []),
+        ...(tx.meta?.loadedWritableAddresses ?? tx.transaction?.meta?.loadedWritableAddresses ?? msg.transaction.meta?.loadedWritableAddresses ?? []),
+        ...(tx.meta?.loadedReadonlyAddresses ?? tx.transaction?.meta?.loadedReadonlyAddresses ?? msg.transaction.meta?.loadedReadonlyAddresses ?? []),
+      ]);
+      log.warn({ slot: msg?.transaction?.slot, txSig, watched: Array.from(this.watched), accountKeysCount: accountKeys.length }, "tx seen but no events decoded");
     }
     for (const ev of events) {
       this.decodedEventCount += 1;

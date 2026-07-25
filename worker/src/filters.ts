@@ -17,6 +17,7 @@ export async function loadTokenMeta(mint: string): Promise<TokenMeta> {
     const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
     const j = (await r.json()) as any;
     const pair = j?.pairs?.[0];
+    if (!pair) return { isPumpFun: mint.endsWith("pump"), socials: {} };
     return {
       marketCapUsd: pair?.fdv,
       liquidityUsd: pair?.liquidity?.usd,
@@ -28,7 +29,7 @@ export async function loadTokenMeta(mint: string): Promise<TokenMeta> {
       },
     };
   } catch {
-    return { isPumpFun: false, socials: {} };
+    return { isPumpFun: mint.endsWith("pump"), socials: {} };
   }
 }
 

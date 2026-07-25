@@ -30,7 +30,7 @@ async function loadConfig(userId: string): Promise<BotConfigRow | null> {
     .order("updated_at", { ascending: false }).limit(1);
   if (any.error) log.error({ err: any.error }, "bot_config query error (fallback)");
   const row = any.data?.[0];
-  if (row) log.info({ found_user_id: row.user_id, target: row.target_wallet }, "using fallback bot_config row");
+  if (row) log.warn({ requested_user_id: userId, found_user_id: row.user_id, target: row.target_wallet }, "using fallback bot_config row — HELIX_USER_ID may not match dashboard config");
   return (row as BotConfigRow) ?? null;
 }
 
@@ -219,6 +219,7 @@ async function main() {
           return;
         }
         if (event.side === "sell") return handleFollowerSell(event);
+        log.info({ eventWallet: event.wallet, targetWallet: cfg.target_wallet, side: event.side, mint: event.tokenMint, txSig: event.txSig }, "swap event ignored — not target buy or follower sell");
       }
     } catch (err) { log.error({ err }, "handler failed"); }
   }
@@ -378,7 +379,13 @@ async function main() {
       return null;
     }
 
-    const secret = await loadSigner(cfg.user_id);
+    let secret: string | null = null;
+    try {
+      secret = await loadSigner(cfg.user_id);
+    } catch (err) {
+      log.error({ err, user_id: cfg.user_id }, "funding key decrypt failed for copy buy");
+      return null;
+    }
     if (!secret) { log.error({ user_id: cfg.user_id }, "no funding key saved for this config user"); return null; }
 
     const amountLamports = Math.floor((cfg.fixed_buy_usd / solPrice) * 1e9);

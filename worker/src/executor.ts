@@ -17,6 +17,7 @@ import { env } from "./env.js";
 const log = pino({ level: env.LOG_LEVEL });
 const conn = new Connection(env.RPC_URL, { commitment: "processed" });
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
+const LANDING_TIMEOUT_MS = 15_000;
 
 const JITO_TIP_ACCOUNTS = (env.JITO_TIP_ACCOUNTS ?? "").split(",").filter(Boolean).map((s) => new PublicKey(s));
 
@@ -150,9 +151,11 @@ async function executeJupiterSwap(input: ExecuteInput, signer: Keypair, t0: numb
     // cannot double-buy, but it gives the trade a second path if Jito accepts a
     // bundle that never lands.
     sendRawViaRpc(tx, t0, "jito-rpc-backup").catch((err) => log.warn({ err }, "rpc backup submit failed"));
+    await waitForLanding(r.txSig, t0, "jito/rpc-backup");
     return { ...r, outUiAmount };
   }
   const sig = await sendRawViaRpc(tx, t0, "rpc");
+  await waitForLanding(sig, t0, "rpc");
   return { txSig: sig, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
 }
 
@@ -208,6 +211,27 @@ async function sendRawViaRpc(tx: VersionedTransaction, t0: number, label: string
   const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
   log.info({ sig, ms: Date.now() - t0, label }, "rpc transaction submitted");
   return sig;
+}
+
+async function waitForLanding(sig: string, t0: number, label: string) {
+  const deadline = Date.now() + LANDING_TIMEOUT_MS;
+  let lastStatus: string | null = null;
+
+  while (Date.now() < deadline) {
+    const { value } = await conn.getSignatureStatuses([sig], { searchTransactionHistory: false });
+    const status = value[0];
+    if (status?.err) {
+      throw new Error(`${label} transaction failed on-chain: ${JSON.stringify(status.err)}`);
+    }
+    if (status) {
+      lastStatus = status.confirmationStatus ?? (status.confirmations === null ? "finalized" : "processed");
+      log.info({ sig, status: lastStatus, ms: Date.now() - t0, label }, "transaction landed on-chain");
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  throw new Error(`${label} transaction was submitted but not seen on-chain within ${LANDING_TIMEOUT_MS / 1000}s: ${sig}`);
 }
 
 async function sendViaJito(tx: VersionedTransaction, signer: Keypair, tipSol: number, t0: number): Promise<ExecuteResult> {
