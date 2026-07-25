@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "doctor": "tsx src/doctor.ts",
+    "save-key": "tsx src/save-key.ts",
     "watch": "tsx watch src/index.ts",
     "start": "node --loader tsx dist/index.js",
     "build": "tsc -p tsconfig.json"
