@@ -457,7 +457,10 @@ export class GeyserFeed {
         continue;
       }
     }
-    return "";
+    // Last resort: treat the token account itself as the watched entity. This
+    // still lets us monitor that token account's future sell/transfer txs even
+    // when the upstream payload omits the wallet owner.
+    return tokenAccount;
   }
 
   private decodeAccountKeys(keys: unknown[]): string[] {
