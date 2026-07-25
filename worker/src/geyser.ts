@@ -90,6 +90,8 @@ export class GeyserFeed {
   private reconnectTimer?: NodeJS.Timeout;
   private reconnecting = false;
   private stopped = false;
+  private lastMessageAt?: number;
+  private decodedEventCount = 0;
 
   constructor(onSwap: OnSwap) {
     this.client = createClient();
@@ -111,6 +113,17 @@ export class GeyserFeed {
   async unwatch(wallet: string) {
     if (!this.watched.delete(wallet)) return;
     await this.push();
+  }
+
+  health() {
+    return {
+      watched: Array.from(this.watched),
+      watchedCount: this.watched.size,
+      lastMessageAt: this.lastMessageAt,
+      secondsSinceLastMessage: this.lastMessageAt ? Math.round((Date.now() - this.lastMessageAt) / 1000) : null,
+      decodedEventCount: this.decodedEventCount,
+      connected: !!this.stream,
+    };
   }
 
   private async push() {
@@ -174,6 +187,7 @@ export class GeyserFeed {
   }
 
   private async handleMessage(msg: any) {
+    this.lastMessageAt = Date.now();
     const tx = msg?.transaction?.transaction;
     if (!tx) return;
     const events = this.decodeEvents(msg, tx);
@@ -181,6 +195,7 @@ export class GeyserFeed {
       log.debug({ slot: msg?.transaction?.slot }, "tx seen but no events decoded");
     }
     for (const ev of events) {
+      this.decodedEventCount += 1;
       log.info({ kind: ev.kind, wallet: (ev as any).wallet ?? (ev as any).from, side: (ev as any).side, mint: ev.tokenMint }, "feed event");
       await this.onSwap(ev);
     }

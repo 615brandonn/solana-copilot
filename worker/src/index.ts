@@ -11,6 +11,7 @@ import { FollowerMonitor } from "./monitor.js";
 import { executeSwap } from "./executor.js";
 import { decryptPrivateKey } from "./crypto.js";
 import { checkEntry, loadTokenMeta } from "./filters.js";
+import { RpcBackfillPoller } from "./poller.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const WSOL = "So11111111111111111111111111111111111111112";
@@ -92,7 +93,8 @@ async function main() {
   await logFundingWalletReadiness(cfg.user_id, cfg.fixed_buy_usd);
 
   const feed = new GeyserFeed(async (event) => handle(event));
-  const monitor = new FollowerMonitor(feed);
+  const poller = new RpcBackfillPoller(rpc, async (event) => handle(event));
+  const monitor = new FollowerMonitor(feed, poller);
 
   const initialTargetWallet = cfg.target_wallet;
   if (!initialTargetWallet) throw new Error("config loaded without a target wallet");
@@ -105,13 +107,17 @@ async function main() {
     if (Number(pos.amount_remaining) <= 0) continue;
     await monitor.onCopyBuy({ positionId: pos.id, tokenMint: pos.token_mint, targetWallet: initialTargetWallet });
     const { data: followers } = await db.from("follower_wallets").select("wallet").eq("position_id", pos.id);
-    for (const f of followers ?? []) await feed.watch(f.wallet);
+    for (const f of followers ?? []) {
+      await feed.watch(f.wallet);
+      poller.watch(f.wallet);
+    }
   }
 
   while (true) {
     try { await feed.start([initialTargetWallet]); break; }
     catch (err) { log.error({ err }, "geyser start failed — retrying in 2s"); await delay(2000); }
   }
+  poller.start([initialTargetWallet]);
 
   setInterval(async () => {
     try {
@@ -121,12 +127,18 @@ async function main() {
       cfg = next;
       if (previousTarget && previousTarget !== next.target_wallet) {
         await feed.unwatch(previousTarget);
+        poller.unwatch(previousTarget);
         await feed.watch(next.target_wallet);
+        poller.watch(next.target_wallet);
         log.info({ previousTarget, nextTarget: next.target_wallet }, "target wallet subscription updated");
       }
     }
     catch (err) { log.error({ err }, "config refresh failed"); }
   }, 3000);
+
+  setInterval(() => {
+    log.info({ target: cfg.target_wallet, geyser: feed.health(), rpcFallback: poller.health() }, "stream heartbeat");
+  }, 30000);
 
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
   setInterval(() => { checkTpSl().catch((err) => log.error({ err }, "tp/sl loop failed")); }, 4000);

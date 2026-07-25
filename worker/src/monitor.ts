@@ -7,6 +7,7 @@
 import pino from "pino";
 import { db } from "./db.js";
 import type { GeyserFeed } from "./geyser.js";
+import type { RpcBackfillPoller } from "./poller.js";
 import { env } from "./env.js";
 
 const log = pino({ level: env.LOG_LEVEL });
@@ -23,7 +24,7 @@ export class FollowerMonitor {
   // tokenMint -> positionId (for quick reverse lookup on incoming swap/transfer events)
   private byMint = new Map<string, string>();
 
-  constructor(private feed: GeyserFeed) {}
+  constructor(private feed: GeyserFeed, private poller?: RpcBackfillPoller) {}
 
   activeForMint(mint: string): PositionCtx | undefined {
     const id = this.byMint.get(mint);
@@ -58,6 +59,7 @@ export class FollowerMonitor {
       });
     }
     await this.feed.watch(recipient);
+    this.poller?.watch(recipient);
     log.info({ positionId, recipient, amount }, "follower registered / topped up");
   }
 
@@ -87,7 +89,10 @@ export class FollowerMonitor {
   async releasePosition(positionId: string) {
     const ctx = this.active.get(positionId);
     const { data: rows } = await db.from("follower_wallets").select("wallet").eq("position_id", positionId);
-    for (const r of rows ?? []) await this.feed.unwatch(r.wallet);
+    for (const r of rows ?? []) {
+      await this.feed.unwatch(r.wallet);
+      this.poller?.unwatch(r.wallet);
+    }
     await db.from("follower_wallets").delete().eq("position_id", positionId);
     this.active.delete(positionId);
     if (ctx) this.byMint.delete(ctx.tokenMint);
