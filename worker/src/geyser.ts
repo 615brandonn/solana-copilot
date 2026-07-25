@@ -176,7 +176,13 @@ export class GeyserFeed {
     const tx = msg?.transaction?.transaction;
     if (!tx) return;
     const events = this.decodeEvents(msg, tx);
-    for (const ev of events) await this.onSwap(ev);
+    if (events.length === 0) {
+      log.debug({ slot: msg?.transaction?.slot }, "tx seen but no events decoded");
+    }
+    for (const ev of events) {
+      log.info({ kind: ev.kind, wallet: (ev as any).wallet ?? (ev as any).from, side: (ev as any).side, mint: ev.tokenMint }, "feed event");
+      await this.onSwap(ev);
+    }
   }
 
   private decodeEvents(msg: any, tx: any): FeedEvent[] {
@@ -257,14 +263,25 @@ export class GeyserFeed {
     return out;
   }
 
+  private toBase58(v: unknown): string {
+    if (!v) return "";
+    if (typeof v === "string") return v;
+    if (v instanceof Uint8Array || Buffer.isBuffer(v)) return bs58.encode(Buffer.from(v as any));
+    if (Array.isArray(v)) return bs58.encode(Buffer.from(v as any));
+    return "";
+  }
+
   private buildOwnerMintDeltas(meta: any): Array<{ owner: string; mint: string; pre: number; post: number; decimals: number }> {
     const key = (owner: string, mint: string) => `${owner}::${mint}`;
     const m = new Map<string, { owner: string; mint: string; pre: number; post: number; decimals: number }>();
     const ingest = (balances: any[], field: "pre" | "post") => {
       for (const b of balances ?? []) {
-        if (!b?.owner || !b?.mint) continue;
-        const k = key(b.owner, b.mint);
-        const row = m.get(k) ?? { owner: b.owner, mint: b.mint, pre: 0, post: 0, decimals: Number(b.uiTokenAmount?.decimals ?? 0) };
+        const owner = this.toBase58(b?.owner);
+        const mint = this.toBase58(b?.mint);
+        if (!owner || !mint) continue;
+        const k = key(owner, mint);
+        const decimals = Number(b.uiTokenAmount?.decimals ?? 0);
+        const row = m.get(k) ?? { owner, mint, pre: 0, post: 0, decimals };
         const amt = Number(b.uiTokenAmount?.uiAmountString ?? b.uiTokenAmount?.uiAmount ?? 0);
         row[field] += amt;
         row.decimals = Number(b.uiTokenAmount?.decimals ?? row.decimals);
