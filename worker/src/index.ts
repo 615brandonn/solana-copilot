@@ -207,7 +207,38 @@ async function main() {
   async function handleTransfer(ev: TransferEvent) {
     if (ev.from !== cfg.target_wallet) return;
     const ctx = monitor.activeForMint(ev.tokenMint);
-    if (!ctx) return; // Only track transfers for tokens we hold
+    if (!ctx) {
+      // Some Laserstream payloads show the target's immediate post-buy token
+      // movement as a transfer, while the actual swap has no positive net
+      // target balance left to decode. Since this target's pattern is buy →
+      // split to follower wallets, use that outbound transfer as a fallback
+      // entry trigger instead of silently missing the trade.
+      log.warn({
+        from: ev.from,
+        to: ev.to,
+        mint: ev.tokenMint,
+        amountTokens: ev.amountTokens,
+        txSig: ev.txSig,
+      }, "target transfer with no open position — using as fallback buy trigger");
+
+      const positionId = await tryCopyBuy({
+        kind: "swap",
+        wallet: ev.from,
+        side: "buy",
+        tokenMint: ev.tokenMint,
+        amountTokens: ev.amountTokens,
+        decimals: ev.decimals,
+        amountUsd: undefined,
+        solDelta: 0,
+        slot: ev.slot,
+        txSig: ev.txSig,
+        timestampMs: ev.timestampMs,
+        isPumpFun: ev.tokenMint.endsWith("pump"),
+      }, "target transfer fallback");
+
+      if (positionId) await monitor.recordTransfer(positionId, ev.to, ev.amountTokens);
+      return;
+    }
     await monitor.recordTransfer(ctx.positionId, ev.to, ev.amountTokens);
   }
 
@@ -276,12 +307,12 @@ async function main() {
     if (closed) await monitor.releasePosition(positionId);
   }
 
-  async function tryCopyBuy(event: SwapEvent) {
-    if (!cfg.enabled) return;
+  async function tryCopyBuy(event: SwapEvent, reason = "target copy buy"): Promise<string | null> {
+    if (!cfg.enabled) return null;
     const targetWallet = cfg.target_wallet;
     if (!targetWallet) {
       log.warn("target buy skipped because config target wallet is empty");
-      return;
+      return null;
     }
     log.info({
       target: event.wallet,
@@ -289,6 +320,7 @@ async function main() {
       tokenAmount: event.amountTokens,
       solDelta: event.solDelta,
       txSig: event.txSig,
+      reason,
     }, "target buy candidate");
     const meta = await loadTokenMeta(event.tokenMint);
     const { data: prior } = await db.from("traded_tokens")
@@ -320,11 +352,11 @@ async function main() {
           onlyOncePerToken: cfg.only_once_per_token,
         },
       }, "filtered");
-      return;
+      return null;
     }
 
     const secret = await loadSigner(cfg.user_id);
-    if (!secret) { log.error({ user_id: cfg.user_id }, "no funding key saved for this config user"); return; }
+    if (!secret) { log.error({ user_id: cfg.user_id }, "no funding key saved for this config user"); return null; }
 
     const amountLamports = Math.floor((cfg.fixed_buy_usd / solPrice) * 1e9);
     log.info({
@@ -344,7 +376,7 @@ async function main() {
       });
     } catch (err) {
       log.error({ err, mint: event.tokenMint, amountLamports, route: cfg.execution_route }, "copy buy failed before transaction landed");
-      return;
+      return null;
     }
 
     // Best-effort actual-received amount: worker doesn't have the confirmed
@@ -367,7 +399,7 @@ async function main() {
     await db.from("trades").insert({
       user_id: cfg.user_id, position_id: pos?.id, side: "buy",
       token_mint: event.tokenMint, amount_tokens: receivedUi, amount_usd: cfg.fixed_buy_usd,
-      tx_sig: result.txSig, reason: "target copy buy", latency_ms: result.latencyMs, route: result.route,
+      tx_sig: result.txSig, reason, latency_ms: result.latencyMs, route: result.route,
     });
     await db.from("traded_tokens").upsert({ user_id: cfg.user_id, token_mint: event.tokenMint });
     await db.from("target_traded_tokens").upsert({ target_wallet: targetWallet, token_mint: event.tokenMint });
@@ -378,6 +410,7 @@ async function main() {
       ms: result.latencyMs,
       targetBuyUsd: targetBuyUsd === undefined ? "unknown" : targetBuyUsd.toFixed(2),
     }, "copy buy landed — follower monitor armed");
+    return pos?.id ?? null;
   }
 }
 
