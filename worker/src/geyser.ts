@@ -343,7 +343,7 @@ export class GeyserFeed {
           tokenMint: inferredBuy.tokenMint,
           amountTokens: inferredBuy.amountTokens,
           decimals: inferredBuy.decimals,
-          amountUsd: undefined,
+          amountUsd: stablecoinSpentUsd,
           solDelta,
           slot,
           txSig,

@@ -193,7 +193,7 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
       tokenMint: inferredBuy.tokenMint,
       amountTokens: inferredBuy.amountTokens,
       decimals: inferredBuy.decimals,
-      amountUsd: undefined,
+      amountUsd: stablecoinSpentUsd,
       solDelta: nativeSolDelta,
       slot,
       txSig: signature,
