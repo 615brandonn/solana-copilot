@@ -141,13 +141,15 @@ async function main() {
   if (!target) return;
 
   let secret: string | null = null;
+  let fundingKeyErrored = false;
   try {
     secret = await loadFundingKey(cfg.user_id);
   } catch (err) {
+    fundingKeyErrored = true;
     fail("Funding key", err instanceof Error ? err.message : String(err));
-    fail("Next step", "Open the dashboard, paste the Phantom private key again, click Save, then run bun run doctor again");
+    fail("Next step", "On the VPS run: bun run save-key — paste the Phantom private key there, then run bun run doctor again");
   }
-  if (!secret) {
+  if (!secret && !fundingKeyErrored) {
     fail("Funding key", `missing for config user_id ${cfg.user_id}`);
   } else {
     try {
