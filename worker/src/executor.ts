@@ -22,6 +22,7 @@ export type ExecuteInput = {
   slippageBps: number;
   route: "jito" | "rpc";
   jitoTipSol: number;
+  outputDecimals?: number;           // needed to compute UI amount received (Jupiter v6 doesn't return this)
 };
 
 export type ExecuteResult = { txSig: string; latencyMs: number; route: "jito" | "rpc"; outUiAmount?: number };
