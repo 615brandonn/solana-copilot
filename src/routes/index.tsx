@@ -77,7 +77,13 @@ function Dashboard() {
 
   const handleSaveKey = async () => {
     try {
-      await saveFundingKey({ data: { privateKey: cfg.fundingPrivateKey } });
+      const result = await saveFundingKey({ data: { privateKey: cfg.fundingPrivateKey } });
+      if (!result.ok) {
+        setKeySaved(false);
+        if (typeof window !== "undefined") localStorage.removeItem("helix_key_saved");
+        toast.error(result.error);
+        return;
+      }
       setKeySaved(true);
       if (typeof window !== "undefined") localStorage.setItem("helix_key_saved", "1");
       toast.success("Private key encrypted and saved");
