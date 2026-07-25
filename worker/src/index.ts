@@ -210,7 +210,10 @@ async function main() {
     try {
       if (event.kind === "transfer") return handleTransfer(event);
       if (event.kind === "swap") {
-        if (event.wallet === cfg.target_wallet && event.side === "buy") return tryCopyBuy(event);
+        if (event.wallet === cfg.target_wallet && event.side === "buy") {
+          await tryCopyBuy(event);
+          return;
+        }
         if (event.side === "sell") return handleFollowerSell(event);
       }
     } catch (err) { log.error({ err }, "handler failed"); }
