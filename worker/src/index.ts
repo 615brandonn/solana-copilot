@@ -80,6 +80,68 @@ async function main() {
     catch (err) { log.error({ err }, "config refresh failed"); }
   }, 3000);
 
+  // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
+  setInterval(() => { checkTpSl().catch((err) => log.error({ err }, "tp/sl loop failed")); }, 4000);
+
+  async function checkTpSl() {
+    if (!cfg?.enabled) return;
+    if (!cfg.take_profit_enabled && !cfg.stop_loss_enabled) return;
+    const { data: positions } = await db.from("positions")
+      .select("id,token_mint,entry_price_usd,amount_tokens,amount_remaining,decimals,tp_taken,mirrored_sold_fraction")
+      .eq("user_id", cfg.user_id).is("closed_at", null);
+    for (const pos of positions ?? []) {
+      const remaining = Number(pos.amount_remaining);
+      const entry = Number(pos.entry_price_usd);
+      if (remaining <= 0 || entry <= 0) continue;
+      const price = await priceUsd(pos.token_mint);
+      if (!price || price <= 0) continue;
+      const gainPct = ((price - entry) / entry) * 100;
+
+      if (cfg.stop_loss_enabled && gainPct <= -Math.abs(cfg.stop_loss_pct)) {
+        const decimals = Number(pos.decimals ?? 0);
+        const sellRaw = Math.floor(remaining * Math.pow(10, decimals));
+        if (sellRaw <= 0) continue;
+        log.warn({ positionId: pos.id, gainPct: gainPct.toFixed(2) }, "stop-loss triggered — selling all");
+        await executeExitSell(pos.id, pos.token_mint, sellRaw, remaining, `stop-loss ${gainPct.toFixed(1)}%`);
+        continue;
+      }
+
+      if (cfg.take_profit_enabled && !pos.tp_taken && gainPct >= Math.abs(cfg.take_profit_pct)) {
+        const sellFraction = Math.min(1, Math.max(0, Number(cfg.take_profit_sell_pct) / 100));
+        const sellUi = remaining * sellFraction;
+        const decimals = Number(pos.decimals ?? 0);
+        const sellRaw = Math.floor(sellUi * Math.pow(10, decimals));
+        if (sellRaw <= 0) continue;
+        log.info({ positionId: pos.id, gainPct: gainPct.toFixed(2), sellFraction }, "take-profit triggered");
+        await executeExitSell(pos.id, pos.token_mint, sellRaw, sellUi, `take-profit ${gainPct.toFixed(1)}%`, true);
+      }
+    }
+  }
+
+  async function executeExitSell(positionId: string, mint: string, sellRaw: number, sellUi: number, reason: string, markTpTaken = false) {
+    const secret = await loadSigner(cfg.user_id);
+    if (!secret) { log.error("no funding key for tp/sl sell"); return; }
+    const result = await executeSwap({
+      signerSecret: secret, inputMint: mint, outputMint: WSOL,
+      amountLamports: sellRaw, slippageBps: 500,
+      route: cfg.execution_route, jitoTipSol: cfg.jito_tip_sol,
+    });
+    const { data: cur } = await db.from("positions").select("amount_remaining").eq("id", positionId).single();
+    const newRemaining = Math.max(0, Number(cur?.amount_remaining ?? 0) - sellUi);
+    const closed = newRemaining <= 1e-9;
+    const update: any = { amount_remaining: newRemaining, closed_at: closed ? new Date().toISOString() : null };
+    if (markTpTaken) update.tp_taken = true;
+    await db.from("positions").update(update).eq("id", positionId);
+    await db.from("trades").insert({
+      user_id: cfg.user_id, position_id: positionId, side: "sell",
+      token_mint: mint, amount_tokens: sellUi,
+      tx_sig: result.txSig, reason, latency_ms: result.latencyMs, route: result.route,
+    });
+    log.info({ sig: result.txSig, reason, closed }, "exit sell landed");
+    if (closed) await monitor.releasePosition(positionId);
+  }
+
+
   async function handle(event: FeedEvent) {
     if (!cfg?.enabled) {
       log.info("bot disabled — skipping event");
@@ -192,13 +254,16 @@ async function main() {
     // balance yet, so we estimate from Jupiter's quote embedded in swap route.
     const receivedUi = result.outUiAmount ?? 0;
 
+    const entryPrice = (await priceUsd(event.tokenMint)) ?? (receivedUi > 0 ? cfg.fixed_buy_usd / receivedUi : 0);
+
     const { data: pos } = await db.from("positions").insert({
       user_id: cfg.user_id, token_mint: event.tokenMint,
-      entry_price_usd: 0,
+      entry_price_usd: entryPrice,
       amount_tokens: receivedUi,
       amount_remaining: receivedUi,
       decimals: event.decimals,
       mirrored_sold_fraction: 0,
+      tp_taken: false,
       entry_tx_sig: result.txSig, entry_slot: event.slot,
     }).select("id").single();
 
