@@ -204,7 +204,12 @@ async function main() {
       jitoTipSol: cfg.jito_tip_sol,
     });
 
-    const newRemaining = Math.max(0, (await db.from("positions").select("amount_remaining").eq("id", positionId).single()).data!.amount_remaining - sellUi);
+    const { data: currentPosition, error: currentPositionError } = await db.from("positions").select("amount_remaining").eq("id", positionId).single();
+    if (currentPositionError || !currentPosition) {
+      log.error({ err: currentPositionError, positionId }, "could not load position after mirror sell");
+      return;
+    }
+    const newRemaining = Math.max(0, Number(currentPosition.amount_remaining) - sellUi);
     const closed = newRemaining <= 1e-9;
     await db.from("positions").update({
       amount_remaining: newRemaining,
@@ -225,6 +230,13 @@ async function main() {
 
   async function tryCopyBuy(event: SwapEvent) {
     if (!cfg.enabled) return;
+    log.info({
+      target: event.wallet,
+      mint: event.tokenMint,
+      tokenAmount: event.amountTokens,
+      solDelta: event.solDelta,
+      txSig: event.txSig,
+    }, "target buy candidate");
     const meta = await loadTokenMeta(event.tokenMint);
     const { data: prior } = await db.from("traded_tokens")
       .select("token_mint").eq("user_id", cfg.user_id).eq("token_mint", event.tokenMint).maybeSingle();
@@ -237,12 +249,19 @@ async function main() {
       .select("token_mint").eq("target_wallet", cfg.target_wallet!).eq("token_mint", event.tokenMint).maybeSingle();
     const firstBuy = !targetPrior;
     const decision = checkEntry(cfg, event, meta, { first: firstBuy, already: !!prior });
-    if (!decision.pass) { log.info({ reason: decision.reason }, "filtered"); return; }
+    if (!decision.pass) { log.info({ reason: decision.reason, mint: event.tokenMint, targetBuyUsd: targetBuyUsd.toFixed(2) }, "filtered"); return; }
 
     const secret = await loadSigner(cfg.user_id);
-    if (!secret) { log.error("no funding key"); return; }
+    if (!secret) { log.error({ user_id: cfg.user_id }, "no funding key saved for this config user"); return; }
 
     const amountLamports = Math.floor((cfg.fixed_buy_usd / solPrice) * 1e9);
+    log.info({
+      mint: event.tokenMint,
+      fixedBuyUsd: cfg.fixed_buy_usd,
+      solPrice,
+      amountLamports,
+      route: cfg.execution_route,
+    }, "submitting copy buy");
 
     const result = await executeSwap({
       signerSecret: secret, inputMint: WSOL, outputMint: event.tokenMint,
