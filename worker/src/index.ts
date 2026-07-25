@@ -128,6 +128,10 @@ async function main() {
     catch (err) { log.error({ err }, "config refresh failed"); }
   }, 3000);
 
+  setInterval(() => {
+    log.info({ target: cfg.target_wallet, ...feed.health() }, "stream heartbeat");
+  }, 30000);
+
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
   setInterval(() => { checkTpSl().catch((err) => log.error({ err }, "tp/sl loop failed")); }, 4000);
 
