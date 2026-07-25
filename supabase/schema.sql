@@ -55,6 +55,8 @@ create table if not exists public.positions (
 );
 alter table public.positions add column if not exists decimals int not null default 0;
 alter table public.positions add column if not exists mirrored_sold_fraction numeric not null default 0;
+alter table public.positions add column if not exists tp_taken boolean not null default false;
+alter table public.positions alter column entry_price_usd drop not null;
 create index if not exists positions_user_open_idx on public.positions (user_id) where closed_at is null;
 create index if not exists positions_open_by_mint_idx on public.positions (token_mint) where closed_at is null;
 
