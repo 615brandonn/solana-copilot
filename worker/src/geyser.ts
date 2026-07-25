@@ -176,7 +176,13 @@ export class GeyserFeed {
     const tx = msg?.transaction?.transaction;
     if (!tx) return;
     const events = this.decodeEvents(msg, tx);
-    for (const ev of events) await this.onSwap(ev);
+    if (events.length === 0) {
+      log.debug({ slot: msg?.transaction?.slot }, "tx seen but no events decoded");
+    }
+    for (const ev of events) {
+      log.info({ kind: ev.kind, wallet: (ev as any).wallet ?? (ev as any).from, side: (ev as any).side, mint: ev.tokenMint }, "feed event");
+      await this.onSwap(ev);
+    }
   }
 
   private decodeEvents(msg: any, tx: any): FeedEvent[] {
