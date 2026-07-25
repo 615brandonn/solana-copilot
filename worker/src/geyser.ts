@@ -368,7 +368,7 @@ export class GeyserFeed {
     emittedBuyMints: Set<string>,
     negativeWalletMints: Set<string>,
   ): { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> } | null {
-    const likelySpentValue = solDelta < -0.0005 || hasSwapSignal;
+    const likelySpentValue = solDelta < -0.0005 || (Math.abs(solDelta) <= 0.0005 && hasSwapSignal);
     if (!likelySpentValue) return null;
 
     const byMint = new Map<string, { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> }>();
