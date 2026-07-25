@@ -193,39 +193,70 @@ export class GeyserFeed {
 
     // Build per-(owner,mint) delta table across the whole tx.
     const table = this.buildOwnerMintDeltas(meta);
-    // For fast lookup: mint -> [{owner, pre, post, decimals}]
-    const byMint = new Map<string, Array<{ owner: string; pre: number; post: number; decimals: number }>>();
-    for (const row of table) {
-      const list = byMint.get(row.mint) ?? [];
-      list.push(row);
-      byMint.set(row.mint, list);
-    }
+
+    // Native SOL deltas per account key (lamports).
+    const message = tx.transaction?.message ?? tx.message;
+    const accountKeys = this.decodeAccountKeys([
+      ...(message?.accountKeys ?? []),
+      ...(meta?.loadedWritableAddresses ?? []),
+      ...(meta?.loadedReadonlyAddresses ?? []),
+    ]);
+    const preBalances: number[] = (meta?.preBalances ?? []).map((n: any) => Number(n));
+    const postBalances: number[] = (meta?.postBalances ?? []).map((n: any) => Number(n));
+    const nativeSolDelta = (wallet: string): number => {
+      const idx = accountKeys.indexOf(wallet);
+      if (idx < 0) return 0;
+      const pre = preBalances[idx] ?? 0;
+      const post = postBalances[idx] ?? 0;
+      return (post - pre) / 1e9; // SOL
+    };
 
     for (const wallet of this.watched) {
-      // SOL/WSOL delta for this wallet in this tx (best-effort; native SOL changes are not in token balances)
-      const solRow = table.find((r) => r.owner === wallet && r.mint === WSOL_MINT);
-      const solDelta = (solRow?.post ?? 0) - (solRow?.pre ?? 0);
+      const wsolRow = table.find((r) => r.owner === wallet && r.mint === WSOL_MINT);
+      const wsolDelta = (wsolRow?.post ?? 0) - (wsolRow?.pre ?? 0);
+      const natDelta = nativeSolDelta(wallet);
+      const solDelta = wsolDelta + natDelta;
+      const hasSolMove = Math.abs(solDelta) > 0.0005; // > 0.0005 SOL rules out fee-only
 
-      // Consider each mint the wallet is involved in
-      const walletRows = table.filter((r) => r.owner === wallet);
+      const walletRows = table.filter((r) => r.owner === wallet && r.mint !== WSOL_MINT);
       for (const row of walletRows) {
-        if (row.mint === WSOL_MINT) continue;
         const delta = row.post - row.pre;
         if (Math.abs(delta) < 1e-12) continue;
 
-        // Is this a transfer? Look for a counterparty on the same mint with opposite-sign delta of ~equal magnitude.
-        const peers = (byMint.get(row.mint) ?? []).filter((p) => p.owner !== wallet);
-        const transferPeer = peers.find((p) => {
-          const pd = p.post - p.pre;
-          return Math.sign(pd) === -Math.sign(delta) && Math.abs(pd + delta) / Math.max(Math.abs(delta), 1e-9) < 0.02;
-        });
-
-        if (transferPeer && delta < 0) {
-          // Target sent tokens to a peer wallet.
+        if (hasSolMove) {
+          // SOL moved on this wallet in this tx → it's a swap, not a transfer.
+          const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
+          // Buy: token+ and SOL-. Sell: token- and SOL+.
+          if ((side === "buy" && solDelta > 0) || (side === "sell" && solDelta < 0)) {
+            // Signs don't match a swap; skip.
+            continue;
+          }
+          out.push({
+            kind: "swap",
+            wallet,
+            side,
+            tokenMint: row.mint,
+            amountTokens: Math.abs(delta),
+            decimals: row.decimals,
+            amountUsd: undefined,
+            solDelta,
+            slot,
+            txSig,
+            timestampMs: Date.now(),
+            isPumpFun: row.mint.endsWith("pump"),
+          });
+        } else if (delta < 0) {
+          // No SOL movement on this wallet: pure token transfer OUT.
+          const peers = table.filter((p) => p.mint === row.mint && p.owner !== wallet);
+          const peer = peers.find((p) => {
+            const pd = p.post - p.pre;
+            return pd > 0 && Math.abs(pd + delta) / Math.max(Math.abs(delta), 1e-9) < 0.05;
+          });
+          if (!peer) continue;
           out.push({
             kind: "transfer",
             from: wallet,
-            to: transferPeer.owner,
+            to: peer.owner,
             tokenMint: row.mint,
             amountTokens: Math.abs(delta),
             decimals: row.decimals,
@@ -233,30 +264,7 @@ export class GeyserFeed {
             txSig,
             timestampMs: Date.now(),
           });
-          continue;
         }
-
-        // Otherwise treat as swap (buy or sell). Skip pure incoming transfers we don't own the sender for.
-        if (transferPeer && delta > 0 && !this.watched.has(transferPeer.owner)) {
-          // We're the recipient of an unrelated transfer — ignore as swap.
-          continue;
-        }
-
-        const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
-        out.push({
-          kind: "swap",
-          wallet,
-          side,
-          tokenMint: row.mint,
-          amountTokens: Math.abs(delta),
-          decimals: row.decimals,
-          amountUsd: undefined,
-          solDelta,
-          slot,
-          txSig,
-          timestampMs: Date.now(),
-          isPumpFun: row.mint.endsWith("pump"),
-        });
       }
     }
 
