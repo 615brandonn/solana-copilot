@@ -99,7 +99,7 @@ export class RpcBackfillPoller {
   }
 }
 
-function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
+export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
   const out: FeedEvent[] = [];
   const meta = tx?.meta;
   if (!meta) return out;
