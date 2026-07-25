@@ -185,6 +185,7 @@ async function main() {
     const result = await executeSwap({
       signerSecret: secret, inputMint: WSOL, outputMint: event.tokenMint,
       amountLamports, slippageBps: 300, route: cfg.execution_route, jitoTipSol: cfg.jito_tip_sol,
+      outputDecimals: event.decimals,
     });
 
     // Best-effort actual-received amount: worker doesn't have the confirmed
