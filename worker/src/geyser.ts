@@ -4,6 +4,8 @@
 
 import { createRequire } from "node:module";
 import type { SubscribeRequest } from "@triton-one/yellowstone-grpc";
+import { PublicKey } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import bs58 from "bs58";
 import pino from "pino";
 import { env } from "./env.js";
@@ -207,8 +209,18 @@ export class GeyserFeed {
     const meta = tx.meta ?? tx.transaction?.meta ?? msg.transaction.meta;
     const txSig = this.decodeSignature(tx.signature ?? tx.transaction?.signatures?.[0]);
 
-    // Build per-(owner,mint) delta table across the whole tx.
-    const table = this.buildOwnerMintDeltas(meta);
+    // Native SOL deltas per account key (lamports).
+    const message = tx.transaction?.message ?? tx.message;
+    const accountKeys = this.decodeAccountKeys([
+      ...(message?.accountKeys ?? []),
+      ...(meta?.loadedWritableAddresses ?? []),
+      ...(meta?.loadedReadonlyAddresses ?? []),
+    ]);
+
+    // Build per-(owner,mint) delta table across the whole tx. Some Geyser/RPC
+    // payloads omit token-balance owner, so accountIndex + ATA matching is used
+    // as a fallback for every watched wallet.
+    const table = this.buildOwnerMintDeltas(meta, accountKeys);
     const logMessages = (meta?.logMessages ?? []).map((line: unknown) => String(line).toLowerCase());
     const hasSwapSignal = logMessages.some((line: string) =>
       line.includes("instruction: buy") ||
@@ -219,13 +231,6 @@ export class GeyserFeed {
       line.includes("exactoutroute"),
     );
 
-    // Native SOL deltas per account key (lamports).
-    const message = tx.transaction?.message ?? tx.message;
-    const accountKeys = this.decodeAccountKeys([
-      ...(message?.accountKeys ?? []),
-      ...(meta?.loadedWritableAddresses ?? []),
-      ...(meta?.loadedReadonlyAddresses ?? []),
-    ]);
     const preBalances: number[] = (meta?.preBalances ?? []).map((n: any) => Number(n));
     const postBalances: number[] = (meta?.postBalances ?? []).map((n: any) => Number(n));
     const nativeSolDelta = (wallet: string): number => {
@@ -244,6 +249,8 @@ export class GeyserFeed {
       const hasSolMove = Math.abs(solDelta) > 0.0005; // > 0.0005 SOL rules out fee-only
 
       const walletRows = table.filter((r) => r.owner === wallet && r.mint !== WSOL_MINT);
+      const emittedBuyMints = new Set<string>();
+      const negativeWalletMints = new Set<string>();
       if (walletRows.length > 0) {
         log.info({
           wallet,
@@ -257,6 +264,7 @@ export class GeyserFeed {
       for (const row of walletRows) {
         const delta = row.post - row.pre;
         if (Math.abs(delta) < 1e-12) continue;
+        if (delta < 0) negativeWalletMints.add(row.mint);
 
         if (hasSolMove || hasSwapSignal) {
           // SOL movement is the strongest signal. Some providers omit loaded
@@ -264,7 +272,7 @@ export class GeyserFeed {
           const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
           // When we have a real SOL delta, require signs to match:
           // Buy: token+ and SOL-. Sell: token- and SOL+.
-          if (hasSolMove && ((side === "buy" && solDelta > 0) || (side === "sell" && solDelta < 0))) {
+          if (hasSolMove && !hasSwapSignal && ((side === "buy" && solDelta > 0) || (side === "sell" && solDelta < 0))) {
             log.info({ wallet, txSig, mint: row.mint, side, solDelta, tokenDelta: delta }, "swap sign mismatch — skipped");
             continue;
           }
@@ -282,6 +290,7 @@ export class GeyserFeed {
             timestampMs: Date.now(),
             isPumpFun: row.mint.endsWith("pump"),
           });
+          if (side === "buy") emittedBuyMints.add(row.mint);
         } else if (delta < 0) {
           // No SOL movement on this wallet: pure token transfer OUT.
           const peers = table.filter((p) => p.mint === row.mint && p.owner !== wallet);
@@ -303,9 +312,87 @@ export class GeyserFeed {
           });
         }
       }
+
+      // Many fast target wallets buy and transfer the bought token out inside
+      // the same transaction. In that tx the target can have no positive final
+      // token delta, so a pure owner-delta decoder misses the buy entirely.
+      // If the watched wallet spent SOL or the tx has explicit swap logs, infer
+      // the bought mint from positive token deltas on recipient wallets, while
+      // excluding mints the watched wallet itself sent out (sell/transfer side).
+      const inferredBuy = this.inferBuyTransferredOut(table, wallet, solDelta, hasSwapSignal, emittedBuyMints, negativeWalletMints);
+      if (inferredBuy) {
+        log.warn({
+          wallet,
+          txSig,
+          mint: inferredBuy.tokenMint,
+          amountTokens: inferredBuy.amountTokens,
+          recipients: inferredBuy.recipients.map((r) => ({ wallet: r.owner, amountTokens: r.amountTokens })),
+          solDelta,
+          hasSwapSignal,
+        }, "inferred target buy from same-tx recipient balances");
+
+        out.push({
+          kind: "swap",
+          wallet,
+          side: "buy",
+          tokenMint: inferredBuy.tokenMint,
+          amountTokens: inferredBuy.amountTokens,
+          decimals: inferredBuy.decimals,
+          amountUsd: undefined,
+          solDelta,
+          slot,
+          txSig,
+          timestampMs: Date.now(),
+          isPumpFun: inferredBuy.tokenMint.endsWith("pump"),
+        });
+
+        for (const recipient of inferredBuy.recipients) {
+          out.push({
+            kind: "transfer",
+            from: wallet,
+            to: recipient.owner,
+            tokenMint: inferredBuy.tokenMint,
+            amountTokens: recipient.amountTokens,
+            decimals: inferredBuy.decimals,
+            slot,
+            txSig,
+            timestampMs: Date.now(),
+          });
+        }
+      }
     }
 
     return out;
+  }
+
+  private inferBuyTransferredOut(
+    table: Array<{ owner: string; mint: string; pre: number; post: number; decimals: number }>,
+    wallet: string,
+    solDelta: number,
+    hasSwapSignal: boolean,
+    emittedBuyMints: Set<string>,
+    negativeWalletMints: Set<string>,
+  ): { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> } | null {
+    const likelySpentValue = solDelta < -0.0005 || hasSwapSignal;
+    if (!likelySpentValue) return null;
+
+    const byMint = new Map<string, { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> }>();
+    for (const row of table) {
+      if (row.owner === wallet || row.mint === WSOL_MINT) continue;
+      if (emittedBuyMints.has(row.mint) || negativeWalletMints.has(row.mint)) continue;
+      const delta = row.post - row.pre;
+      if (delta <= 1e-12) continue;
+      const cur = byMint.get(row.mint) ?? { tokenMint: row.mint, amountTokens: 0, decimals: row.decimals, recipients: [] };
+      cur.amountTokens += delta;
+      cur.decimals = row.decimals;
+      cur.recipients.push({ owner: row.owner, amountTokens: delta });
+      byMint.set(row.mint, cur);
+    }
+
+    const candidates = Array.from(byMint.values())
+      .filter((candidate) => candidate.amountTokens > 0 && candidate.recipients.length > 0)
+      .sort((a, b) => b.amountTokens - a.amountTokens);
+    return candidates[0] ?? null;
   }
 
   private toBase58(v: unknown): string {
@@ -332,13 +419,13 @@ export class GeyserFeed {
     return "";
   }
 
-  private buildOwnerMintDeltas(meta: any): Array<{ owner: string; mint: string; pre: number; post: number; decimals: number }> {
+  private buildOwnerMintDeltas(meta: any, accountKeys: string[]): Array<{ owner: string; mint: string; pre: number; post: number; decimals: number }> {
     const key = (owner: string, mint: string) => `${owner}::${mint}`;
     const m = new Map<string, { owner: string; mint: string; pre: number; post: number; decimals: number }>();
     const ingest = (balances: any[], field: "pre" | "post") => {
       for (const b of balances ?? []) {
-        const owner = this.toBase58(b?.owner);
         const mint = this.toBase58(b?.mint);
+        const owner = this.resolveTokenOwner(b, mint, accountKeys);
         if (!owner || !mint) continue;
         const k = key(owner, mint);
         const decimals = Number(b.uiTokenAmount?.decimals ?? 0);
@@ -352,6 +439,28 @@ export class GeyserFeed {
     ingest(meta?.preTokenBalances ?? [], "pre");
     ingest(meta?.postTokenBalances ?? [], "post");
     return Array.from(m.values());
+  }
+
+  private resolveTokenOwner(balance: any, mint: string, accountKeys: string[]): string {
+    const explicitOwner = this.toBase58(balance?.owner);
+    if (explicitOwner) return explicitOwner;
+
+    const accountIndex = Number(balance?.accountIndex);
+    const tokenAccount = Number.isFinite(accountIndex) ? accountKeys[accountIndex] : "";
+    if (!tokenAccount || !mint) return "";
+
+    for (const wallet of this.watched) {
+      try {
+        const ata = getAssociatedTokenAddressSync(new PublicKey(mint), new PublicKey(wallet), true).toBase58();
+        if (ata === tokenAccount) return wallet;
+      } catch {
+        continue;
+      }
+    }
+    // Last resort: treat the token account itself as the watched entity. This
+    // still lets us monitor that token account's future sell/transfer txs even
+    // when the upstream payload omits the wallet owner.
+    return tokenAccount;
   }
 
   private decodeAccountKeys(keys: unknown[]): string[] {

@@ -1,4 +1,5 @@
 import { Connection, PublicKey } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import pino from "pino";
 import { env } from "./env.js";
 import type { FeedEvent } from "./geyser.js";
@@ -111,7 +112,7 @@ function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
   const postLamports = targetIndex >= 0 ? Number(meta?.postBalances?.[targetIndex] ?? 0) : 0;
   const nativeSolDelta = (postLamports - preLamports) / 1e9;
 
-  const rows = ownerMintRows(meta, wallet);
+  const rows = ownerMintRows(meta, wallet, accountKeys);
   const logMessages = (meta?.logMessages ?? []).map((line: unknown) => String(line).toLowerCase());
   const hasSwapSignal = logMessages.some((line: string) =>
     line.includes("instruction: buy") ||
@@ -122,14 +123,17 @@ function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
     line.includes("exactoutroute"),
   );
   const hasSolMove = Math.abs(nativeSolDelta) > 0.0005;
+  const emittedBuyMints = new Set<string>();
+  const negativeWalletMints = new Set<string>();
 
   for (const row of rows) {
     const delta = row.post - row.pre;
     if (Math.abs(delta) < 1e-12) continue;
+    if (delta < 0) negativeWalletMints.add(row.mint);
 
     if (hasSolMove || hasSwapSignal) {
       const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
-      if (hasSolMove && ((side === "buy" && nativeSolDelta > 0) || (side === "sell" && nativeSolDelta < 0))) continue;
+      if (hasSolMove && !hasSwapSignal && ((side === "buy" && nativeSolDelta > 0) || (side === "sell" && nativeSolDelta < 0))) continue;
       out.push({
         kind: "swap",
         wallet,
@@ -144,6 +148,7 @@ function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
         timestampMs: Date.now(),
         isPumpFun: row.mint.endsWith("pump"),
       });
+      if (side === "buy") emittedBuyMints.add(row.mint);
       continue;
     }
 
@@ -164,14 +169,57 @@ function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
     }
   }
 
+  const inferredBuy = inferBuyTransferredOut(meta, wallet, accountKeys, nativeSolDelta, hasSwapSignal, emittedBuyMints, negativeWalletMints);
+  if (inferredBuy) {
+    log.warn({
+      wallet,
+      signature,
+      mint: inferredBuy.tokenMint,
+      amountTokens: inferredBuy.amountTokens,
+      recipients: inferredBuy.recipients.map((r) => ({ wallet: r.owner, amountTokens: r.amountTokens })),
+      nativeSolDelta,
+      hasSwapSignal,
+    }, "rpc fallback inferred target buy from same-tx recipient balances");
+
+    out.push({
+      kind: "swap",
+      wallet,
+      side: "buy",
+      tokenMint: inferredBuy.tokenMint,
+      amountTokens: inferredBuy.amountTokens,
+      decimals: inferredBuy.decimals,
+      amountUsd: undefined,
+      solDelta: nativeSolDelta,
+      slot,
+      txSig: signature,
+      timestampMs: Date.now(),
+      isPumpFun: inferredBuy.tokenMint.endsWith("pump"),
+    });
+
+    for (const recipient of inferredBuy.recipients) {
+      out.push({
+        kind: "transfer",
+        from: wallet,
+        to: recipient.owner,
+        tokenMint: inferredBuy.tokenMint,
+        amountTokens: recipient.amountTokens,
+        decimals: inferredBuy.decimals,
+        slot,
+        txSig: signature,
+        timestampMs: Date.now(),
+      });
+    }
+  }
+
   return out;
 }
 
-function ownerMintRows(meta: any, owner: string) {
+function ownerMintRows(meta: any, owner: string, accountKeys: string[]) {
   const rows = new Map<string, { mint: string; pre: number; post: number; decimals: number }>();
   const ingest = (balances: any[], field: "pre" | "post") => {
     for (const balance of balances ?? []) {
-      if (balance?.owner !== owner || balance?.mint === WSOL_MINT) continue;
+      const resolvedOwner = resolveTokenOwner(balance, balance?.mint, accountKeys, owner);
+      if (resolvedOwner !== owner || balance?.mint === WSOL_MINT) continue;
       const row = rows.get(balance.mint) ?? { mint: balance.mint, pre: 0, post: 0, decimals: Number(balance?.uiTokenAmount?.decimals ?? 0) };
       row[field] += Number(balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0);
       row.decimals = Number(balance?.uiTokenAmount?.decimals ?? row.decimals);
@@ -181,6 +229,64 @@ function ownerMintRows(meta: any, owner: string) {
   ingest(meta?.preTokenBalances ?? [], "pre");
   ingest(meta?.postTokenBalances ?? [], "post");
   return Array.from(rows.values());
+}
+
+function inferBuyTransferredOut(
+  meta: any,
+  wallet: string,
+  accountKeys: string[],
+  solDelta: number,
+  hasSwapSignal: boolean,
+  emittedBuyMints: Set<string>,
+  negativeWalletMints: Set<string>,
+): { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> } | null {
+  const likelySpentValue = solDelta < -0.0005 || hasSwapSignal;
+  if (!likelySpentValue) return null;
+
+  const rows = new Map<string, { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> }>();
+  const preByOwnerMint = new Map<string, number>();
+  for (const balance of meta?.preTokenBalances ?? []) {
+    const owner = resolveTokenOwner(balance, balance?.mint, accountKeys, wallet);
+    if (!owner || !balance?.mint || balance.mint === WSOL_MINT || owner === wallet) continue;
+    preByOwnerMint.set(`${owner}::${balance.mint}`, Number(balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0));
+  }
+
+  for (const balance of meta?.postTokenBalances ?? []) {
+    const owner = resolveTokenOwner(balance, balance?.mint, accountKeys, wallet);
+    if (!owner || !balance?.mint || balance.mint === WSOL_MINT || owner === wallet) continue;
+    if (emittedBuyMints.has(balance.mint) || negativeWalletMints.has(balance.mint)) continue;
+    const post = Number(balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0);
+    const pre = preByOwnerMint.get(`${owner}::${balance.mint}`) ?? 0;
+    const delta = post - pre;
+    if (delta <= 1e-12) continue;
+    const row = rows.get(balance.mint) ?? {
+      tokenMint: balance.mint,
+      amountTokens: 0,
+      decimals: Number(balance?.uiTokenAmount?.decimals ?? 0),
+      recipients: [],
+    };
+    row.amountTokens += delta;
+    row.decimals = Number(balance?.uiTokenAmount?.decimals ?? row.decimals);
+    row.recipients.push({ owner, amountTokens: delta });
+    rows.set(balance.mint, row);
+  }
+
+  const candidates = Array.from(rows.values()).sort((a, b) => b.amountTokens - a.amountTokens);
+  return candidates[0] ?? null;
+}
+
+function resolveTokenOwner(balance: any, mint: string | undefined, accountKeys: string[], watchedWallet: string): string {
+  if (balance?.owner) return String(balance.owner);
+  const accountIndex = Number(balance?.accountIndex);
+  const tokenAccount = Number.isFinite(accountIndex) ? accountKeys[accountIndex] : "";
+  if (!tokenAccount || !mint) return "";
+  try {
+    const ata = getAssociatedTokenAddressSync(new PublicKey(mint), new PublicKey(watchedWallet), true).toBase58();
+    if (ata === tokenAccount) return watchedWallet;
+  } catch {
+    return tokenAccount;
+  }
+  return tokenAccount;
 }
 
 function findTransferRecipient(meta: any, mint: string, sender: string, amount: number): string | null {
