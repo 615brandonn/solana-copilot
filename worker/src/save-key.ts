@@ -72,6 +72,8 @@ async function loadConfig(): Promise<BotConfigRow | null> {
 
 async function main() {
   console.log("\nHelix funding wallet saver\n");
+  console.log("For security, your private key will NOT show on screen while you paste it.");
+  console.log("Paste it once, then press Enter. If nothing appears, that is normal.\n");
 
   const cfg = await loadConfig();
   if (!cfg) throw new Error("No bot_config row found. Save the target wallet in the dashboard first.");
@@ -81,6 +83,8 @@ async function main() {
 
   const privateKey = await readHidden("Paste Phantom private key, then press Enter: ");
   if (!privateKey) throw new Error("No private key pasted");
+
+  console.log("Private key received. Validating and saving...");
 
   const decoded = bs58.decode(privateKey.trim());
   if (decoded.length !== 64) {
