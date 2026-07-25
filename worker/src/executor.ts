@@ -5,6 +5,7 @@
 
 import { Connection, Keypair, VersionedTransaction, PublicKey, SystemProgram, TransactionMessage, type Transaction, type VersionedTransactionResponse } from "@solana/web3.js";
 import { AnchorProvider, type Wallet } from "@coral-xyz/anchor";
+import { getAccount, getAssociatedTokenAddress } from "@solana/spl-token";
 import { searcherClient } from "jito-ts/dist/sdk/block-engine/searcher.js";
 import { Bundle } from "jito-ts/dist/sdk/block-engine/types.js";
 import { PumpFunSDK } from "pumpdotfun-sdk";
@@ -176,7 +177,7 @@ async function executePumpFunSwap(input: ExecuteInput, signer: Keypair, t0: numb
   }
 
   const outUiAmount = isBuy
-    ? tokenDeltaFromTx(result.results, signer.publicKey.toBase58(), mint.toBase58())
+    ? tokenDeltaFromTx(result.results, signer.publicKey.toBase58(), mint.toBase58()) ?? await tokenBalanceUi(signer.publicKey, mint, input.outputDecimals)
     : undefined;
   log.info({ sig: result.signature, ms: Date.now() - t0, side: isBuy ? "buy" : "sell", mint: mint.toBase58(), outUiAmount }, "Pump.fun direct transaction landed");
   return { txSig: result.signature, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
@@ -191,6 +192,16 @@ function tokenDeltaFromTx(tx: VersionedTransactionResponse | undefined, owner: s
     .reduce((sum, b) => sum + Number(b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount ?? 0), 0);
   const delta = post - pre;
   return delta > 0 ? delta : undefined;
+}
+
+async function tokenBalanceUi(owner: PublicKey, mint: PublicKey, decimals = 6): Promise<number | undefined> {
+  try {
+    const ata = await getAssociatedTokenAddress(mint, owner, false);
+    const account = await getAccount(conn, ata, "processed");
+    return Number(account.amount) / Math.pow(10, decimals);
+  } catch {
+    return undefined;
+  }
 }
 
 async function sendRawViaRpc(tx: VersionedTransaction, t0: number, label: string) {
