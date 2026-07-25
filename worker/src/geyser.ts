@@ -244,6 +244,8 @@ export class GeyserFeed {
       const hasSolMove = Math.abs(solDelta) > 0.0005; // > 0.0005 SOL rules out fee-only
 
       const walletRows = table.filter((r) => r.owner === wallet && r.mint !== WSOL_MINT);
+      const emittedBuyMints = new Set<string>();
+      const negativeWalletMints = new Set<string>();
       if (walletRows.length > 0) {
         log.info({
           wallet,
@@ -257,6 +259,7 @@ export class GeyserFeed {
       for (const row of walletRows) {
         const delta = row.post - row.pre;
         if (Math.abs(delta) < 1e-12) continue;
+        if (delta < 0) negativeWalletMints.add(row.mint);
 
         if (hasSolMove || hasSwapSignal) {
           // SOL movement is the strongest signal. Some providers omit loaded
@@ -282,6 +285,7 @@ export class GeyserFeed {
             timestampMs: Date.now(),
             isPumpFun: row.mint.endsWith("pump"),
           });
+          if (side === "buy") emittedBuyMints.add(row.mint);
         } else if (delta < 0) {
           // No SOL movement on this wallet: pure token transfer OUT.
           const peers = table.filter((p) => p.mint === row.mint && p.owner !== wallet);
@@ -303,9 +307,87 @@ export class GeyserFeed {
           });
         }
       }
+
+      // Many fast target wallets buy and transfer the bought token out inside
+      // the same transaction. In that tx the target can have no positive final
+      // token delta, so a pure owner-delta decoder misses the buy entirely.
+      // If the watched wallet spent SOL or the tx has explicit swap logs, infer
+      // the bought mint from positive token deltas on recipient wallets, while
+      // excluding mints the watched wallet itself sent out (sell/transfer side).
+      const inferredBuy = this.inferBuyTransferredOut(table, wallet, solDelta, hasSwapSignal, emittedBuyMints, negativeWalletMints);
+      if (inferredBuy) {
+        log.warn({
+          wallet,
+          txSig,
+          mint: inferredBuy.tokenMint,
+          amountTokens: inferredBuy.amountTokens,
+          recipients: inferredBuy.recipients.map((r) => ({ wallet: r.owner, amountTokens: r.amountTokens })),
+          solDelta,
+          hasSwapSignal,
+        }, "inferred target buy from same-tx recipient balances");
+
+        out.push({
+          kind: "swap",
+          wallet,
+          side: "buy",
+          tokenMint: inferredBuy.tokenMint,
+          amountTokens: inferredBuy.amountTokens,
+          decimals: inferredBuy.decimals,
+          amountUsd: undefined,
+          solDelta,
+          slot,
+          txSig,
+          timestampMs: Date.now(),
+          isPumpFun: inferredBuy.tokenMint.endsWith("pump"),
+        });
+
+        for (const recipient of inferredBuy.recipients) {
+          out.push({
+            kind: "transfer",
+            from: wallet,
+            to: recipient.owner,
+            tokenMint: inferredBuy.tokenMint,
+            amountTokens: recipient.amountTokens,
+            decimals: inferredBuy.decimals,
+            slot,
+            txSig,
+            timestampMs: Date.now(),
+          });
+        }
+      }
     }
 
     return out;
+  }
+
+  private inferBuyTransferredOut(
+    table: Array<{ owner: string; mint: string; pre: number; post: number; decimals: number }>,
+    wallet: string,
+    solDelta: number,
+    hasSwapSignal: boolean,
+    emittedBuyMints: Set<string>,
+    negativeWalletMints: Set<string>,
+  ): { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> } | null {
+    const likelySpentValue = solDelta < -0.0005 || hasSwapSignal;
+    if (!likelySpentValue) return null;
+
+    const byMint = new Map<string, { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> }>();
+    for (const row of table) {
+      if (row.owner === wallet || row.mint === WSOL_MINT) continue;
+      if (emittedBuyMints.has(row.mint) || negativeWalletMints.has(row.mint)) continue;
+      const delta = row.post - row.pre;
+      if (delta <= 1e-12) continue;
+      const cur = byMint.get(row.mint) ?? { tokenMint: row.mint, amountTokens: 0, decimals: row.decimals, recipients: [] };
+      cur.amountTokens += delta;
+      cur.decimals = row.decimals;
+      cur.recipients.push({ owner: row.owner, amountTokens: delta });
+      byMint.set(row.mint, cur);
+    }
+
+    const candidates = Array.from(byMint.values())
+      .filter((candidate) => candidate.amountTokens > 0 && candidate.recipients.length > 0)
+      .sort((a, b) => b.amountTokens - a.amountTokens);
+    return candidates[0] ?? null;
   }
 
   private toBase58(v: unknown): string {
