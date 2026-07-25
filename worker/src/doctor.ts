@@ -95,15 +95,53 @@ function analyzeTargetTx(tx: any, target: string) {
 
   const wouldTriggerBuy = deltas.some((row) => row.delta > 0) && (nativeSolDelta < -0.0005 || swapSignal);
   const wouldTriggerFallbackTransfer = deltas.some((row) => row.delta < 0) && !(Math.abs(nativeSolDelta) > 0.0005 || swapSignal);
+  const inferredBuy = inferBuyTransferredOut(meta, target, nativeSolDelta, swapSignal, deltas);
 
   return {
     signature: tx?.transaction?.signatures?.[0],
     nativeSolDelta,
     swapSignal,
     targetTokenDeltas: deltas,
+    inferredSameTxBuy: inferredBuy,
     wouldTriggerBuy,
+    wouldTriggerInferredBuy: !!inferredBuy,
     wouldTriggerFallbackTransfer,
   };
+}
+
+function inferBuyTransferredOut(meta: any, target: string, solDelta: number, swapSignal: boolean, targetDeltas: Array<{ mint: string; delta: number; decimals: number }>) {
+  const likelySpentValue = solDelta < -0.0005 || (Math.abs(solDelta) <= 0.0005 && swapSignal);
+  if (!likelySpentValue) return null;
+
+  const alreadyPositive = new Set(targetDeltas.filter((row) => row.delta > 0).map((row) => row.mint));
+  const targetNegative = new Set(targetDeltas.filter((row) => row.delta < 0).map((row) => row.mint));
+  const preByOwnerMint = new Map<string, number>();
+  for (const balance of meta?.preTokenBalances ?? []) {
+    if (!balance?.owner || !balance?.mint || balance.owner === target || balance.mint === WSOL) continue;
+    preByOwnerMint.set(`${balance.owner}::${balance.mint}`, amountFromTokenBalance(balance));
+  }
+
+  const byMint = new Map<string, { mint: string; amountTokens: number; decimals: number; recipients: Array<{ wallet: string; amountTokens: number }> }>();
+  for (const balance of meta?.postTokenBalances ?? []) {
+    if (!balance?.owner || !balance?.mint || balance.owner === target || balance.mint === WSOL) continue;
+    if (alreadyPositive.has(balance.mint) || targetNegative.has(balance.mint)) continue;
+    const pre = preByOwnerMint.get(`${balance.owner}::${balance.mint}`) ?? 0;
+    const post = amountFromTokenBalance(balance);
+    const delta = post - pre;
+    if (delta <= 1e-12) continue;
+    const cur = byMint.get(balance.mint) ?? {
+      mint: balance.mint,
+      amountTokens: 0,
+      decimals: Number(balance?.uiTokenAmount?.decimals ?? 0),
+      recipients: [],
+    };
+    cur.amountTokens += delta;
+    cur.decimals = Number(balance?.uiTokenAmount?.decimals ?? cur.decimals);
+    cur.recipients.push({ wallet: balance.owner, amountTokens: delta });
+    byMint.set(balance.mint, cur);
+  }
+
+  return Array.from(byMint.values()).sort((a, b) => b.amountTokens - a.amountTokens)[0] ?? null;
 }
 
 async function main() {
@@ -199,7 +237,7 @@ async function main() {
   const analyses = txs.filter(Boolean).map((tx) => analyzeTargetTx(tx, target.toBase58()));
   line("Last 5 tx decoder check", analyses);
 
-  const trigger = analyses.find((row) => row.wouldTriggerBuy || row.wouldTriggerFallbackTransfer);
+  const trigger = analyses.find((row) => row.wouldTriggerBuy || row.wouldTriggerInferredBuy || row.wouldTriggerFallbackTransfer);
   if (trigger) pass("Decoder verdict", "At least one recent tx should trigger the bot path. If PM2 logs did not show feed event, Laserstream subscription is the likely break.");
   else fail("Decoder verdict", "Recent target txs do not look like target buys/transfers to this decoder. The target may be buying from another wallet/signing account, or the tx format needs a new parser.");
 
