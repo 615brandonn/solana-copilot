@@ -55,9 +55,10 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   const tx = VersionedTransaction.deserialize(Buffer.from(swapResp.swapTransaction, "base64"));
   tx.sign([signer]);
 
-  // Jupiter returns outAmount (raw) + outputDecimals via the quote.
+  // Jupiter v6 quote returns outAmount as a RAW string. It does not return
+  // outputDecimals reliably, so callers pass it in (from the target-swap event).
   const outAmountRaw = Number(quote?.outAmount ?? 0);
-  const outDecimals = Number(quote?.outputDecimals ?? swapResp?.outputDecimals ?? 0);
+  const outDecimals = Number(input.outputDecimals ?? quote?.outputDecimals ?? swapResp?.outputDecimals ?? 0);
   const outUiAmount = outDecimals > 0 ? outAmountRaw / Math.pow(10, outDecimals) : outAmountRaw;
 
   if (input.route === "jito" && JITO_TIP_ACCOUNTS.length > 0) {
