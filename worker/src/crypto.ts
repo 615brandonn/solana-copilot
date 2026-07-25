@@ -1,12 +1,15 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { env } from "./env.js";
 
-// AES-256-GCM. Ciphertext layout: [12-byte IV | 16-byte tag | ciphertext] base64
-function key(): Buffer {
-  if (!env.KEY_ENCRYPTION_KEY) return serviceKey();
-  const buf = Buffer.from(env.KEY_ENCRYPTION_KEY, "base64");
-  if (buf.length !== 32) throw new Error("KEY_ENCRYPTION_KEY must decode to 32 bytes");
-  return buf;
+// AES-256-GCM. Ciphertext layout: [12-byte IV | 16-byte tag | ciphertext] base64.
+// New saves always use the Supabase service key hash so users do not need to
+// manage a separate KEY_ENCRYPTION_KEY. A valid KEY_ENCRYPTION_KEY is only kept
+// as a legacy decrypt fallback for keys saved before this simplification.
+function legacyKey(): Buffer | null {
+  const raw = env.KEY_ENCRYPTION_KEY?.trim();
+  if (!raw) return null;
+  const buf = Buffer.from(raw, "base64");
+  return buf.length === 32 ? buf : null;
 }
 
 function serviceKey(): Buffer {
@@ -25,9 +28,9 @@ function decryptWith(stored: string, aesKey: Buffer): string {
 
 export function encryptPrivateKey(plaintext: string): string {
   const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key(), iv);
+  const cipher = createCipheriv("aes-256-gcm", serviceKey(), iv);
   const ct = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  return Buffer.concat([iv, cipher.getAuthTag(), ct]).toString("base64");
+  return `svc:${Buffer.concat([iv, cipher.getAuthTag(), ct]).toString("base64")}`;
 }
 
 export function decryptPrivateKey(stored: string): string {
@@ -41,14 +44,18 @@ export function decryptPrivateKey(stored: string): string {
     }
   }
   try {
-    return decryptWith(stored, key());
+    return decryptWith(stored, serviceKey());
   } catch {
-    try {
-      return decryptWith(stored, serviceKey());
-    } catch {
-      throw new Error(
-        "Funding key cannot be decrypted. Re-save the Phantom private key in the dashboard, then restart the worker.",
-      );
+    const legacy = legacyKey();
+    if (legacy) {
+      try {
+        return decryptWith(stored, legacy);
+      } catch {
+        // Fall through to the clear action message below.
+      }
     }
+    throw new Error(
+      "Funding key cannot be decrypted. On the VPS run: bun run save-key, paste the Phantom private key, then run bun run doctor again.",
+    );
   }
 }
