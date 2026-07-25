@@ -24,5 +24,10 @@ export const BotConfigSchema = z.object({
 });
 
 export const FundingKeySchema = z.object({
-  privateKey: z.string().min(32),
+  privateKey: z
+    .string()
+    .trim()
+    .min(32, "Private key is too short")
+    .max(256, "Private key is too long")
+    .regex(/^[1-9A-HJ-NP-Za-km-z]+$/, "Paste the base58 private key from Phantom"),
 });

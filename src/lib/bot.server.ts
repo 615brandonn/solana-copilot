@@ -1,4 +1,4 @@
-import { createCipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { createClient } from "@supabase/supabase-js";
 
@@ -8,7 +8,7 @@ import { normalizeSupabaseUrl } from "./supabase-url";
 
 export type SaveFundingKeyResult =
   | { ok: true }
-  | { ok: false; code: "missing_encryption_key" | "save_failed"; error: string };
+  | { ok: false; code: "missing_backend_key" | "save_failed"; error: string };
 
 export function currentUserId() {
   return process.env.HELIX_USER_ID ?? "00000000-0000-0000-0000-000000000000";
@@ -87,21 +87,20 @@ export function configToRow(cfg: BotConfig): Omit<Database["public"]["Tables"]["
 }
 
 export async function saveFundingKeyRecord(privateKey: string): Promise<SaveFundingKeyResult> {
-  const raw = process.env.SERVER_KEY_ENCRYPTION_KEY ?? process.env.KEY_ENCRYPTION_KEY ?? "";
-  const key = Buffer.from(raw, "base64");
-
-  if (key.length !== 32) {
+  const serverKey = serviceRoleKey();
+  if (!serverKey) {
     return {
       ok: false,
-      code: "missing_encryption_key",
-      error: "The dashboard encryption key is missing or incorrect. Paste the KEY_ENCRYPTION_KEY value from your VPS into SERVER_KEY_ENCRYPTION_KEY, then try saving your wallet key again.",
+      code: "missing_backend_key",
+      error: "The backend service key is missing. Add SERVER_SUPABASE_SERVICE_ROLE_KEY first, then save your wallet key again.",
     };
   }
+  const key = createHash("sha256").update(serverKey).digest();
 
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const ct = Buffer.concat([cipher.update(privateKey, "utf8"), cipher.final()]);
-  const ciphertext = Buffer.concat([iv, cipher.getAuthTag(), ct]).toString("base64");
+  const ciphertext = `svc:${Buffer.concat([iv, cipher.getAuthTag(), ct]).toString("base64")}`;
 
   const db = adminClient();
   const row = {

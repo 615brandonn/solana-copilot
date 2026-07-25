@@ -78,7 +78,7 @@ export function WalletPanel({ targetWallet, fundingPrivateKey, onChange, onSaveK
           </div>
           <p className="mt-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
             <ShieldCheck className="h-3 w-3 text-success" />
-            AES-GCM encrypted with your worker's master key before it leaves this device. Never stored in plain text; never in localStorage.
+            Sent securely, encrypted by your backend, then stored for the worker. Never stored in plain text; never in localStorage.
             {keySaved && <span className="mono ml-2 text-success">✓ sent to worker</span>}
           </p>
         </div>

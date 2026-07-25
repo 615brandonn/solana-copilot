@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { env } from "./env.js";
 
 // AES-256-GCM. Ciphertext layout: [12-byte IV | 16-byte tag | ciphertext] base64
@@ -6,6 +6,20 @@ function key(): Buffer {
   const buf = Buffer.from(env.KEY_ENCRYPTION_KEY, "base64");
   if (buf.length !== 32) throw new Error("KEY_ENCRYPTION_KEY must decode to 32 bytes");
   return buf;
+}
+
+function serviceKey(): Buffer {
+  return createHash("sha256").update(env.BOT_SUPABASE_SERVICE_ROLE_KEY).digest();
+}
+
+function decryptWith(stored: string, aesKey: Buffer): string {
+  const buf = Buffer.from(stored, "base64");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const ct = buf.subarray(28);
+  const decipher = createDecipheriv("aes-256-gcm", aesKey, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
 }
 
 export function encryptPrivateKey(plaintext: string): string {
@@ -16,11 +30,10 @@ export function encryptPrivateKey(plaintext: string): string {
 }
 
 export function decryptPrivateKey(stored: string): string {
-  const buf = Buffer.from(stored, "base64");
-  const iv = buf.subarray(0, 12);
-  const tag = buf.subarray(12, 28);
-  const ct = buf.subarray(28);
-  const decipher = createDecipheriv("aes-256-gcm", key(), iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
+  if (stored.startsWith("svc:")) return decryptWith(stored.slice(4), serviceKey());
+  try {
+    return decryptWith(stored, key());
+  } catch {
+    return decryptWith(stored, serviceKey());
+  }
 }
