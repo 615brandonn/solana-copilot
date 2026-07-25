@@ -31,10 +31,24 @@ export function encryptPrivateKey(plaintext: string): string {
 }
 
 export function decryptPrivateKey(stored: string): string {
-  if (stored.startsWith("svc:")) return decryptWith(stored.slice(4), serviceKey());
+  if (stored.startsWith("svc:")) {
+    try {
+      return decryptWith(stored.slice(4), serviceKey());
+    } catch {
+      throw new Error(
+        "Funding key cannot be decrypted. Re-save the Phantom private key in the dashboard, then restart the worker.",
+      );
+    }
+  }
   try {
     return decryptWith(stored, key());
   } catch {
-    return decryptWith(stored, serviceKey());
+    try {
+      return decryptWith(stored, serviceKey());
+    } catch {
+      throw new Error(
+        "Funding key cannot be decrypted. Re-save the Phantom private key in the dashboard, then restart the worker.",
+      );
+    }
   }
 }
