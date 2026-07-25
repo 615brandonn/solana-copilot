@@ -12,6 +12,10 @@ import { env } from "./env.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
+const STABLECOIN_MINTS = new Set([
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCo24RDUuUuJZq8bn6T", // USDT
+]);
 const require = createRequire(import.meta.url);
 const YellowstoneGrpc = require("@triton-one/yellowstone-grpc") as Record<string, any>;
 const CommitmentLevel = YellowstoneGrpc.CommitmentLevel ?? YellowstoneGrpc.default?.CommitmentLevel ?? { PROCESSED: 0 };
@@ -194,7 +198,14 @@ export class GeyserFeed {
     if (!tx) return;
     const events = this.decodeEvents(msg, tx);
     if (events.length === 0) {
-      log.debug({ slot: msg?.transaction?.slot }, "tx seen but no events decoded");
+      const txSig = this.decodeSignature(tx.signature ?? tx.transaction?.signatures?.[0]);
+      const message = tx.transaction?.message ?? tx.message;
+      const accountKeys = this.decodeAccountKeys([
+        ...(message?.accountKeys ?? []),
+        ...(tx.meta?.loadedWritableAddresses ?? tx.transaction?.meta?.loadedWritableAddresses ?? msg.transaction.meta?.loadedWritableAddresses ?? []),
+        ...(tx.meta?.loadedReadonlyAddresses ?? tx.transaction?.meta?.loadedReadonlyAddresses ?? msg.transaction.meta?.loadedReadonlyAddresses ?? []),
+      ]);
+      log.warn({ slot: msg?.transaction?.slot, txSig, watched: Array.from(this.watched), accountKeysCount: accountKeys.length }, "tx seen but no events decoded");
     }
     for (const ev of events) {
       this.decodedEventCount += 1;
@@ -249,6 +260,7 @@ export class GeyserFeed {
       const hasSolMove = Math.abs(solDelta) > 0.0005; // > 0.0005 SOL rules out fee-only
 
       const walletRows = table.filter((r) => r.owner === wallet && r.mint !== WSOL_MINT);
+      const stablecoinSpentUsd = this.usdStablecoinSpent(table, wallet);
       const emittedBuyMints = new Set<string>();
       const negativeWalletMints = new Set<string>();
       if (walletRows.length > 0) {
@@ -283,7 +295,7 @@ export class GeyserFeed {
             tokenMint: row.mint,
             amountTokens: Math.abs(delta),
             decimals: row.decimals,
-            amountUsd: undefined,
+            amountUsd: side === "buy" ? stablecoinSpentUsd : undefined,
             solDelta,
             slot,
             txSig,
@@ -338,7 +350,7 @@ export class GeyserFeed {
           tokenMint: inferredBuy.tokenMint,
           amountTokens: inferredBuy.amountTokens,
           decimals: inferredBuy.decimals,
-          amountUsd: undefined,
+          amountUsd: stablecoinSpentUsd,
           solDelta,
           slot,
           txSig,
@@ -439,6 +451,16 @@ export class GeyserFeed {
     ingest(meta?.preTokenBalances ?? [], "pre");
     ingest(meta?.postTokenBalances ?? [], "post");
     return Array.from(m.values());
+  }
+
+  private usdStablecoinSpent(table: Array<{ owner: string; mint: string; pre: number; post: number }>, wallet: string): number | undefined {
+    const spent = table
+      .filter((row) => row.owner === wallet && STABLECOIN_MINTS.has(row.mint))
+      .reduce((sum, row) => {
+        const delta = row.post - row.pre;
+        return delta < 0 ? sum + Math.abs(delta) : sum;
+      }, 0);
+    return spent > 0 ? spent : undefined;
   }
 
   private resolveTokenOwner(balance: any, mint: string, accountKeys: string[]): string {

@@ -5,6 +5,10 @@ import { env } from "./env.js";
 import type { FeedEvent } from "./geyser.js";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
+const STABLECOIN_MINTS = new Set([
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCo24RDUuUuJZq8bn6T", // USDT
+]);
 const log = pino({ level: env.LOG_LEVEL });
 
 export type PollerHandler = (event: FeedEvent) => Promise<void> | void;
@@ -99,7 +103,7 @@ export class RpcBackfillPoller {
   }
 }
 
-function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
+export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
   const out: FeedEvent[] = [];
   const meta = tx?.meta;
   if (!meta) return out;
@@ -123,6 +127,7 @@ function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
     line.includes("exactoutroute"),
   );
   const hasSolMove = Math.abs(nativeSolDelta) > 0.0005;
+  const stablecoinSpentUsd = usdStablecoinSpent(rows);
   const emittedBuyMints = new Set<string>();
   const negativeWalletMints = new Set<string>();
 
@@ -141,7 +146,7 @@ function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
         tokenMint: row.mint,
         amountTokens: Math.abs(delta),
         decimals: row.decimals,
-        amountUsd: undefined,
+        amountUsd: side === "buy" ? stablecoinSpentUsd : undefined,
         solDelta: nativeSolDelta,
         slot,
         txSig: signature,
@@ -188,7 +193,7 @@ function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
       tokenMint: inferredBuy.tokenMint,
       amountTokens: inferredBuy.amountTokens,
       decimals: inferredBuy.decimals,
-      amountUsd: undefined,
+      amountUsd: stablecoinSpentUsd,
       solDelta: nativeSolDelta,
       slot,
       txSig: signature,
@@ -229,6 +234,16 @@ function ownerMintRows(meta: any, owner: string, accountKeys: string[]) {
   ingest(meta?.preTokenBalances ?? [], "pre");
   ingest(meta?.postTokenBalances ?? [], "post");
   return Array.from(rows.values());
+}
+
+function usdStablecoinSpent(rows: Array<{ mint: string; pre: number; post: number }>): number | undefined {
+  const spent = rows
+    .filter((row) => STABLECOIN_MINTS.has(row.mint))
+    .reduce((sum, row) => {
+      const delta = row.post - row.pre;
+      return delta < 0 ? sum + Math.abs(delta) : sum;
+    }, 0);
+  return spent > 0 ? spent : undefined;
 }
 
 function inferBuyTransferredOut(

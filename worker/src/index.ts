@@ -15,6 +15,10 @@ import { RpcBackfillPoller } from "./poller.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const WSOL = "So11111111111111111111111111111111111111112";
+const STABLECOIN_MINTS = new Set([
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCo24RDUuUuJZq8bn6T", // USDT
+]);
 const rpc = new Connection(env.RPC_URL, { commitment: "processed" });
 
 async function loadConfig(userId: string): Promise<BotConfigRow | null> {
@@ -26,7 +30,7 @@ async function loadConfig(userId: string): Promise<BotConfigRow | null> {
     .order("updated_at", { ascending: false }).limit(1);
   if (any.error) log.error({ err: any.error }, "bot_config query error (fallback)");
   const row = any.data?.[0];
-  if (row) log.info({ found_user_id: row.user_id, target: row.target_wallet }, "using fallback bot_config row");
+  if (row) log.warn({ requested_user_id: userId, found_user_id: row.user_id, target: row.target_wallet }, "using fallback bot_config row — HELIX_USER_ID may not match dashboard config");
   return (row as BotConfigRow) ?? null;
 }
 
@@ -215,6 +219,7 @@ async function main() {
           return;
         }
         if (event.side === "sell") return handleFollowerSell(event);
+        log.info({ eventWallet: event.wallet, targetWallet: cfg.target_wallet, side: event.side, mint: event.tokenMint, txSig: event.txSig }, "swap event ignored — not target buy or follower sell");
       }
     } catch (err) { log.error({ err }, "handler failed"); }
   }
@@ -324,6 +329,10 @@ async function main() {
 
   async function tryCopyBuy(event: SwapEvent, reason = "target copy buy"): Promise<string | null> {
     if (!cfg.enabled) return null;
+    if (event.tokenMint === WSOL || STABLECOIN_MINTS.has(event.tokenMint)) {
+      log.info({ mint: event.tokenMint, txSig: event.txSig }, "target buy skipped — output is SOL/stablecoin, not a token entry");
+      return null;
+    }
     const targetWallet = cfg.target_wallet;
     if (!targetWallet) {
       log.warn("target buy skipped because config target wallet is empty");
@@ -342,7 +351,7 @@ async function main() {
       .select("token_mint").eq("user_id", cfg.user_id).eq("token_mint", event.tokenMint).maybeSingle();
     // Best-effort USD size of the target's buy using the wallet's WSOL/SOL delta in this tx.
     const solPrice = (await priceUsd(WSOL)) ?? 150;
-    const targetBuyUsd = Math.abs(event.solDelta) > 0.0005 ? Math.abs(event.solDelta) * solPrice : undefined;
+    const targetBuyUsd = event.amountUsd ?? (Math.abs(event.solDelta) > 0.0005 ? Math.abs(event.solDelta) * solPrice : undefined);
     event.amountUsd = targetBuyUsd;
     // First-buy tracking: "first buy of this mint by this target since the bot started monitoring".
     const { data: targetPrior } = await db.from("target_traded_tokens")
@@ -370,7 +379,13 @@ async function main() {
       return null;
     }
 
-    const secret = await loadSigner(cfg.user_id);
+    let secret: string | null = null;
+    try {
+      secret = await loadSigner(cfg.user_id);
+    } catch (err) {
+      log.error({ err, user_id: cfg.user_id }, "funding key decrypt failed for copy buy");
+      return null;
+    }
     if (!secret) { log.error({ user_id: cfg.user_id }, "no funding key saved for this config user"); return null; }
 
     const amountLamports = Math.floor((cfg.fixed_buy_usd / solPrice) * 1e9);

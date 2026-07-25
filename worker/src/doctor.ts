@@ -4,6 +4,7 @@ import bs58 from "bs58";
 import { env } from "./env.js";
 import { db, type BotConfigRow } from "./db.js";
 import { decryptPrivateKey } from "./crypto.js";
+import { decodeParsedTransaction } from "./poller.js";
 
 const WSOL = "So11111111111111111111111111111111111111112";
 const rpc = new Connection(env.RPC_URL, { commitment: "confirmed" });
@@ -93,6 +94,9 @@ function analyzeTargetTx(tx: any, target: string) {
     decimals: row.decimals,
   })).filter((row) => Math.abs(row.delta) > 1e-12);
 
+  const decodedEvents = decodeParsedTransaction(target, tx);
+  const decodedTargetBuys = decodedEvents.filter((event) => event.kind === "swap" && event.wallet === target && event.side === "buy");
+  const decodedTargetTransfers = decodedEvents.filter((event) => event.kind === "transfer" && event.from === target);
   const wouldTriggerBuy = deltas.some((row) => row.delta > 0) && (nativeSolDelta < -0.0005 || swapSignal);
   const wouldTriggerFallbackTransfer = deltas.some((row) => row.delta < 0) && !(Math.abs(nativeSolDelta) > 0.0005 || swapSignal);
   const inferredBuy = inferBuyTransferredOut(meta, target, nativeSolDelta, swapSignal, deltas);
@@ -102,10 +106,12 @@ function analyzeTargetTx(tx: any, target: string) {
     nativeSolDelta,
     swapSignal,
     targetTokenDeltas: deltas,
+    liveDecoderEvents: decodedEvents,
     inferredSameTxBuy: inferredBuy,
     wouldTriggerBuy,
     wouldTriggerInferredBuy: !!inferredBuy,
     wouldTriggerFallbackTransfer,
+    liveWorkerWouldCopyBuy: decodedTargetBuys.length > 0 || decodedTargetTransfers.length > 0,
   };
 }
 
@@ -237,8 +243,8 @@ async function main() {
   const analyses = txs.filter(Boolean).map((tx) => analyzeTargetTx(tx, target.toBase58()));
   line("Last 5 tx decoder check", analyses);
 
-  const trigger = analyses.find((row) => row.wouldTriggerBuy || row.wouldTriggerInferredBuy || row.wouldTriggerFallbackTransfer);
-  if (trigger) pass("Decoder verdict", "At least one recent tx should trigger the bot path. If PM2 logs did not show feed event, Laserstream subscription is the likely break.");
+  const trigger = analyses.find((row) => row.liveWorkerWouldCopyBuy || row.wouldTriggerBuy || row.wouldTriggerInferredBuy || row.wouldTriggerFallbackTransfer);
+  if (trigger) pass("Decoder verdict", "At least one recent tx should trigger the live worker path. If PM2 logs did not show feed event, Laserstream/RPC polling is the likely break.");
   else fail("Decoder verdict", "Recent target txs do not look like target buys/transfers to this decoder. The target may be buying from another wallet/signing account, or the tx format needs a new parser.");
 
   console.log("\nNext command if this passes but bot is silent:\npm2 logs helix-worker --lines 200 --nostream | grep -E \"stream heartbeat|feed event|target buy candidate|filtered|submitting copy buy|copy buy|Pump.fun|funding wallet\"\n");
