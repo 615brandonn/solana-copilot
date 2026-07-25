@@ -149,8 +149,11 @@ async function main() {
     fail("Funding key", err instanceof Error ? err.message : String(err));
     fail("Next step", "On the VPS run: bun run save-key — paste the Phantom private key there, then run bun run doctor again");
   }
-  if (!secret && !fundingKeyErrored) {
-    fail("Funding key", `missing for config user_id ${cfg.user_id}`);
+  if (!secret) {
+    if (!fundingKeyErrored) {
+      fail("Funding key", `missing for config user_id ${cfg.user_id}`);
+      fail("Next step", "On the VPS run: bun run save-key — paste the Phantom private key there, then run bun run doctor again");
+    }
   } else {
     try {
       const decoded = bs58.decode(secret.trim());
