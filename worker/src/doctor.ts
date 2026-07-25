@@ -140,7 +140,13 @@ async function main() {
   const target = validatePubkey("Target wallet", cfg.target_wallet);
   if (!target) return;
 
-  const secret = await loadFundingKey(cfg.user_id);
+  let secret: string | null = null;
+  try {
+    secret = await loadFundingKey(cfg.user_id);
+  } catch (err) {
+    fail("Funding key", err instanceof Error ? err.message : String(err));
+    fail("Next step", "Open the dashboard, paste the Phantom private key again, click Save, then run bun run doctor again");
+  }
   if (!secret) {
     fail("Funding key", `missing for config user_id ${cfg.user_id}`);
   } else {
