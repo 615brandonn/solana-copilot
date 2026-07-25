@@ -32,7 +32,13 @@ const JUPITER_BASE_URLS = [
   "https://quote-api.jup.ag/v6",
 ];
 
-async function readJsonOrThrow(resp: Response, label: string) {
+type FetchResponseLike = {
+  ok: boolean;
+  status: number;
+  text: () => Promise<string>;
+};
+
+async function readJsonOrThrow(resp: FetchResponseLike, label: string) {
   const text = await resp.text();
   let json: any = null;
   try { json = text ? JSON.parse(text) : null; } catch { json = null; }

@@ -27,7 +27,7 @@ export const db = createClient(normalizeSupabaseUrl(env.BOT_SUPABASE_URL), env.B
         headers.delete("Authorization");
       }
 
-      return fetch(input, { ...init, headers });
+      return fetch(input as Parameters<typeof fetch>[0], { ...init, headers } as Parameters<typeof fetch>[1]) as unknown as Promise<Response>;
     },
   },
 });
