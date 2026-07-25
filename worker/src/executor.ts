@@ -1,9 +1,13 @@
 // Executor: builds the swap tx and sends it either through Jito (default)
-// or straight through the RPC. Uses Jupiter aggregator for route quoting.
+// or straight through the RPC. Uses Jupiter aggregator for routed tokens and
+// falls back to direct Pump.fun instructions when a fresh bonding-curve token
+// has no Jupiter route yet.
 
-import { Connection, Keypair, VersionedTransaction, PublicKey, SystemProgram, TransactionMessage } from "@solana/web3.js";
+import { Connection, Keypair, VersionedTransaction, PublicKey, SystemProgram, TransactionMessage, type Transaction, type VersionedTransactionResponse } from "@solana/web3.js";
+import { AnchorProvider, type Wallet } from "@coral-xyz/anchor";
 import { searcherClient } from "jito-ts/dist/sdk/block-engine/searcher.js";
 import { Bundle } from "jito-ts/dist/sdk/block-engine/types.js";
+import { PumpFunSDK } from "pumpdotfun-sdk";
 import bs58 from "bs58";
 import { fetch } from "undici";
 import pino from "pino";
@@ -11,6 +15,7 @@ import { env } from "./env.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const conn = new Connection(env.RPC_URL, { commitment: "processed" });
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
 const JITO_TIP_ACCOUNTS = (env.JITO_TIP_ACCOUNTS ?? "").split(",").filter(Boolean).map((s) => new PublicKey(s));
 
@@ -26,6 +31,26 @@ export type ExecuteInput = {
 };
 
 export type ExecuteResult = { txSig: string; latencyMs: number; route: "jito" | "rpc"; outUiAmount?: number };
+
+class KeypairWallet implements Wallet {
+  public readonly publicKey: PublicKey;
+  public readonly payer: Keypair;
+
+  constructor(payer: Keypair) {
+    this.payer = payer;
+    this.publicKey = payer.publicKey;
+  }
+
+  async signTransaction<T extends Transaction | VersionedTransaction>(tx: T): Promise<T> {
+    if ("version" in tx) tx.sign([this.payer]);
+    else tx.partialSign(this.payer);
+    return tx;
+  }
+
+  async signAllTransactions<T extends Transaction | VersionedTransaction>(txs: T[]): Promise<T[]> {
+    return Promise.all(txs.map((tx) => this.signTransaction(tx)));
+  }
+}
 
 const JUPITER_BASE_URLS = [
   "https://lite-api.jup.ag/swap/v1",
@@ -92,7 +117,20 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   }
   const signer = Keypair.fromSecretKey(decodedSecret);
 
-  // 1. Get Jupiter quote + swap tx
+  try {
+    return await executeJupiterSwap(input, signer, t0);
+  } catch (err) {
+    log.warn({ err, inputMint: input.inputMint, outputMint: input.outputMint }, "Jupiter swap failed — checking Pump.fun fallback");
+    try {
+      return await executePumpFunSwap(input, signer, t0);
+    } catch (fallbackErr) {
+      log.error({ err: fallbackErr, jupiterErr: err, inputMint: input.inputMint, outputMint: input.outputMint }, "Pump.fun fallback failed");
+      throw err;
+    }
+  }
+}
+
+async function executeJupiterSwap(input: ExecuteInput, signer: Keypair, t0: number): Promise<ExecuteResult> {
   const { base, quote } = await fetchJupiterQuote(input);
   const swapResp = await fetchJupiterSwap(base, quote, signer);
 
@@ -115,6 +153,44 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   }
   const sig = await sendRawViaRpc(tx, t0, "rpc");
   return { txSig: sig, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
+}
+
+async function executePumpFunSwap(input: ExecuteInput, signer: Keypair, t0: number): Promise<ExecuteResult> {
+  const isBuy = input.inputMint === WSOL_MINT;
+  const isSell = input.outputMint === WSOL_MINT;
+  if (!isBuy && !isSell) throw new Error("Pump.fun fallback only supports SOL buys and SOL exits");
+
+  const mint = new PublicKey(isBuy ? input.outputMint : input.inputMint);
+  const provider = new AnchorProvider(conn, new KeypairWallet(signer), { commitment: "processed", preflightCommitment: "processed" });
+  const sdk = new PumpFunSDK(provider);
+  const curve = await sdk.getBondingCurveAccount(mint, "processed");
+  if (!curve) throw new Error(`Pump.fun bonding curve not found: ${mint.toBase58()}`);
+
+  const priorityFees = { unitLimit: 250_000, unitPrice: 250_000 };
+  const result = isBuy
+    ? await sdk.buy(signer, mint, BigInt(input.amountLamports), BigInt(input.slippageBps), priorityFees, "processed", "confirmed")
+    : await sdk.sell(signer, mint, BigInt(input.amountLamports), BigInt(input.slippageBps), priorityFees, "processed", "confirmed");
+
+  if (!result.success || !result.signature) {
+    throw new Error(`Pump.fun ${isBuy ? "buy" : "sell"} failed: ${String(result.error ?? "no signature")}`);
+  }
+
+  const outUiAmount = isBuy
+    ? tokenDeltaFromTx(result.results, signer.publicKey.toBase58(), mint.toBase58())
+    : undefined;
+  log.info({ sig: result.signature, ms: Date.now() - t0, side: isBuy ? "buy" : "sell", mint: mint.toBase58(), outUiAmount }, "Pump.fun direct transaction landed");
+  return { txSig: result.signature, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
+}
+
+function tokenDeltaFromTx(tx: VersionedTransactionResponse | undefined, owner: string, mint: string): number | undefined {
+  const pre = (tx?.meta?.preTokenBalances ?? [])
+    .filter((b) => b.owner === owner && b.mint === mint)
+    .reduce((sum, b) => sum + Number(b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount ?? 0), 0);
+  const post = (tx?.meta?.postTokenBalances ?? [])
+    .filter((b) => b.owner === owner && b.mint === mint)
+    .reduce((sum, b) => sum + Number(b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount ?? 0), 0);
+  const delta = post - pre;
+  return delta > 0 ? delta : undefined;
 }
 
 async function sendRawViaRpc(tx: VersionedTransaction, t0: number, label: string) {
