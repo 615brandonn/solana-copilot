@@ -11,6 +11,7 @@ export type PollerHandler = (event: FeedEvent) => Promise<void> | void;
 export class RpcBackfillPoller {
   private watched = new Set<string>();
   private seen = new Set<string>();
+  private initialized = new Set<string>();
   private timer?: NodeJS.Timeout;
   private running = false;
   private lastPollAt?: number;
@@ -34,6 +35,7 @@ export class RpcBackfillPoller {
 
   unwatch(wallet: string) {
     this.watched.delete(wallet);
+    this.initialized.delete(wallet);
   }
 
   health() {
@@ -68,6 +70,13 @@ export class RpcBackfillPoller {
     }
 
     const signatures = await this.conn.getSignaturesForAddress(pubkey, { limit: 12 }, "confirmed");
+    if (!this.initialized.has(wallet)) {
+      signatures.forEach((sig) => this.seen.add(sig.signature));
+      this.initialized.add(wallet);
+      log.info({ wallet, baselineSignatures: signatures.length }, "rpc fallback wallet baseline ready");
+      return;
+    }
+
     const fresh = signatures.filter((sig) => !this.seen.has(sig.signature)).reverse();
     for (const sig of fresh) this.seen.add(sig.signature);
     if (this.seen.size > 2000) this.seen = new Set(Array.from(this.seen).slice(-1000));
