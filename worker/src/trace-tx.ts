@@ -60,7 +60,7 @@ function tokenDeltasFor(tx: any, wallet: string) {
 
 async function explainCandidate(cfg: BotConfigRow, event: any) {
   const solPrice = (await priceUsd(WSOL)) ?? 150;
-  const targetBuyUsd = Math.abs(event.solDelta) > 0.0005 ? Math.abs(event.solDelta) * solPrice : undefined;
+  const targetBuyUsd = event.amountUsd ?? (Math.abs(event.solDelta) > 0.0005 ? Math.abs(event.solDelta) * solPrice : undefined);
   event.amountUsd = targetBuyUsd;
 
   const meta = await loadTokenMeta(event.tokenMint);
