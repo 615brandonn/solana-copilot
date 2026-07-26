@@ -12,13 +12,26 @@ function short(mint: string) {
 function relTime(iso: string) {
   const then = new Date(iso).getTime();
   const diff = Math.max(0, Date.now() - then);
-  const s = Math.floor(diff / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h`;
-  return `${Math.floor(h / 24)}d`;
+  const seconds = Math.floor(diff / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+function tokenAmount(value: number) {
+  if (!Number.isFinite(value)) return "0";
+  return value.toLocaleString(undefined, { maximumFractionDigits: 6 });
+}
+
+function latency(value: number | null) {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return null;
+  return milliseconds < 1_000
+    ? `${Math.round(milliseconds)}ms`
+    : `${(milliseconds / 1_000).toFixed(1)}s`;
 }
 
 export function ActivityFeed() {
@@ -32,7 +45,11 @@ export function ActivityFeed() {
   const trades = (data ?? []) as TradeRow[];
 
   return (
-    <SectionCard title="Activity" description="Live trade feed from your worker" icon={<Radio className="h-4 w-4" />}>
+    <SectionCard
+      title="Activity"
+      description="Confirmed buys and sells from your worker"
+      icon={<Radio className="h-4 w-4" />}
+    >
       {isError && (
         <p className="py-3 text-center text-xs text-destructive">
           {(error as Error)?.message ?? "Failed to load trades"}
@@ -44,38 +61,59 @@ export function ActivityFeed() {
             {isLoading ? "Loading…" : "No trades yet. Arm the bot and add a target wallet."}
           </li>
         )}
-        {trades.map((t) => {
-          const pnl = t.pnl_pct != null ? Number(t.pnl_pct) : undefined;
-          const usd = t.amount_usd != null ? Number(t.amount_usd) : 0;
+        {trades.map((trade) => {
+          const pnl = trade.pnl_pct != null ? Number(trade.pnl_pct) : undefined;
+          const usd = trade.amount_usd != null ? Number(trade.amount_usd) : undefined;
+          const tokens = Number(trade.amount_tokens);
+          const tradeLatency = latency(trade.latency_ms);
+          const hasUsd = usd !== undefined && Number.isFinite(usd);
+
           return (
-            <li key={t.id} className="flex items-center gap-4 py-3">
+            <li key={trade.id} className="flex items-center gap-4 py-3">
               <div
                 className={`flex h-9 w-9 items-center justify-center rounded-lg ${
-                  t.side === "buy"
+                  trade.side === "buy"
                     ? "bg-primary/10 text-primary"
                     : pnl !== undefined && pnl < 0
-                    ? "bg-destructive/10 text-destructive"
-                    : "bg-success/10 text-success"
+                      ? "bg-destructive/10 text-destructive"
+                      : "bg-success/10 text-success"
                 }`}
               >
-                {t.side === "buy" ? <ArrowDownRight className="h-4 w-4" /> : <ArrowUpRight className="h-4 w-4" />}
+                {trade.side === "buy" ? (
+                  <ArrowDownRight className="h-4 w-4" />
+                ) : (
+                  <ArrowUpRight className="h-4 w-4" />
+                )}
               </div>
-              <div className="flex-1 min-w-0">
+              <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <span className="mono text-sm font-semibold">{short(t.token_mint)}</span>
-                  <span className="text-[10px] uppercase tracking-widest text-muted-foreground">{t.side}</span>
-                  {pnl !== undefined && (
-                    <span className={`mono text-xs ${pnl >= 0 ? "text-success" : "text-destructive"}`}>
+                  <span className="mono text-sm font-semibold">{short(trade.token_mint)}</span>
+                  <span className="text-[10px] uppercase tracking-widest text-muted-foreground">
+                    {trade.side}
+                  </span>
+                  {pnl !== undefined && Number.isFinite(pnl) && (
+                    <span
+                      className={`mono text-xs ${pnl >= 0 ? "text-success" : "text-destructive"}`}
+                    >
                       {pnl >= 0 ? "+" : ""}
                       {pnl.toFixed(1)}%
                     </span>
                   )}
                 </div>
-                <div className="truncate text-xs text-muted-foreground">{t.reason ?? "—"}</div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {trade.reason ?? "—"}
+                </div>
               </div>
               <div className="text-right">
-                <div className="mono text-sm">${usd.toFixed(2)}</div>
-                <div className="mono text-[10px] text-muted-foreground">{relTime(t.created_at)}</div>
+                <div className="mono text-sm">{tokenAmount(tokens)} tokens</div>
+                <div
+                  className="mono max-w-48 truncate text-[10px] text-muted-foreground"
+                  title={`${tokenAmount(tokens)} tokens`}
+                >
+                  {hasUsd ? `$${usd.toFixed(2)} · ` : ""}
+                  {tradeLatency ? `${tradeLatency} · ` : ""}
+                  {relTime(trade.created_at)}
+                </div>
               </div>
             </li>
           );
