@@ -1,11 +1,17 @@
 import { createServerFn } from "@tanstack/react-start";
 import type { BotConfig } from "./bot-config";
 import { BotConfigSchema, FundingKeySchema } from "./bot.schemas";
-import { adminClient, configToRow, currentUserId, rowToConfig, saveFundingKeyRecord } from "./bot.server";
+import {
+  adminClient,
+  configToRow,
+  currentUserId,
+  rowToConfig,
+  saveFundingKeyRecord,
+} from "./bot.server";
 
 export const getBotConfig = createServerFn({ method: "GET" }).handler(async () => {
   const db = adminClient();
-  const { data, error } = await db
+  const { data, error } = await (db as any)
     .from("bot_config")
     .select("*")
     .eq("user_id", currentUserId())
@@ -17,7 +23,7 @@ export const getBotConfig = createServerFn({ method: "GET" }).handler(async () =
 });
 
 export const saveBotConfig = createServerFn({ method: "POST" })
-  .inputValidator((data) => BotConfigSchema.parse(data))
+  .validator((data) => BotConfigSchema.parse(data))
   .handler(async ({ data }) => {
     const db = adminClient();
     const row = configToRow(data as BotConfig);
@@ -35,10 +41,41 @@ export const saveBotConfig = createServerFn({ method: "POST" })
   });
 
 export const saveFundingKey = createServerFn({ method: "POST" })
-  .inputValidator((data) => FundingKeySchema.parse(data))
+  .validator((data) => FundingKeySchema.parse(data))
   .handler(async ({ data }) => {
     return saveFundingKeyRecord(data.privateKey);
   });
+
+export const getFundingKeyStatus = createServerFn({ method: "GET" }).handler(async () => {
+  const db = adminClient();
+  const { data, error } = await (db as any)
+    .from("funding_keys")
+    .select("wallet_pubkey")
+    .eq("user_id", currentUserId())
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return { saved: !!data, walletPubkey: data?.wallet_pubkey ?? null };
+});
+
+export const getWorkerStatus = createServerFn({ method: "GET" }).handler(async () => {
+  const db = adminClient();
+  const { data, error } = await (db as any)
+    .from("worker_heartbeat")
+    .select("*")
+    .eq("user_id", currentUserId())
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data)
+    return { online: false, updatedAt: null, geyserConnected: false, decodedEventCount: 0 };
+  const updatedAtMs = new Date(data.updated_at).getTime();
+  const online = Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs < 45_000;
+  return {
+    online,
+    updatedAt: data.updated_at,
+    geyserConnected: data.geyser_connected,
+    decodedEventCount: Number(data.decoded_event_count),
+  };
+});
 
 export const getTrades = createServerFn({ method: "GET" }).handler(async () => {
   const db = adminClient();
@@ -105,4 +142,41 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
       last_updated: f.last_updated,
     };
   });
+});
+
+export const getStrategyInsights = createServerFn({ method: "GET" }).handler(async () => {
+  const db = adminClient();
+  const since = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+  const { data, error } = await (db as any).rpc("strategy_insights", {
+    p_user_id: currentUserId(),
+    p_since: since,
+  });
+  if (error) throw new Error(error.message);
+  return (
+    data ?? {
+      since,
+      generated_at: new Date().toISOString(),
+      total_observations: 0,
+      target_buys: 0,
+      target_sells: 0,
+      target_transfers: 0,
+      follower_sells: 0,
+      unique_mints: 0,
+      copied_buys: 0,
+      filtered_buys: 0,
+      failed_actions: 0,
+      median_buy_reaction_ms: null,
+      median_buy_execution_ms: null,
+      median_sell_reaction_ms: null,
+      median_sell_execution_ms: null,
+      learning_confidence_pct: 0,
+      top_filter_reasons: [],
+      median_target_buy_usd: null,
+      median_entry_market_cap_usd: null,
+      median_entry_liquidity_usd: null,
+      average_transfer_recipients: null,
+      most_active_hour_utc: null,
+      recent: [],
+    }
+  );
 });

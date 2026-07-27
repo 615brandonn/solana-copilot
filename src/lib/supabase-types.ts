@@ -65,6 +65,113 @@ export type FundingKeyRow = {
   created_at: string;
 };
 
+export type WorkerHeartbeatRow = {
+  user_id: string;
+  target_wallet: string | null;
+  started_at: string;
+  updated_at: string;
+  geyser_connected: boolean;
+  last_geyser_message_at: string | null;
+  decoded_event_count: number;
+  rpc_last_poll_at: string | null;
+};
+
+export type StrategyObservationRow = {
+  id: string;
+  user_id: string;
+  target_wallet: string;
+  event_key: string;
+  tx_sig: string;
+  slot: number | null;
+  source: "geyser" | "rpc" | "unknown";
+  event_at: string;
+  detected_at: string;
+  updated_at: string;
+  relationship: "target" | "follower" | "observed";
+  event_kind: "swap" | "transfer";
+  side: "buy" | "sell" | null;
+  actor_wallet: string;
+  from_wallet: string | null;
+  to_wallet: string | null;
+  token_mint: string;
+  amount_tokens: number;
+  decimals: number;
+  sol_delta: number | null;
+  amount_usd: number | null;
+  is_pump_fun: boolean | null;
+  position_id: string | null;
+  market_cap_usd: number | null;
+  liquidity_usd: number | null;
+  has_socials: boolean | null;
+  bot_decision:
+    | "filtered"
+    | "skipped"
+    | "copy_submitted"
+    | "copied"
+    | "mirror_submitted"
+    | "mirrored"
+    | "tracked"
+    | "failed"
+    | null;
+  bot_reason: string | null;
+  bot_tx_sig: string | null;
+  reaction_ms: number | null;
+  execution_ms: number | null;
+  metadata: Record<string, unknown>;
+};
+
+export type StrategyRecentObservation = Pick<
+  StrategyObservationRow,
+  | "event_key"
+  | "tx_sig"
+  | "event_at"
+  | "relationship"
+  | "event_kind"
+  | "side"
+  | "actor_wallet"
+  | "from_wallet"
+  | "to_wallet"
+  | "token_mint"
+  | "amount_tokens"
+  | "amount_usd"
+  | "market_cap_usd"
+  | "liquidity_usd"
+  | "bot_decision"
+  | "bot_reason"
+  | "source"
+>;
+
+export type StrategyReasonCount = {
+  reason: string;
+  count: number;
+};
+
+export type StrategyInsights = {
+  since: string;
+  generated_at: string;
+  total_observations: number;
+  target_buys: number;
+  target_sells: number;
+  target_transfers: number;
+  follower_sells: number;
+  unique_mints: number;
+  copied_buys: number;
+  filtered_buys: number;
+  failed_actions: number;
+  median_buy_reaction_ms: number | null;
+  median_buy_execution_ms: number | null;
+  median_sell_reaction_ms: number | null;
+  median_sell_execution_ms: number | null;
+  learning_confidence_pct: number;
+  top_filter_reasons: StrategyReasonCount[];
+  median_target_buy_usd: number | null;
+  median_entry_market_cap_usd: number | null;
+  median_entry_liquidity_usd: number | null;
+  average_transfer_recipients: number | null;
+  most_active_hour_utc: number | null;
+  recent: StrategyRecentObservation[];
+};
+
 // Minimal Database shape for createClient<Database>
 export type Database = {
   public: {
@@ -88,6 +195,16 @@ export type Database = {
         Row: TradeRow;
         Insert: Omit<TradeRow, "id" | "created_at">;
         Update: Partial<TradeRow>;
+      };
+      worker_heartbeat: {
+        Row: WorkerHeartbeatRow;
+        Insert: WorkerHeartbeatRow;
+        Update: Partial<WorkerHeartbeatRow>;
+      };
+      strategy_observations: {
+        Row: StrategyObservationRow;
+        Insert: Omit<StrategyObservationRow, "id" | "updated_at">;
+        Update: Partial<StrategyObservationRow>;
       };
     };
   };
