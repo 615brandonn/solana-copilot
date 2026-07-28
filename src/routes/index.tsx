@@ -1,23 +1,40 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast, Toaster } from "sonner";
 
 import { DEFAULT_CONFIG, loadConfig, saveConfig, type BotConfig } from "@/lib/bot-config";
-import { getBotConfig, saveBotConfig, getPositions, getFollowers, saveFundingKey } from "@/lib/bot.functions";
+import {
+  getBotConfig,
+  saveBotConfig,
+  getPositions,
+  getFollowers,
+  saveFundingKey,
+  getFundingKeyStatus,
+  getWorkerStatus,
+} from "@/lib/bot.functions";
+import { isSolanaPublicKey } from "@/lib/base58";
 import { useQuery } from "@tanstack/react-query";
 import { StatusHeader } from "@/components/dashboard/StatusHeader";
 import { WalletPanel } from "@/components/dashboard/WalletPanel";
 import { SettingsPanel } from "@/components/dashboard/SettingsPanel";
 import { ActivityFeed } from "@/components/dashboard/ActivityFeed";
 import { MonitoredWallets } from "@/components/dashboard/MonitoredWallets";
+import { StrategyLab } from "@/components/dashboard/StrategyLab";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
       { title: "Helix — Solana Copy Trading Bot" },
-      { name: "description", content: "Configure sub-second Solana copy trades, follower propagation exits, and risk filters." },
+      {
+        name: "description",
+        content:
+          "Configure sub-second Solana copy trades, follower propagation exits, and risk filters.",
+      },
       { property: "og:title", content: "Helix — Solana Copy Trading Bot" },
-      { property: "og:description", content: "Configure sub-second Solana copy trades, follower propagation exits, and risk filters." },
+      {
+        property: "og:description",
+        content: "Sub-second Solana copy trading with follower-wallet monitoring.",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
     ],
@@ -25,42 +42,55 @@ export const Route = createFileRoute("/")({
   loader: async () => {
     try {
       const remote = await getBotConfig();
-      return { remote: remote ?? DEFAULT_CONFIG };
-    } catch {
-      return { remote: DEFAULT_CONFIG };
+      return { remote, loadError: null as string | null };
+    } catch (error) {
+      return {
+        remote: null,
+        loadError: error instanceof Error ? error.message : "Could not load Supabase config",
+      };
     }
   },
   component: Dashboard,
-  errorComponent: () => <div className="p-8 text-center">Failed to load bot config. Refresh to retry.</div>,
+  errorComponent: () => (
+    <div className="p-8 text-center">Failed to load bot config. Refresh to retry.</div>
+  ),
   notFoundComponent: () => <div className="p-8 text-center">Dashboard not found.</div>,
 });
 
 function Dashboard() {
-  const { remote } = Route.useLoaderData();
-  const [cfg, setCfg] = useState<BotConfig>(remote);
+  const { remote, loadError } = Route.useLoaderData();
+  const [cfg, setCfg] = useState<BotConfig>(remote ?? DEFAULT_CONFIG);
+  const cfgRef = useRef(cfg);
   const [hydrated, setHydrated] = useState(false);
-  const [keySaved, setKeySaved] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [configRevision, setConfigRevision] = useState(0);
 
   useEffect(() => {
-    // Merge local settings with remote (local wins for in-memory preferences).
-    const local = loadConfig();
-    setCfg((r) => ({ ...r, ...local }));
-    if (typeof window !== "undefined" && localStorage.getItem("helix_key_saved") === "1") {
-      setKeySaved(true);
+    // Supabase is authoritative. Local settings are only a fallback when the
+    // remote row could not be loaded, preventing stale browser data from
+    // silently overwriting a live VPS configuration.
+    if (!remote) {
+      const local = loadConfig();
+      setCfg((current) => {
+        const next = { ...current, ...local };
+        cfgRef.current = next;
+        return next;
+      });
     }
     setHydrated(true);
-  }, []);
+    if (loadError) toast.error(`Config not loaded: ${loadError}`);
+  }, [loadError, remote]);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || configRevision === 0) return;
     // Persist non-sensitive settings locally for fast startup.
-    saveConfig(cfg);
+    const configToSave = cfgRef.current;
+    saveConfig(configToSave);
     // Sync to your own Supabase.
     const timeout = setTimeout(async () => {
       setSyncing(true);
       try {
-        await saveBotConfig({ data: cfg });
+        await saveBotConfig({ data: configToSave });
         toast.success("Settings synced to Supabase");
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Unknown error";
@@ -71,21 +101,40 @@ function Dashboard() {
       }
     }, 600);
     return () => clearTimeout(timeout);
-  }, [cfg, hydrated]);
+  }, [configRevision, hydrated]);
 
-  const update = (patch: Partial<BotConfig>) => setCfg((c) => ({ ...c, ...patch }));
+  const update = (patch: Partial<BotConfig>) => {
+    setCfg((current) => {
+      const next = { ...current, ...patch };
+      cfgRef.current = next;
+      return next;
+    });
+    if (Object.keys(patch).some((key) => key !== "fundingPrivateKey")) {
+      setConfigRevision((revision) => revision + 1);
+    }
+  };
+
+  const fundingKeyQ = useQuery({
+    queryKey: ["funding-key-status"],
+    queryFn: () => getFundingKeyStatus(),
+    refetchInterval: 10_000,
+  });
+  const workerQ = useQuery({
+    queryKey: ["worker-status"],
+    queryFn: () => getWorkerStatus(),
+    refetchInterval: 10_000,
+    retry: false,
+  });
+  const keySaved = fundingKeyQ.data?.saved ?? false;
 
   const handleSaveKey = async () => {
     try {
       const result = await saveFundingKey({ data: { privateKey: cfg.fundingPrivateKey } });
       if (!result.ok) {
-        setKeySaved(false);
-        if (typeof window !== "undefined") localStorage.removeItem("helix_key_saved");
         toast.error(result.error);
         return;
       }
-      setKeySaved(true);
-      if (typeof window !== "undefined") localStorage.setItem("helix_key_saved", "1");
+      await fundingKeyQ.refetch();
       toast.success("Private key encrypted and saved");
       setCfg((c) => ({ ...c, fundingPrivateKey: "" }));
     } catch (e) {
@@ -94,10 +143,18 @@ function Dashboard() {
     }
   };
 
-  const positionsQ = useQuery({ queryKey: ["positions"], queryFn: () => getPositions(), refetchInterval: 3000 });
-  const followersQ = useQuery({ queryKey: ["followers"], queryFn: () => getFollowers(), refetchInterval: 3000 });
-  const activePositions = (positionsQ.data as unknown as any[] | undefined)?.length ?? 0;
-  const monitored = (followersQ.data as unknown as any[] | undefined)?.length ?? 0;
+  const positionsQ = useQuery({
+    queryKey: ["positions"],
+    queryFn: () => getPositions(),
+    refetchInterval: 3000,
+  });
+  const followersQ = useQuery({
+    queryKey: ["followers"],
+    queryFn: () => getFollowers(),
+    refetchInterval: 3000,
+  });
+  const activePositions = (positionsQ.data as unknown[] | undefined)?.length ?? 0;
+  const monitored = (followersQ.data as unknown[] | undefined)?.length ?? 0;
 
   return (
     <div className="min-h-screen">
@@ -106,19 +163,26 @@ function Dashboard() {
         <StatusHeader
           enabled={cfg.enabled}
           onToggle={(v) => update({ enabled: v })}
-          workerConnected={hydrated}
+          workerConnected={workerQ.data?.online ?? false}
+          workerStatusMessage={
+            workerQ.isError
+              ? "Worker heartbeat unavailable. Apply the latest Supabase schema and restart the VPS worker."
+              : workerQ.data?.online
+                ? `Heartbeat current; ${workerQ.data.decodedEventCount} decoded events`
+                : "No recent VPS heartbeat"
+          }
           activePositions={activePositions}
           monitoredWallets={monitored}
           syncing={syncing}
-          targetWalletValid={/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(cfg.targetWallet || "")}
+          targetWalletValid={isSolanaPublicKey(cfg.targetWallet || "")}
           fundingKeySaved={keySaved}
         />
-
 
         <main className="mt-8 grid gap-6 lg:grid-cols-3">
           <div className="lg:col-span-2 space-y-6">
             <WalletPanel
               targetWallet={cfg.targetWallet}
+              additionalTargetWallets={cfg.additionalTargetWallets}
               fundingPrivateKey={cfg.fundingPrivateKey}
               onChange={update}
               onSaveKey={handleSaveKey}
@@ -133,11 +197,11 @@ function Dashboard() {
           </aside>
         </main>
 
+        <StrategyLab />
+
         <footer className="mt-10 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-6 text-[11px] text-muted-foreground">
           <span className="mono">helix · self-hosted · supabase + cloudflare + jito</span>
-          <span className="mono">
-            worker endpoint: <span className="text-foreground">{import.meta.env.PUBLIC_WORKER_URL ?? "not configured"}</span>
-          </span>
+          <span className="mono">worker status: Supabase heartbeat</span>
         </footer>
       </div>
     </div>
