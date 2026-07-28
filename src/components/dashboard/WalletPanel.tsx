@@ -1,20 +1,37 @@
-import { Crosshair, KeyRound, ShieldCheck, Eye, EyeOff } from "lucide-react";
+import { Crosshair, KeyRound, ShieldCheck, Eye, EyeOff, Network } from "lucide-react";
 import { useState } from "react";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
+import { isSolanaPublicKey } from "@/lib/base58";
 import { SectionCard } from "./SettingRow";
 
 type Props = {
   targetWallet: string;
+  additionalTargetWallets: string[];
   fundingPrivateKey: string;
-  onChange: (patch: { targetWallet?: string; fundingPrivateKey?: string }) => void;
+  onChange: (patch: {
+    targetWallet?: string;
+    additionalTargetWallets?: string[];
+    fundingPrivateKey?: string;
+  }) => void;
   onSaveKey: () => void;
   keySaved: boolean;
 };
 
-export function WalletPanel({ targetWallet, fundingPrivateKey, onChange, onSaveKey, keySaved }: Props) {
+export function WalletPanel({
+  targetWallet,
+  additionalTargetWallets,
+  fundingPrivateKey,
+  onChange,
+  onSaveKey,
+  keySaved,
+}: Props) {
   const [reveal, setReveal] = useState(false);
-  const isValidSolAddr = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(targetWallet);
+  const isValidSolAddr = isSolanaPublicKey(targetWallet);
+  const invalidAdditionalTargets = additionalTargetWallets.filter(
+    (wallet) => !isSolanaPublicKey(wallet),
+  );
 
   return (
     <SectionCard
@@ -44,6 +61,45 @@ export function WalletPanel({ targetWallet, fundingPrivateKey, onChange, onSaveK
               </span>
             )}
           </div>
+        </div>
+
+        <div>
+          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wider text-muted-foreground">
+            <Network className="h-3.5 w-3.5" />
+            Additional target wallets - sell network only
+          </label>
+          <Textarea
+            value={additionalTargetWallets.join("\n")}
+            onChange={(event) => {
+              const wallets = Array.from(
+                new Set(
+                  event.target.value
+                    .split(/[\s,]+/)
+                    .map((wallet) => wallet.trim())
+                    .filter(Boolean),
+                ),
+              );
+              onChange({ additionalTargetWallets: wallets });
+            }}
+            placeholder={"One wallet per line\nThese wallets never trigger a copied buy"}
+            className="mono min-h-28 resize-y"
+            spellCheck={false}
+          />
+          <p
+            className={`mt-2 text-[11px] ${
+              invalidAdditionalTargets.length || additionalTargetWallets.length > 20
+                ? "text-destructive"
+                : "text-muted-foreground"
+            }`}
+          >
+            {additionalTargetWallets.length > 20
+              ? "Use no more than 20 additional target wallets."
+              : invalidAdditionalTargets.length
+                ? `${invalidAdditionalTargets.length} wallet address${
+                    invalidAdditionalTargets.length === 1 ? " is" : "es are"
+                  } invalid.`
+                : `${additionalTargetWallets.length}/20 added. Their buys and direct sells are ignored. Only transfers for a coin you already copied create follower wallets whose sells can be mirrored.`}
+          </p>
         </div>
 
         <div>
@@ -78,7 +134,8 @@ export function WalletPanel({ targetWallet, fundingPrivateKey, onChange, onSaveK
           </div>
           <p className="mt-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
             <ShieldCheck className="h-3 w-3 text-success" />
-            Sent securely, encrypted by your backend, then stored for the worker. Never stored in plain text; never in localStorage.
+            Sent securely, encrypted by your backend, then stored for the worker. Never stored in
+            plain text; never in localStorage.
             {keySaved && <span className="mono ml-2 text-success">✓ sent to worker</span>}
           </p>
         </div>
