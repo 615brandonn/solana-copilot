@@ -6,6 +6,7 @@ export type BotConfigRow = {
   user_id: string;
   enabled: boolean;
   target_wallet: string | null;
+  additional_target_wallets: string[];
   execution_route: string;
   jito_tip_sol: number;
   fixed_buy_usd: number;
@@ -16,6 +17,12 @@ export type BotConfigRow = {
   liq_max_usd: number;
   pump_fun_only: boolean;
   require_socials: boolean;
+  require_24h_uptrend: boolean;
+  large_buy_scanner_enabled: boolean;
+  large_buy_scanner_max_mc_usd: number;
+  large_buy_scanner_min_buy_usd: number;
+  large_buy_scanner_multiplier: number;
+  large_buy_scanner_history_window: number;
   only_first_buy_ever: boolean;
   only_once_per_token: boolean;
   take_profit_enabled: boolean;
@@ -54,6 +61,7 @@ export type TradeRow = {
   reason: string | null;
   latency_ms: number | null;
   route: string | null;
+  valuation_source: string | null;
   created_at: string;
 };
 

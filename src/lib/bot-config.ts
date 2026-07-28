@@ -1,6 +1,7 @@
 export type BotConfig = {
   enabled: boolean;
   targetWallet: string;
+  additionalTargetWallets: string[];
   fundingPrivateKey: string; // client-side only; encrypted before persistence
   executionRoute: "jito" | "rpc";
   jitoTipSol: number;
@@ -12,6 +13,12 @@ export type BotConfig = {
   liqMaxUsd: number;
   pumpFunOnly: boolean;
   requireSocials: boolean;
+  require24hUptrend: boolean;
+  largeBuyScannerEnabled: boolean;
+  largeBuyScannerMaxMcUsd: number;
+  largeBuyScannerMinBuyUsd: number;
+  largeBuyScannerMultiplier: number;
+  largeBuyScannerHistoryWindow: number;
   onlyFirstBuyEver: boolean;
   onlyOncePerToken: boolean;
   takeProfitEnabled: boolean;
@@ -25,6 +32,7 @@ export type BotConfig = {
 export const DEFAULT_CONFIG: BotConfig = {
   enabled: false,
   targetWallet: "",
+  additionalTargetWallets: [],
   fundingPrivateKey: "",
   executionRoute: "jito",
   jitoTipSol: 0.001,
@@ -36,6 +44,12 @@ export const DEFAULT_CONFIG: BotConfig = {
   liqMaxUsd: 2_000_000,
   pumpFunOnly: false,
   requireSocials: true,
+  require24hUptrend: false,
+  largeBuyScannerEnabled: false,
+  largeBuyScannerMaxMcUsd: 10_000,
+  largeBuyScannerMinBuyUsd: 500,
+  largeBuyScannerMultiplier: 2,
+  largeBuyScannerHistoryWindow: 20,
   onlyFirstBuyEver: false,
   onlyOncePerToken: true,
   takeProfitEnabled: true,
