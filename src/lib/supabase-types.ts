@@ -10,6 +10,12 @@ export type BotConfigRow = {
   execution_route: string;
   jito_tip_sol: number;
   fixed_buy_usd: number;
+  network_scaling_enabled: boolean;
+  starter_position_pct: number;
+  max_position_pct: number;
+  new_entry_reserve_pct: number;
+  target_copy_ratio_pct: number;
+  min_scale_buy_usd: number;
   min_target_buy_usd: number;
   mc_min_usd: number;
   mc_max_usd: number;
@@ -45,6 +51,12 @@ export type PositionRow = {
   entry_slot: number | null;
   opened_at: string;
   closed_at: string | null;
+  network_target_spend_usd: number;
+  bot_cost_basis_usd: number;
+  campaign_bankroll_usd: number;
+  root_buy_count: number;
+  last_root_buy_at: string | null;
+  last_root_buy_wallet: string | null;
 };
 
 export type TradeRow = {

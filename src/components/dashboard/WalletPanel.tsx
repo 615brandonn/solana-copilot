@@ -1,5 +1,5 @@
 import { Crosshair, KeyRound, ShieldCheck, Eye, EyeOff, Network } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,12 @@ export function WalletPanel({
   keySaved,
 }: Props) {
   const [reveal, setReveal] = useState(false);
+  const [additionalDraft, setAdditionalDraft] = useState(
+    additionalTargetWallets.join("\n"),
+  );
+  useEffect(() => {
+    setAdditionalDraft(additionalTargetWallets.join("\n"));
+  }, [additionalTargetWallets.join("\n")]);
   const isValidSolAddr = isSolanaPublicKey(targetWallet);
   const invalidAdditionalTargets = additionalTargetWallets.filter(
     (wallet) => !isSolanaPublicKey(wallet),
@@ -66,11 +72,12 @@ export function WalletPanel({
         <div>
           <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wider text-muted-foreground">
             <Network className="h-3.5 w-3.5" />
-            Additional target wallets - sell network only
+            Additional market-maker buying wallets
           </label>
           <Textarea
-            value={additionalTargetWallets.join("\n")}
+            value={additionalDraft}
             onChange={(event) => {
+              setAdditionalDraft(event.target.value);
               const wallets = Array.from(
                 new Set(
                   event.target.value
@@ -81,7 +88,7 @@ export function WalletPanel({
               );
               onChange({ additionalTargetWallets: wallets });
             }}
-            placeholder={"One wallet per line\nThese wallets never trigger a copied buy"}
+            placeholder={"One wallet per line\nBuys from every wallet build one combined position"}
             className="mono min-h-28 resize-y"
             spellCheck={false}
           />
@@ -98,7 +105,7 @@ export function WalletPanel({
                 ? `${invalidAdditionalTargets.length} wallet address${
                     invalidAdditionalTargets.length === 1 ? " is" : "es are"
                   } invalid.`
-                : `${additionalTargetWallets.length}/20 added. Their buys and direct sells are ignored. Only transfers for a coin you already copied create follower wallets whose sells can be mirrored.`}
+                : `${additionalTargetWallets.length}/20 added. Every listed wallet can start or scale a copied position. Transfers between them do not cause duplicate buys, and wallets they fund remain tracked for proportional sells.`}
           </p>
         </div>
 

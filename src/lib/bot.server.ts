@@ -12,9 +12,7 @@ export type SaveFundingKeyResult =
 
 export function currentUserId() {
   const userId = process.env.HELIX_USER_ID?.trim();
-  const fallback = "00000000-0000-0000-0000-000000000000";
-  if (!userId) return fallback;
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
+  if (!userId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
     throw new Error("HELIX_USER_ID must be set to a valid UUID");
   }
   return userId;
@@ -59,6 +57,12 @@ export function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row
     executionRoute: row.execution_route as "jito" | "rpc",
     jitoTipSol: row.jito_tip_sol,
     fixedBuyUsd: row.fixed_buy_usd,
+    networkScalingEnabled: row.network_scaling_enabled ?? true,
+    starterPositionPct: row.starter_position_pct ?? 5,
+    maxPositionPct: row.max_position_pct ?? 15,
+    newEntryReservePct: row.new_entry_reserve_pct ?? 50,
+    targetCopyRatioPct: row.target_copy_ratio_pct ?? 1,
+    minScaleBuyUsd: row.min_scale_buy_usd ?? 1,
     minTargetBuyUsd: row.min_target_buy_usd,
     mcMinUsd: row.mc_min_usd,
     mcMaxUsd: row.mc_max_usd,
@@ -100,6 +104,12 @@ export function configToRow(
     execution_route: cfg.executionRoute,
     jito_tip_sol: cfg.jitoTipSol,
     fixed_buy_usd: cfg.fixedBuyUsd,
+    network_scaling_enabled: cfg.networkScalingEnabled,
+    starter_position_pct: cfg.starterPositionPct,
+    max_position_pct: cfg.maxPositionPct,
+    new_entry_reserve_pct: cfg.newEntryReservePct,
+    target_copy_ratio_pct: cfg.targetCopyRatioPct,
+    min_scale_buy_usd: cfg.minScaleBuyUsd,
     min_target_buy_usd: cfg.minTargetBuyUsd,
     mc_min_usd: cfg.mcMinUsd,
     mc_max_usd: cfg.mcMaxUsd,

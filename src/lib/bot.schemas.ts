@@ -14,6 +14,12 @@ export const BotConfigSchema = z
     executionRoute: z.enum(["jito", "rpc"]),
     jitoTipSol: z.number().finite().min(0).max(1),
     fixedBuyUsd: z.number().finite().positive().max(1_000_000),
+    networkScalingEnabled: z.boolean(),
+    starterPositionPct: z.number().finite().positive().max(100),
+    maxPositionPct: z.number().finite().positive().max(100),
+    newEntryReservePct: z.number().finite().min(0).max(95),
+    targetCopyRatioPct: z.number().finite().positive().max(100),
+    minScaleBuyUsd: z.number().finite().positive().max(1_000_000),
     minTargetBuyUsd: z.number().finite().min(0).max(1_000_000_000),
     mcMinUsd: z.number().finite().min(0),
     mcMaxUsd: z.number().finite().min(0),
@@ -43,6 +49,10 @@ export const BotConfigSchema = z
   .refine((config) => config.liqMinUsd <= config.liqMaxUsd, {
     message: "Liquidity minimum cannot exceed maximum",
     path: ["liqMaxUsd"],
+  })
+  .refine((config) => config.starterPositionPct <= config.maxPositionPct, {
+    message: "Starter position cannot exceed the per-coin maximum",
+    path: ["maxPositionPct"],
   })
   .superRefine((config, ctx) => {
     const normalized = config.additionalTargetWallets.map((wallet) => wallet.trim());

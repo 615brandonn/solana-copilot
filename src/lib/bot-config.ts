@@ -6,6 +6,12 @@ export type BotConfig = {
   executionRoute: "jito" | "rpc";
   jitoTipSol: number;
   fixedBuyUsd: number;
+  networkScalingEnabled: boolean;
+  starterPositionPct: number;
+  maxPositionPct: number;
+  newEntryReservePct: number;
+  targetCopyRatioPct: number;
+  minScaleBuyUsd: number;
   minTargetBuyUsd: number;
   mcMinUsd: number;
   mcMaxUsd: number;
@@ -37,6 +43,12 @@ export const DEFAULT_CONFIG: BotConfig = {
   executionRoute: "jito",
   jitoTipSol: 0.001,
   fixedBuyUsd: 25,
+  networkScalingEnabled: true,
+  starterPositionPct: 5,
+  maxPositionPct: 15,
+  newEntryReservePct: 50,
+  targetCopyRatioPct: 1,
+  minScaleBuyUsd: 1,
   minTargetBuyUsd: 100,
   mcMinUsd: 20_000,
   mcMaxUsd: 5_000_000,
