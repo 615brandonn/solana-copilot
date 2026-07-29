@@ -12,7 +12,9 @@ export type SaveFundingKeyResult =
 
 export function currentUserId() {
   const userId = process.env.HELIX_USER_ID?.trim();
-  if (!userId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
+  const fallback = "00000000-0000-0000-0000-000000000000";
+  if (!userId) return fallback;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
     throw new Error("HELIX_USER_ID must be set to a valid UUID");
   }
   return userId;
