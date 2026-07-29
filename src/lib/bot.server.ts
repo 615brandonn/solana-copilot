@@ -10,9 +10,18 @@ import { decodeBase58, encodeBase58 } from "./base58";
 export type SaveFundingKeyResult =
   { ok: true } | { ok: false; code: "missing_backend_key" | "save_failed"; error: string };
 
+const SINGLE_USER_ID = "00000000-0000-0000-0000-000000000000";
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function currentUserId() {
   const userId = process.env.HELIX_USER_ID?.trim();
-  if (!userId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
+  // Lovable preview does not always expose optional project variables. This
+  // project is intentionally single-user, and its existing Supabase row and
+  // VPS worker both use the zero UUID, so a missing value safely resolves to
+  // that same row. A nonempty malformed value is still rejected.
+  if (!userId) return SINGLE_USER_ID;
+  if (!UUID_PATTERN.test(userId)) {
     throw new Error("HELIX_USER_ID must be set to a valid UUID");
   }
   return userId;
