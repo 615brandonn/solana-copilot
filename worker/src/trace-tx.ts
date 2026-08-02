@@ -4,6 +4,7 @@ import { env } from "./env.js";
 import { db, type BotConfigRow } from "./db.js";
 import { decodeParsedTransaction } from "./poller.js";
 import { checkEntry, loadTokenMeta } from "./filters.js";
+import type { SwapEvent, TransferEvent } from "./geyser.js";
 
 const WSOL = "So11111111111111111111111111111111111111112";
 const rpc = new Connection(env.RPC_URL, { commitment: "confirmed" });
@@ -119,8 +120,14 @@ async function main() {
   print("Swap-like logs found", swapSignal);
   print("Decoded bot events", events);
 
-  const targetBuys = events.filter((event) => event.kind === "swap" && event.wallet === cfg.target_wallet && event.side === "buy");
-  const targetTransfers = events.filter((event) => event.kind === "transfer" && event.from === cfg.target_wallet);
+  const targetBuys = events.filter(
+    (event): event is SwapEvent =>
+      event.kind === "swap" && event.wallet === cfg.target_wallet && event.side === "buy",
+  );
+  const targetTransfers = events.filter(
+    (event): event is TransferEvent =>
+      event.kind === "transfer" && event.from === cfg.target_wallet,
+  );
 
   if (targetBuys.length === 0 && targetTransfers.length === 0) {
     print("Why it did not copy", "This transaction did not decode as a target buy or target outbound token transfer. Most likely the address entered is not the actual trading signer/owner for this swap, or this tx format needs another decoder path.");

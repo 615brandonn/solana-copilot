@@ -135,7 +135,12 @@ function inferBuyTransferredOut(meta: any, target: string, solDelta: number, swa
     const post = amountFromTokenBalance(balance);
     const delta = post - pre;
     if (delta <= 1e-12) continue;
-    const cur = byMint.get(balance.mint) ?? {
+    const cur: {
+      mint: string;
+      amountTokens: number;
+      decimals: number;
+      recipients: Array<{ wallet: string; amountTokens: number }>;
+    } = byMint.get(balance.mint) ?? {
       mint: balance.mint,
       amountTokens: 0,
       decimals: Number(balance?.uiTokenAmount?.decimals ?? 0),
@@ -174,6 +179,9 @@ async function main() {
     mc_max_usd: cfg.mc_max_usd,
     liq_min_usd: cfg.liq_min_usd,
     liq_max_usd: cfg.liq_max_usd,
+    token_age_filter_enabled: cfg.token_age_filter_enabled,
+    token_age_min_minutes: cfg.token_age_min_minutes,
+    token_age_max_minutes: cfg.token_age_max_minutes,
     pump_fun_only: cfg.pump_fun_only,
     require_socials: cfg.require_socials,
     only_first_buy_ever: cfg.only_first_buy_ever,

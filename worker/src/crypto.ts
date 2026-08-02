@@ -2,9 +2,9 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:
 import { env } from "./env.js";
 
 // AES-256-GCM. Ciphertext layout: [12-byte IV | 16-byte tag | ciphertext] base64.
-// New saves always use the Supabase service key hash so users do not need to
-// manage a separate KEY_ENCRYPTION_KEY. A valid KEY_ENCRYPTION_KEY is only kept
-// as a legacy decrypt fallback for keys saved before this simplification.
+// VPS saves use the Supabase service-key hash. Dashboard saves use that same
+// key unless KEY_ENCRYPTION_KEY is configured, in which case they are prefixed
+// with `key:` and must be decrypted with the explicit key.
 function legacyKey(): Buffer | null {
   const raw = env.KEY_ENCRYPTION_KEY?.trim();
   if (!raw) return null;
@@ -34,6 +34,21 @@ export function encryptPrivateKey(plaintext: string): string {
 }
 
 export function decryptPrivateKey(stored: string): string {
+  if (stored.startsWith("key:")) {
+    const key = legacyKey();
+    if (!key) {
+      throw new Error(
+        "Funding key requires KEY_ENCRYPTION_KEY. Configure the same key on the worker or re-save the Phantom private key.",
+      );
+    }
+    try {
+      return decryptWith(stored.slice(4), key);
+    } catch {
+      throw new Error(
+        "Funding key cannot be decrypted with KEY_ENCRYPTION_KEY. Confirm the dashboard and worker use the same key, then re-save it.",
+      );
+    }
+  }
   if (stored.startsWith("svc:")) {
     try {
       return decryptWith(stored.slice(4), serviceKey());

@@ -252,6 +252,37 @@ export function SettingsPanel({ cfg, onChange }: Props) {
             />
           </div>
         </SettingRow>
+        <SettingRow
+          label="Token-age filter"
+          hint="Use the earliest DexScreener pair timestamp as trading age. Missing age data is rejected when enabled."
+        >
+          <Switch
+            checked={cfg.tokenAgeFilterEnabled}
+            onCheckedChange={(v) => onChange({ tokenAgeFilterEnabled: v })}
+          />
+        </SettingRow>
+        {cfg.tokenAgeFilterEnabled && (
+          <SettingRow
+            label="Token-age range"
+            hint="Only copy tokens whose first known trading pair is within this age range. Set the minimum to 0 for brand-new launches."
+          >
+            <div className="flex items-center gap-2 mono text-xs">
+              <NumInput
+                value={cfg.tokenAgeMinMinutes}
+                onChange={(n) => onChange({ tokenAgeMinMinutes: n })}
+                suffix="min"
+                min={0}
+              />
+              <span className="text-muted-foreground">→</span>
+              <NumInput
+                value={cfg.tokenAgeMaxMinutes}
+                onChange={(n) => onChange({ tokenAgeMaxMinutes: n })}
+                suffix="min"
+                min={0}
+              />
+            </div>
+          </SettingRow>
+        )}
         <SettingRow label="Pump.fun only" hint="Reject non-Pump.fun tokens.">
           <Switch checked={cfg.pumpFunOnly} onCheckedChange={(v) => onChange({ pumpFunOnly: v })} />
         </SettingRow>

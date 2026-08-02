@@ -25,6 +25,9 @@ export const BotConfigSchema = z
     mcMaxUsd: z.number().finite().min(0),
     liqMinUsd: z.number().finite().min(0),
     liqMaxUsd: z.number().finite().min(0),
+    tokenAgeFilterEnabled: z.boolean(),
+    tokenAgeMinMinutes: z.number().finite().min(0).max(525_600),
+    tokenAgeMaxMinutes: z.number().finite().min(0).max(525_600),
     pumpFunOnly: z.boolean(),
     requireSocials: z.boolean(),
     require24hUptrend: z.boolean(),
@@ -49,6 +52,10 @@ export const BotConfigSchema = z
   .refine((config) => config.liqMinUsd <= config.liqMaxUsd, {
     message: "Liquidity minimum cannot exceed maximum",
     path: ["liqMaxUsd"],
+  })
+  .refine((config) => config.tokenAgeMinMinutes <= config.tokenAgeMaxMinutes, {
+    message: "Token-age minimum cannot exceed maximum",
+    path: ["tokenAgeMaxMinutes"],
   })
   .refine((config) => config.starterPositionPct <= config.maxPositionPct, {
     message: "Starter position cannot exceed the per-coin maximum",

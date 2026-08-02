@@ -357,6 +357,13 @@ async function main() {
     const { data: targetPrior } = await db.from("target_traded_tokens")
       .select("token_mint").eq("target_wallet", targetWallet).eq("token_mint", event.tokenMint).maybeSingle();
     const firstBuy = !targetPrior;
+    if (firstBuy) {
+      const { error: firstSeenError } = await db.from("target_traded_tokens")
+        .upsert({ target_wallet: targetWallet, token_mint: event.tokenMint });
+      if (firstSeenError) {
+        log.error({ err: firstSeenError, targetWallet, mint: event.tokenMint }, "could not record target's first observed buy");
+      }
+    }
     const decision = checkEntry(cfg, event, meta, { first: firstBuy, already: !!prior });
     if (!decision.pass) {
       log.info({
@@ -370,6 +377,9 @@ async function main() {
           mcMaxUsd: cfg.mc_max_usd,
           liqMinUsd: cfg.liq_min_usd,
           liqMaxUsd: cfg.liq_max_usd,
+          tokenAgeFilterEnabled: cfg.token_age_filter_enabled,
+          tokenAgeMinMinutes: cfg.token_age_min_minutes,
+          tokenAgeMaxMinutes: cfg.token_age_max_minutes,
           pumpFunOnly: cfg.pump_fun_only,
           requireSocials: cfg.require_socials,
           onlyFirstBuyEver: cfg.only_first_buy_ever,
@@ -432,7 +442,6 @@ async function main() {
       tx_sig: result.txSig, reason, latency_ms: result.latencyMs, route: result.route,
     });
     await db.from("traded_tokens").upsert({ user_id: cfg.user_id, token_mint: event.tokenMint });
-    await db.from("target_traded_tokens").upsert({ target_wallet: targetWallet, token_mint: event.tokenMint });
 
     if (pos) await monitor.onCopyBuy({ positionId: pos.id, tokenMint: event.tokenMint, targetWallet });
     log.info({

@@ -61,6 +61,13 @@ bun run dev             # or `npm run dev`
 4. When `amount_remaining = 0`, unsubscribe every follower and mark the
    position closed.
 
+## Token-age filter
+
+The optional token-age range uses the earliest `pairCreatedAt` timestamp
+returned by DexScreener for the mint. When enabled, missing age metadata is
+rejected. Run `supabase/token-age-migration.sql` before enabling it on an
+existing deployment.
+
 ## Security
 
 - Funding private keys are AES-256-GCM encrypted with `KEY_ENCRYPTION_KEY`
