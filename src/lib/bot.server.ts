@@ -77,6 +77,9 @@ export function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row
     mcMaxUsd: row.mc_max_usd,
     liqMinUsd: row.liq_min_usd,
     liqMaxUsd: row.liq_max_usd,
+    tokenAgeFilterEnabled: row.token_age_filter_enabled ?? false,
+    tokenAgeMinMinutes: row.token_age_min_minutes ?? 0,
+    tokenAgeMaxMinutes: row.token_age_max_minutes ?? 60,
     pumpFunOnly: row.pump_fun_only,
     requireSocials: row.require_socials,
     require24hUptrend: row.require_24h_uptrend ?? false,
@@ -124,6 +127,9 @@ export function configToRow(
     mc_max_usd: cfg.mcMaxUsd,
     liq_min_usd: cfg.liqMinUsd,
     liq_max_usd: cfg.liqMaxUsd,
+    token_age_filter_enabled: cfg.tokenAgeFilterEnabled,
+    token_age_min_minutes: cfg.tokenAgeMinMinutes,
+    token_age_max_minutes: cfg.tokenAgeMaxMinutes,
     pump_fun_only: cfg.pumpFunOnly,
     require_socials: cfg.requireSocials,
     require_24h_uptrend: cfg.require24hUptrend,
@@ -185,7 +191,13 @@ export async function saveFundingKeyRecord(privateKey: string): Promise<SaveFund
     wallet_pubkey: encodeBase58(secretBytes.slice(32)),
     ciphertext,
   };
-  const { error } = await db.from("funding_keys").upsert(row as any, { onConflict: "user_id" });
+  const fundingKeys = db.from("funding_keys") as unknown as {
+    upsert: (
+      value: Database["public"]["Tables"]["funding_keys"]["Insert"],
+      options: { onConflict: string },
+    ) => PromiseLike<{ error: { message: string } | null }>;
+  };
+  const { error } = await fundingKeys.upsert(row, { onConflict: "user_id" });
   if (error) {
     return { ok: false, code: "save_failed", error: error.message };
   }

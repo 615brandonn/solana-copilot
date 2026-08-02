@@ -17,6 +17,9 @@ create table if not exists public.bot_config (
   mc_max_usd numeric not null default 5000000,
   liq_min_usd numeric not null default 10000,
   liq_max_usd numeric not null default 2000000,
+  token_age_filter_enabled boolean not null default false,
+  token_age_min_minutes numeric not null default 0,
+  token_age_max_minutes numeric not null default 60,
   pump_fun_only boolean not null default false,
   require_socials boolean not null default true,
   only_first_buy_ever boolean not null default false,
@@ -30,6 +33,14 @@ create table if not exists public.bot_config (
   updated_at timestamptz not null default now(),
   unique (user_id)
 );
+
+-- Idempotent migration for existing deployments.
+alter table public.bot_config
+  add column if not exists token_age_filter_enabled boolean not null default false;
+alter table public.bot_config
+  add column if not exists token_age_min_minutes numeric not null default 0;
+alter table public.bot_config
+  add column if not exists token_age_max_minutes numeric not null default 60;
 
 -- Encrypted funding wallet private keys (AES-256-GCM ciphertext blobs)
 create table if not exists public.funding_keys (

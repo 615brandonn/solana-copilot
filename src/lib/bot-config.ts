@@ -17,6 +17,9 @@ export type BotConfig = {
   mcMaxUsd: number;
   liqMinUsd: number;
   liqMaxUsd: number;
+  tokenAgeFilterEnabled: boolean;
+  tokenAgeMinMinutes: number;
+  tokenAgeMaxMinutes: number;
   pumpFunOnly: boolean;
   requireSocials: boolean;
   require24hUptrend: boolean;
@@ -54,6 +57,9 @@ export const DEFAULT_CONFIG: BotConfig = {
   mcMaxUsd: 5_000_000,
   liqMinUsd: 10_000,
   liqMaxUsd: 2_000_000,
+  tokenAgeFilterEnabled: false,
+  tokenAgeMinMinutes: 0,
+  tokenAgeMaxMinutes: 60,
   pumpFunOnly: false,
   requireSocials: true,
   require24hUptrend: false,

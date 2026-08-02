@@ -274,7 +274,12 @@ function inferBuyTransferredOut(
     const pre = preByOwnerMint.get(`${owner}::${balance.mint}`) ?? 0;
     const delta = post - pre;
     if (delta <= 1e-12) continue;
-    const row = rows.get(balance.mint) ?? {
+    const row: {
+      tokenMint: string;
+      amountTokens: number;
+      decimals: number;
+      recipients: Array<{ owner: string; amountTokens: number }>;
+    } = rows.get(balance.mint) ?? {
       tokenMint: balance.mint,
       amountTokens: 0,
       decimals: Number(balance?.uiTokenAmount?.decimals ?? 0),

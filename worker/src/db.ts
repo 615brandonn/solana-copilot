@@ -45,6 +45,9 @@ export type BotConfigRow = {
   mc_max_usd: number;
   liq_min_usd: number;
   liq_max_usd: number;
+  token_age_filter_enabled: boolean;
+  token_age_min_minutes: number;
+  token_age_max_minutes: number;
   pump_fun_only: boolean;
   require_socials: boolean;
   only_first_buy_ever: boolean;

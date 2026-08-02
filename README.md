@@ -38,8 +38,8 @@ VPS (for the worker), your own RPC + Jito credentials.
 
 - Subscribes to a **target wallet** via Yellowstone Geyser gRPC — sub-second
   event delivery.
-- On a buy that passes your filters (market cap, liquidity, pump.fun-only,
-  socials, first-ever-buy, min buy size, once-per-token), immediately sends
+- On a buy that passes your filters (market cap, liquidity, token trading age,
+  pump.fun-only, socials, first-ever-buy, min buy size, once-per-token), immediately sends
   a copy buy through a **Jito bundle** with configurable tip, or through
   your RPC.
 - After a successful copy buy, monitors the target's outgoing SPL transfers
