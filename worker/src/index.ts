@@ -144,6 +144,46 @@ async function main() {
     log.info({ target: cfg.target_wallet, geyser: feed.health(), rpcFallback: poller.health() }, "stream heartbeat");
   }, 30000);
 
+  const workerStartedAt = new Date().toISOString();
+
+  const toIso = (value: unknown): string | null => {
+    let parsed: Date;
+    if (value instanceof Date) parsed = value;
+    else if (typeof value === "number") {
+      parsed = new Date(value < 1_000_000_000_000 ? value * 1000 : value);
+    } else if (typeof value === "string") parsed = new Date(value);
+    else return null;
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  };
+
+  async function writeWorkerHeartbeat() {
+    const geyser = feed.health();
+    const rpcFallback = poller.health();
+
+    const { error } = await db.from("worker_heartbeat").upsert({
+      user_id: cfg.user_id,
+      target_wallet: cfg.target_wallet ?? null,
+      started_at: workerStartedAt,
+      updated_at: new Date().toISOString(),
+      geyser_connected: Boolean(geyser.connected),
+      last_geyser_message_at: toIso(geyser.lastMessageAt),
+      decoded_event_count: Number(geyser.decodedEventCount ?? 0),
+      rpc_last_poll_at: toIso(rpcFallback.lastPollAt),
+    }, { onConflict: "user_id" });
+
+    if (error) throw error;
+  }
+
+  await writeWorkerHeartbeat().catch((err) =>
+    log.error({ err }, "database heartbeat failed")
+  );
+
+  setInterval(() => {
+    writeWorkerHeartbeat().catch((err) =>
+      log.error({ err }, "database heartbeat failed")
+    );
+  }, 20000);
+
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
   setInterval(() => { checkTpSl().catch((err) => log.error({ err }, "tp/sl loop failed")); }, 4000);
 
