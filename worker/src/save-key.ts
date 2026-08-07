@@ -67,7 +67,13 @@ async function loadConfig(): Promise<BotConfigRow | null> {
     .not("target_wallet", "is", null).neq("target_wallet", "")
     .order("updated_at", { ascending: false }).limit(1);
   if (any.error) throw new Error(`bot_config fallback query failed: ${any.error.message}`);
-  return (any.data?.[0] as BotConfigRow | undefined) ?? null;
+  const row = any.data?.[0] as BotConfigRow | undefined;
+  if (row) {
+    throw new Error(
+      `HELIX_USER_ID mismatch: worker requested ${env.HELIX_USER_ID}, but the configured dashboard row uses ${row.user_id}`,
+    );
+  }
+  return null;
 }
 
 async function main() {

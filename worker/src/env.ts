@@ -7,9 +7,9 @@ const Env = z.object({
   BOT_SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
 
   // Solana infra
-  RPC_URL: z.string().url(),                // Helius/Triton mainnet HTTPS RPC
-  YELLOWSTONE_GRPC_URL: z.string().url(),   // Helius Laserstream / Yellowstone gRPC endpoint
-  YELLOWSTONE_TOKEN: z.string().optional(),  // Helius API key (x-token) for gRPC auth
+  RPC_URL: z.string().url(), // Helius/Triton mainnet HTTPS RPC
+  YELLOWSTONE_GRPC_URL: z.string().url(), // Helius Laserstream / Yellowstone gRPC endpoint
+  YELLOWSTONE_TOKEN: z.string().optional(), // Helius API key (x-token) for gRPC auth
 
   // Jito
   JITO_BLOCK_ENGINE_URL: z.string().url().default("https://mainnet.block-engine.jito.wtf"),
@@ -20,10 +20,8 @@ const Env = z.object({
   KEY_ENCRYPTION_KEY: z.string().min(43).optional(),
 
   // Price feed (Birdeye/Jupiter)
-  PRICE_API_URL: z.string().url().default("https://price.jup.ag/v6/price"),
-
-  // Auth for worker HTTP API called by the dashboard
-  WORKER_API_TOKEN: z.string().min(16),
+  PRICE_API_URL: z.string().url().default("https://api.jup.ag/price/v3"),
+  JUPITER_API_KEY: z.string().min(1).optional(),
 
   // Single user this bot instance manages (matches the dashboard user)
   HELIX_USER_ID: z.string().uuid().default("00000000-0000-0000-0000-000000000000"),

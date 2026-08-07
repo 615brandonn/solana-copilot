@@ -14,6 +14,21 @@ export const BotConfigSchema = z
     executionRoute: z.enum(["jito", "rpc"]),
     jitoTipSol: z.number().finite().min(0).max(1),
     fixedBuyUsd: z.number().finite().positive().max(1_000_000),
+    coordinatedModeEnabled: z.boolean(),
+    coordinatedFixedBuyUsd: z.number().finite().positive().max(1_000_000),
+    coordinatedTargetWalletCount: z.number().int().min(2).max(20),
+    coordinatedWindowSeconds: z.number().int().min(1).max(21_600),
+    coordinatedMcMinUsd: z.number().finite().min(0).max(1_000_000_000),
+    coordinatedMcMaxUsd: z.number().finite().min(0).max(1_000_000_000),
+    coordinatedCoinAgeMinMinutes: z.number().finite().min(0).max(525_600),
+    coordinatedCoinAgeMaxMinutes: z.number().finite().min(0).max(525_600),
+    coordinatedTargetBuyMinUsd: z.number().finite().min(0).max(1_000_000_000),
+    coordinatedTargetBuyMaxUsd: z.number().finite().min(0).max(1_000_000_000),
+    coordinatedFirstBuyOnly: z.boolean(),
+    coordinatedOncePerToken: z.boolean(),
+    coordinatedFollowerSellCount: z.number().int().min(1).max(1_000),
+    coordinatedFollowerSellPct: z.number().finite().positive().max(100),
+    coordinatedInactivityHours: z.number().finite().min(0.05).max(720),
     networkScalingEnabled: z.boolean(),
     starterPositionPct: z.number().finite().positive().max(100),
     maxPositionPct: z.number().finite().positive().max(100),
@@ -49,6 +64,18 @@ export const BotConfigSchema = z
     message: "Market-cap minimum cannot exceed maximum",
     path: ["mcMaxUsd"],
   })
+  .refine((config) => config.coordinatedMcMinUsd <= config.coordinatedMcMaxUsd, {
+    message: "Coordinated market-cap minimum cannot exceed maximum",
+    path: ["coordinatedMcMaxUsd"],
+  })
+  .refine((config) => config.coordinatedCoinAgeMinMinutes <= config.coordinatedCoinAgeMaxMinutes, {
+    message: "Coordinated coin-age minimum cannot exceed maximum",
+    path: ["coordinatedCoinAgeMaxMinutes"],
+  })
+  .refine((config) => config.coordinatedTargetBuyMinUsd <= config.coordinatedTargetBuyMaxUsd, {
+    message: "Coordinated target-buy minimum cannot exceed maximum",
+    path: ["coordinatedTargetBuyMaxUsd"],
+  })
   .refine((config) => config.liqMinUsd <= config.liqMaxUsd, {
     message: "Liquidity minimum cannot exceed maximum",
     path: ["liqMaxUsd"],
@@ -75,6 +102,17 @@ export const BotConfigSchema = z
         code: "custom",
         message: "Do not repeat the primary target wallet",
         path: ["additionalTargetWallets"],
+      });
+    }
+    const configuredTargetCount = (config.targetWallet ? 1 : 0) + normalized.length;
+    if (
+      config.coordinatedModeEnabled &&
+      configuredTargetCount < config.coordinatedTargetWalletCount
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: `Add at least ${config.coordinatedTargetWalletCount} target wallets before enabling coordinated mode`,
+        path: ["coordinatedTargetWalletCount"],
       });
     }
   });

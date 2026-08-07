@@ -25,24 +25,25 @@ bun run dev             # or `npm run dev`
 | `RPC_URL` | Helius / Triton / QuickNode mainnet HTTPS RPC endpoint |
 | `YELLOWSTONE_GRPC_URL` | Helius Laserstream or Yellowstone gRPC endpoint (e.g. `https://laserstream-mainnet-ewr.helius-rpc.com`) |
 | `YELLOWSTONE_TOKEN` | Helius API key (used as the gRPC auth token) |
+| `JUPITER_API_KEY` | Paid Jupiter developer key for Price API v3 and the official Swap endpoint |
+| `PRICE_API_URL` | `https://api.jup.ag/price/v3` |
 | `JITO_BLOCK_ENGINE_URL` | e.g. `https://amsterdam.mainnet.block-engine.jito.wtf` |
 | `JITO_TIP_ACCOUNTS` | CSV of the 8 Jito tip accounts (see Jito docs) |
-| `KEY_ENCRYPTION_KEY` | 32-byte AES key, base64. Generate with `openssl rand -base64 32` |
-| `WORKER_API_TOKEN` | Bearer token the dashboard uses to talk to this worker |
+| `KEY_ENCRYPTION_KEY` | Optional 32-byte AES key, base64. When set, it must match the dashboard server value |
 | `HELIX_USER_ID` | UUID matching the `bot_config.user_id` row for this deployment |
 
 ## Architecture
 
 ```
- Dashboard (Cloudflare Pages)          Worker (your VPS)
+ Dashboard (Cloudflare)                Worker (your VPS)
  ┌──────────────────────┐              ┌────────────────────────────┐
- │ Settings UI          │──POST────────▶ /keys  (encrypt funding sk) │
- │ writes bot_config    │              │                            │
- └──────────┬───────────┘              │  Geyser gRPC subscription  │
+ │ Server functions     │              │                            │
+ │ encrypt funding key  │              │  Geyser gRPC subscription  │
+ └──────────┬───────────┘              │  Heartbeat every 20 sec    │
             │                          │        │                   │
             ▼                          │        ▼                   │
      ┌──────────────┐                  │  Dispatcher                │
-     │  Supabase    │◀─── config poll ─┤        │                   │
+     │  Supabase    │◀── config/health ┤        │                   │
      │  (your own)  │                  │        ▼                   │
      └──────────────┘                  │  Filters + Executor        │
                                        │        │                   │
@@ -68,11 +69,30 @@ returned by DexScreener for the mint. When enabled, missing age metadata is
 rejected. Run `supabase/token-age-migration.sql` before enabling it on an
 existing deployment.
 
+## Coordinated-wallet mode
+
+Run `supabase/coordinated-mode-migration.sql` before deploying this worker.
+The worker then:
+
+1. Subscribes to the primary and all additional target wallets.
+2. Counts only distinct, in-range target buys of the same mint inside the
+   configured rolling window.
+3. Opens one coordinated position after the wallet threshold and independent
+   market-cap/age filters pass.
+4. Tracks direct recipients and transfer chains up to three hops only while
+   that position is open.
+5. Counts each recipient wallet once toward the coordinated seller threshold,
+   with transaction-signature deduplication across Geyser and RPC delivery.
+6. Exits 100% after the target-inactivity window, which defaults to six hours.
+
+Turning Entries off blocks new buys but deliberately leaves open-position
+follower exits, take-profit/stop-loss, and inactivity exits active.
+
 ## Security
 
-- Funding private keys are AES-256-GCM encrypted with `KEY_ENCRYPTION_KEY`
-  before being written to Supabase. Only this worker (which holds the key)
-  can decrypt them.
+- Funding private keys are AES-256-GCM encrypted by the dashboard server
+  before being written to Supabase. The worker decrypts them with the shared
+  explicit key or the shared service-role-key derivation.
 - The `funding_keys` table has RLS enabled and is not exposed to the
   `authenticated` role — only `service_role` can read it.
 - Never commit `.env`. Rotate `KEY_ENCRYPTION_KEY` by re-encrypting existing
@@ -80,6 +100,6 @@ existing deployment.
 
 ## Deploying
 
-- Systemd unit or `pm2 start dist/index.js --name helix`.
+- Systemd unit or `pm2 start dist/index.js --name helix-worker-v3`.
 - Log to stdout, pipe to Vector/Grafana Loki if you want history.
 - Restart policy: always. The Geyser stream reconnects automatically.

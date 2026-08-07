@@ -48,11 +48,27 @@ VPS (for the worker), your own RPC + Jito credentials.
   proportional exit. Take profit and stop loss run alongside.
 - When your bag hits zero, all follower subscriptions are released.
 
+### Exclusive coordinated-wallet mode
+
+This mode waits for a configurable number of distinct target wallets to buy
+the same mint inside a rolling time window. It has independent buy size,
+market-cap, coin-age, target-buy-size, first-observed-buy, and once-per-coin
+rules. Normal entry and exit settings are ignored while the mode is enabled.
+
+Tracked recipient wallets count once each toward the distinct-seller exit,
+even if the same transaction arrives from both Geyser and the RPC fallback.
+The mode also exits the full remaining position when no configured target buys
+that mint again inside the configured inactivity window (six hours by default).
+
+Existing deployments must run
+`supabase/coordinated-mode-migration.sql` before deploying the updated
+dashboard or worker.
+
 ## Security notes
 
-- Your funding private key is **AES-256-GCM encrypted** in the browser (with
-  a key that only your worker holds — see `KEY_ENCRYPTION_KEY`) before it
-  ever leaves the device. It's stored as ciphertext in Supabase.
+- Your funding private key is sent over HTTPS to the dashboard's server
+  function, **AES-256-GCM encrypted there**, and stored in Supabase only as
+  ciphertext. It is never stored in browser localStorage.
 - The `funding_keys` table has RLS on and only `service_role` can read it.
 - Nothing in this repo talks to Lovable's cloud. Delete this line to prove
   it: `grep -ri lovable src worker supabase` (only frontend error reporting

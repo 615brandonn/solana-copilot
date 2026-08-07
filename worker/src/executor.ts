@@ -3,7 +3,16 @@
 // falls back to direct Pump.fun instructions when a fresh bonding-curve token
 // has no Jupiter route yet.
 
-import { Connection, Keypair, VersionedTransaction, PublicKey, SystemProgram, TransactionMessage, type Transaction, type VersionedTransactionResponse } from "@solana/web3.js";
+import {
+  Connection,
+  Keypair,
+  VersionedTransaction,
+  PublicKey,
+  SystemProgram,
+  TransactionMessage,
+  type Transaction,
+  type VersionedTransactionResponse,
+} from "@solana/web3.js";
 import { AnchorProvider, type Wallet } from "@coral-xyz/anchor";
 import { getAccount, getAssociatedTokenAddress } from "@solana/spl-token";
 import { searcherClient } from "jito-ts/dist/sdk/block-engine/searcher.js";
@@ -19,20 +28,28 @@ const conn = new Connection(env.RPC_URL, { commitment: "processed" });
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const LANDING_TIMEOUT_MS = 15_000;
 
-const JITO_TIP_ACCOUNTS = (env.JITO_TIP_ACCOUNTS ?? "").split(",").filter(Boolean).map((s) => new PublicKey(s));
+const JITO_TIP_ACCOUNTS = (env.JITO_TIP_ACCOUNTS ?? "")
+  .split(",")
+  .filter(Boolean)
+  .map((s) => new PublicKey(s));
 
 export type ExecuteInput = {
-  signerSecret: string;              // base58 secret key of funding wallet
-  inputMint: string;                 // e.g. So1111... for SOL
+  signerSecret: string; // base58 secret key of funding wallet
+  inputMint: string; // e.g. So1111... for SOL
   outputMint: string;
   amountLamports: number;
   slippageBps: number;
   route: "jito" | "rpc";
   jitoTipSol: number;
-  outputDecimals?: number;           // needed to compute UI amount received (Jupiter v6 doesn't return this)
+  outputDecimals?: number; // needed to compute UI amount received (Jupiter v6 doesn't return this)
 };
 
-export type ExecuteResult = { txSig: string; latencyMs: number; route: "jito" | "rpc"; outUiAmount?: number };
+export type ExecuteResult = {
+  txSig: string;
+  latencyMs: number;
+  route: "jito" | "rpc";
+  outUiAmount?: number;
+};
 
 class KeypairWallet implements Wallet {
   public readonly publicKey: PublicKey;
@@ -55,9 +72,10 @@ class KeypairWallet implements Wallet {
 }
 
 const JUPITER_BASE_URLS = [
-  "https://lite-api.jup.ag/swap/v1",
-  "https://quote-api.jup.ag/v6",
+  { base: "https://api.jup.ag/swap/v1", requiresKey: true },
+  { base: "https://lite-api.jup.ag/swap/v1", requiresKey: false },
 ];
+const JUPITER_V2_BASE = "https://api.jup.ag/swap/v2";
 
 type FetchResponseLike = {
   ok: boolean;
@@ -65,29 +83,58 @@ type FetchResponseLike = {
   text: () => Promise<string>;
 };
 
-async function readJsonOrThrow(resp: FetchResponseLike, label: string) {
+async function readJsonOrThrow<T extends Record<string, unknown>>(
+  resp: FetchResponseLike,
+  label: string,
+): Promise<T> {
   const text = await resp.text();
-  let json: any = null;
-  try { json = text ? JSON.parse(text) : null; } catch { json = null; }
-  if (!resp.ok) {
-    throw new Error(`${label} HTTP ${resp.status}: ${json?.error ?? json?.message ?? text.slice(0, 180)}`);
+  let json: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = text ? JSON.parse(text) : {};
+    json = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    json = {};
   }
-  if (json?.error) throw new Error(`${label}: ${json.error}`);
-  return json;
+  const apiError = json.error ?? json.message;
+  if (!resp.ok) {
+    throw new Error(`${label} HTTP ${resp.status}: ${String(apiError ?? text.slice(0, 180))}`);
+  }
+  if (apiError) throw new Error(`${label}: ${String(apiError)}`);
+  return json as T;
 }
+
+type JupiterV1Quote = Record<string, unknown> & {
+  outAmount: string;
+  outputDecimals?: number;
+};
+
+type JupiterV1Swap = Record<string, unknown> & {
+  swapTransaction: string;
+  outputDecimals?: number;
+};
 
 async function fetchJupiterQuote(input: ExecuteInput) {
   const errors: string[] = [];
-  for (const base of JUPITER_BASE_URLS) {
+  for (const endpoint of JUPITER_BASE_URLS) {
+    if (endpoint.requiresKey && !env.JUPITER_API_KEY) continue;
     try {
+      const base = endpoint.base;
       const quoteUrl = new URL(`${base}/quote`);
       quoteUrl.searchParams.set("inputMint", input.inputMint);
       quoteUrl.searchParams.set("outputMint", input.outputMint);
       quoteUrl.searchParams.set("amount", String(input.amountLamports));
       quoteUrl.searchParams.set("slippageBps", String(input.slippageBps));
-      const quote = await readJsonOrThrow(await fetch(quoteUrl), "Jupiter quote");
+      const quote = await readJsonOrThrow<JupiterV1Quote>(
+        await fetch(quoteUrl, {
+          headers:
+            endpoint.requiresKey && env.JUPITER_API_KEY
+              ? { "x-api-key": env.JUPITER_API_KEY }
+              : undefined,
+        }),
+        "Jupiter quote",
+      );
       if (!quote?.outAmount) throw new Error("Jupiter quote did not include outAmount");
-      return { base, quote };
+      return { base, quote, requiresKey: endpoint.requiresKey };
     } catch (err) {
       errors.push(err instanceof Error ? err.message : String(err));
     }
@@ -95,19 +142,33 @@ async function fetchJupiterQuote(input: ExecuteInput) {
   throw new Error(`All Jupiter quote endpoints failed: ${errors.join(" | ")}`);
 }
 
-async function fetchJupiterSwap(base: string, quote: any, signer: Keypair) {
-  const swap = await readJsonOrThrow(await fetch(`${base}/swap`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      quoteResponse: quote,
-      userPublicKey: signer.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: "auto",
+async function fetchJupiterSwap(
+  base: string,
+  quote: JupiterV1Quote,
+  signer: Keypair,
+  requiresKey: boolean,
+) {
+  const swap = await readJsonOrThrow<JupiterV1Swap>(
+    await fetch(`${base}/swap`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(requiresKey && env.JUPITER_API_KEY ? { "x-api-key": env.JUPITER_API_KEY } : {}),
+      },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: signer.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: "auto",
+      }),
     }),
-  }), "Jupiter swap");
-  if (!swap?.swapTransaction) throw new Error(`Jupiter swap did not return a transaction: ${JSON.stringify(swap).slice(0, 220)}`);
+    "Jupiter swap",
+  );
+  if (!swap?.swapTransaction)
+    throw new Error(
+      `Jupiter swap did not return a transaction: ${JSON.stringify(swap).slice(0, 220)}`,
+    );
   return swap;
 }
 
@@ -115,26 +176,60 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   const t0 = Date.now();
   const decodedSecret = bs58.decode(input.signerSecret.trim());
   if (decodedSecret.length !== 64) {
-    throw new Error(`Funding private key decoded to ${decodedSecret.length} bytes; Phantom/base58 secret keys must decode to 64 bytes`);
+    throw new Error(
+      `Funding private key decoded to ${decodedSecret.length} bytes; Phantom/base58 secret keys must decode to 64 bytes`,
+    );
   }
   const signer = Keypair.fromSecretKey(decodedSecret);
 
+  const failures: string[] = [];
   try {
     return await executeJupiterSwap(input, signer, t0);
   } catch (err) {
-    log.warn({ err, inputMint: input.inputMint, outputMint: input.outputMint }, "Jupiter swap failed — checking Pump.fun fallback");
+    failures.push(`Jupiter V1/Jito: ${errorMessage(err)}`);
+    log.warn(
+      { err, inputMint: input.inputMint, outputMint: input.outputMint },
+      "Jupiter V1/Jito swap failed — checking managed Jupiter V2 fallback",
+    );
+  }
+
+  if (env.JUPITER_API_KEY) {
     try {
-      return await executePumpFunSwap(input, signer, t0);
-    } catch (fallbackErr) {
-      log.error({ err: fallbackErr, jupiterErr: err, inputMint: input.inputMint, outputMint: input.outputMint }, "Pump.fun fallback failed");
-      throw err;
+      return await executeJupiterManagedV2(input, signer, t0);
+    } catch (err) {
+      failures.push(`Jupiter V2: ${errorMessage(err)}`);
+      log.warn(
+        { err, inputMint: input.inputMint, outputMint: input.outputMint },
+        "managed Jupiter V2 fallback failed — checking Pump.fun fallback",
+      );
     }
+  } else {
+    failures.push("Jupiter V2: JUPITER_API_KEY is not configured");
+  }
+
+  try {
+    return await executePumpFunSwap(input, signer, t0);
+  } catch (err) {
+    failures.push(`Pump.fun: ${errorMessage(err)}`);
+    log.error(
+      { err, inputMint: input.inputMint, outputMint: input.outputMint, failures },
+      "all swap execution paths failed",
+    );
+    throw new Error(`All swap execution paths failed: ${failures.join(" | ")}`);
   }
 }
 
-async function executeJupiterSwap(input: ExecuteInput, signer: Keypair, t0: number): Promise<ExecuteResult> {
-  const { base, quote } = await fetchJupiterQuote(input);
-  const swapResp = await fetchJupiterSwap(base, quote, signer);
+function errorMessage(err: unknown) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function executeJupiterSwap(
+  input: ExecuteInput,
+  signer: Keypair,
+  t0: number,
+): Promise<ExecuteResult> {
+  const { base, quote, requiresKey } = await fetchJupiterQuote(input);
+  const swapResp = await fetchJupiterSwap(base, quote, signer, requiresKey);
 
   const tx = VersionedTransaction.deserialize(Buffer.from(swapResp.swapTransaction, "base64"));
   tx.sign([signer]);
@@ -142,62 +237,204 @@ async function executeJupiterSwap(input: ExecuteInput, signer: Keypair, t0: numb
   // Jupiter v6 quote returns outAmount as a RAW string. It does not return
   // outputDecimals reliably, so callers pass it in (from the target-swap event).
   const outAmountRaw = Number(quote?.outAmount ?? 0);
-  const outDecimals = Number(input.outputDecimals ?? quote?.outputDecimals ?? swapResp?.outputDecimals ?? 0);
+  const outDecimals = Number(
+    input.outputDecimals ?? quote?.outputDecimals ?? swapResp?.outputDecimals ?? 0,
+  );
   const outUiAmount = outDecimals > 0 ? outAmountRaw / Math.pow(10, outDecimals) : outAmountRaw;
 
   if (input.route === "jito" && JITO_TIP_ACCOUNTS.length > 0) {
-    const r = await sendViaJito(tx, signer, input.jitoTipSol, t0);
-    // Also push the exact same signed swap through RPC. Same signature means it
-    // cannot double-buy, but it gives the trade a second path if Jito accepts a
-    // bundle that never lands.
-    sendRawViaRpc(tx, t0, "jito-rpc-backup").catch((err) => log.warn({ err }, "rpc backup submit failed"));
-    await waitForLanding(r.txSig, t0, "jito/rpc-backup");
-    return { ...r, outUiAmount };
+    try {
+      const r = await sendViaJito(tx, signer, input.jitoTipSol, t0);
+      // Also push the exact same signed swap through RPC. Same signature means it
+      // cannot double-buy, but it gives the trade a second path if Jito accepts a
+      // bundle that never lands.
+      sendRawViaRpc(tx, t0, "jito-rpc-backup").catch((err) =>
+        log.warn({ err }, "rpc backup submit failed"),
+      );
+      await waitForLanding(r.txSig, t0, "jito/rpc-backup");
+      return { ...r, outUiAmount };
+    } catch (err) {
+      log.warn({ err }, "Jito bundle submission failed — sending signed swap through RPC");
+      const sig = await sendRawViaRpc(tx, t0, "jito-failed-rpc-fallback");
+      await waitForLanding(sig, t0, "jito-failed-rpc-fallback");
+      return { txSig: sig, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
+    }
   }
   const sig = await sendRawViaRpc(tx, t0, "rpc");
   await waitForLanding(sig, t0, "rpc");
   return { txSig: sig, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
 }
 
-async function executePumpFunSwap(input: ExecuteInput, signer: Keypair, t0: number): Promise<ExecuteResult> {
+type JupiterOrder = {
+  transaction?: string | null;
+  requestId?: string;
+  outAmount?: string;
+  router?: string;
+  errorCode?: number;
+  errorMessage?: string;
+};
+
+type JupiterExecute = {
+  status?: "Success" | "Failed";
+  signature?: string;
+  code?: number;
+  totalOutputAmount?: string;
+  error?: string;
+};
+
+async function executeJupiterManagedV2(
+  input: ExecuteInput,
+  signer: Keypair,
+  t0: number,
+): Promise<ExecuteResult> {
+  if (!env.JUPITER_API_KEY) throw new Error("JUPITER_API_KEY is required for Swap V2");
+
+  const orderUrl = new URL(`${JUPITER_V2_BASE}/order`);
+  orderUrl.searchParams.set("inputMint", input.inputMint);
+  orderUrl.searchParams.set("outputMint", input.outputMint);
+  orderUrl.searchParams.set("amount", String(input.amountLamports));
+  orderUrl.searchParams.set("taker", signer.publicKey.toBase58());
+  orderUrl.searchParams.set("slippageBps", String(input.slippageBps));
+
+  const headers = { "x-api-key": env.JUPITER_API_KEY };
+  const order = await readJsonOrThrow<JupiterOrder & Record<string, unknown>>(
+    await fetch(orderUrl, { headers, signal: AbortSignal.timeout(10_000) }),
+    "Jupiter V2 order",
+  );
+  if (!order.transaction || !order.requestId) {
+    throw new Error(
+      `Jupiter V2 could not build a transaction (${order.router ?? "unknown router"}/${order.errorCode ?? "unknown code"}): ${order.errorMessage ?? "missing transaction or requestId"}`,
+    );
+  }
+
+  const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
+  tx.sign([signer]);
+  const signedTransaction = Buffer.from(tx.serialize()).toString("base64");
+  const executed = await readJsonOrThrow<JupiterExecute & Record<string, unknown>>(
+    await fetch(`${JUPITER_V2_BASE}/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify({ signedTransaction, requestId: order.requestId }),
+      signal: AbortSignal.timeout(30_000),
+    }),
+    "Jupiter V2 execute",
+  );
+  if (executed.status !== "Success" || !executed.signature) {
+    throw new Error(
+      `Jupiter V2 execution failed (${executed.code ?? "unknown code"}): ${executed.error ?? executed.status ?? "unknown status"}`,
+    );
+  }
+
+  const outAmountRaw = Number(executed.totalOutputAmount ?? order.outAmount ?? 0);
+  const outDecimals = Number(input.outputDecimals ?? 0);
+  const outUiAmount = outDecimals > 0 ? outAmountRaw / Math.pow(10, outDecimals) : outAmountRaw;
+  log.info(
+    {
+      sig: executed.signature,
+      ms: Date.now() - t0,
+      router: order.router,
+      outUiAmount,
+    },
+    "managed Jupiter V2 swap landed",
+  );
+  // Trade rows currently distinguish the configured Jito path from all other
+  // submission paths as `rpc`; keep that stable while logging the V2 router.
+  return {
+    txSig: executed.signature,
+    latencyMs: Date.now() - t0,
+    route: "rpc",
+    outUiAmount,
+  };
+}
+
+async function executePumpFunSwap(
+  input: ExecuteInput,
+  signer: Keypair,
+  t0: number,
+): Promise<ExecuteResult> {
   const isBuy = input.inputMint === WSOL_MINT;
   const isSell = input.outputMint === WSOL_MINT;
   if (!isBuy && !isSell) throw new Error("Pump.fun fallback only supports SOL buys and SOL exits");
 
   const mint = new PublicKey(isBuy ? input.outputMint : input.inputMint);
-  const provider = new AnchorProvider(conn, new KeypairWallet(signer), { commitment: "processed", preflightCommitment: "processed" });
+  const provider = new AnchorProvider(conn, new KeypairWallet(signer), {
+    commitment: "processed",
+    preflightCommitment: "processed",
+  });
   const sdk = new PumpFunSDK(provider);
   const curve = await sdk.getBondingCurveAccount(mint, "processed");
   if (!curve) throw new Error(`Pump.fun bonding curve not found: ${mint.toBase58()}`);
 
   const priorityFees = { unitLimit: 250_000, unitPrice: 250_000 };
   const result = isBuy
-    ? await sdk.buy(signer, mint, BigInt(input.amountLamports), BigInt(input.slippageBps), priorityFees, "processed", "confirmed")
-    : await sdk.sell(signer, mint, BigInt(input.amountLamports), BigInt(input.slippageBps), priorityFees, "processed", "confirmed");
+    ? await sdk.buy(
+        signer,
+        mint,
+        BigInt(input.amountLamports),
+        BigInt(input.slippageBps),
+        priorityFees,
+        "processed",
+        "confirmed",
+      )
+    : await sdk.sell(
+        signer,
+        mint,
+        BigInt(input.amountLamports),
+        BigInt(input.slippageBps),
+        priorityFees,
+        "processed",
+        "confirmed",
+      );
 
   if (!result.success || !result.signature) {
-    throw new Error(`Pump.fun ${isBuy ? "buy" : "sell"} failed: ${String(result.error ?? "no signature")}`);
+    throw new Error(
+      `Pump.fun ${isBuy ? "buy" : "sell"} failed: ${String(result.error ?? "no signature")}`,
+    );
   }
 
   const outUiAmount = isBuy
-    ? tokenDeltaFromTx(result.results, signer.publicKey.toBase58(), mint.toBase58()) ?? await tokenBalanceUi(signer.publicKey, mint, input.outputDecimals)
+    ? (tokenDeltaFromTx(result.results, signer.publicKey.toBase58(), mint.toBase58()) ??
+      (await tokenBalanceUi(signer.publicKey, mint, input.outputDecimals)))
     : undefined;
-  log.info({ sig: result.signature, ms: Date.now() - t0, side: isBuy ? "buy" : "sell", mint: mint.toBase58(), outUiAmount }, "Pump.fun direct transaction landed");
+  log.info(
+    {
+      sig: result.signature,
+      ms: Date.now() - t0,
+      side: isBuy ? "buy" : "sell",
+      mint: mint.toBase58(),
+      outUiAmount,
+    },
+    "Pump.fun direct transaction landed",
+  );
   return { txSig: result.signature, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
 }
 
-function tokenDeltaFromTx(tx: VersionedTransactionResponse | undefined, owner: string, mint: string): number | undefined {
+function tokenDeltaFromTx(
+  tx: VersionedTransactionResponse | undefined,
+  owner: string,
+  mint: string,
+): number | undefined {
   const pre = (tx?.meta?.preTokenBalances ?? [])
     .filter((b) => b.owner === owner && b.mint === mint)
-    .reduce((sum, b) => sum + Number(b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount ?? 0), 0);
+    .reduce(
+      (sum, b) => sum + Number(b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount ?? 0),
+      0,
+    );
   const post = (tx?.meta?.postTokenBalances ?? [])
     .filter((b) => b.owner === owner && b.mint === mint)
-    .reduce((sum, b) => sum + Number(b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount ?? 0), 0);
+    .reduce(
+      (sum, b) => sum + Number(b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount ?? 0),
+      0,
+    );
   const delta = post - pre;
   return delta > 0 ? delta : undefined;
 }
 
-async function tokenBalanceUi(owner: PublicKey, mint: PublicKey, decimals = 6): Promise<number | undefined> {
+async function tokenBalanceUi(
+  owner: PublicKey,
+  mint: PublicKey,
+  decimals = 6,
+): Promise<number | undefined> {
   try {
     const ata = await getAssociatedTokenAddress(mint, owner, false);
     const account = await getAccount(conn, ata, "processed");
@@ -224,17 +461,28 @@ async function waitForLanding(sig: string, t0: number, label: string) {
       throw new Error(`${label} transaction failed on-chain: ${JSON.stringify(status.err)}`);
     }
     if (status) {
-      lastStatus = status.confirmationStatus ?? (status.confirmations === null ? "finalized" : "processed");
-      log.info({ sig, status: lastStatus, ms: Date.now() - t0, label }, "transaction landed on-chain");
+      lastStatus =
+        status.confirmationStatus ?? (status.confirmations === null ? "finalized" : "processed");
+      log.info(
+        { sig, status: lastStatus, ms: Date.now() - t0, label },
+        "transaction landed on-chain",
+      );
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 
-  throw new Error(`${label} transaction was submitted but not seen on-chain within ${LANDING_TIMEOUT_MS / 1000}s: ${sig}`);
+  throw new Error(
+    `${label} transaction was submitted but not seen on-chain within ${LANDING_TIMEOUT_MS / 1000}s: ${sig}`,
+  );
 }
 
-async function sendViaJito(tx: VersionedTransaction, signer: Keypair, tipSol: number, t0: number): Promise<ExecuteResult> {
+async function sendViaJito(
+  tx: VersionedTransaction,
+  signer: Keypair,
+  tipSol: number,
+  t0: number,
+): Promise<ExecuteResult> {
   const client = searcherClient(new URL(env.JITO_BLOCK_ENGINE_URL).host);
   const tipAcct = JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)];
   const { blockhash } = await conn.getLatestBlockhash("processed");
@@ -242,12 +490,14 @@ async function sendViaJito(tx: VersionedTransaction, signer: Keypair, tipSol: nu
     new TransactionMessage({
       payerKey: signer.publicKey,
       recentBlockhash: blockhash,
-      instructions: [SystemProgram.transfer({
-        fromPubkey: signer.publicKey,
-        toPubkey: tipAcct,
-        lamports: Math.floor(tipSol * 1e9),
-      })],
-    }).compileToV0Message()
+      instructions: [
+        SystemProgram.transfer({
+          fromPubkey: signer.publicKey,
+          toPubkey: tipAcct,
+          lamports: Math.floor(tipSol * 1e9),
+        }),
+      ],
+    }).compileToV0Message(),
   );
   tipTx.sign([signer]);
 

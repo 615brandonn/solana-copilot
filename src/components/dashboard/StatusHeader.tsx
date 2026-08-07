@@ -4,27 +4,30 @@ import { Switch } from "@/components/ui/switch";
 type Props = {
   enabled: boolean;
   onToggle: (v: boolean) => void;
-  workerConnected: boolean;
+  ready: boolean;
+  readinessPending?: boolean;
+  readinessMessage: string;
+  workerConnected?: boolean;
   workerStatusMessage?: string;
   activePositions: number;
   monitoredWallets: number;
   syncing?: boolean;
-  targetWalletValid?: boolean;
-  fundingKeySaved?: boolean;
+  coordinatedModeEnabled?: boolean;
 };
 
 export function StatusHeader({
   enabled,
   onToggle,
+  ready,
+  readinessPending,
+  readinessMessage,
   workerConnected,
   workerStatusMessage,
   activePositions,
   monitoredWallets,
   syncing,
-  targetWalletValid,
-  fundingKeySaved,
+  coordinatedModeEnabled,
 }: Props) {
-  const ready = !!(targetWalletValid && fundingKeySaved && workerConnected);
   return (
     <header className="glass-card rounded-2xl px-6 py-5 flex flex-wrap items-center justify-between gap-6">
       <div className="flex items-center gap-4">
@@ -41,6 +44,11 @@ export function StatusHeader({
           <p className="text-xs text-muted-foreground">
             Sub-second copy trading · follower propagation exits
           </p>
+          <p
+            className={`mt-1 max-w-xl text-[11px] ${ready ? "text-success" : "text-muted-foreground"}`}
+          >
+            {readinessMessage}
+          </p>
         </div>
         <div
           className={`ml-2 flex items-center gap-2 rounded-lg border px-3 py-1.5 ${
@@ -48,15 +56,11 @@ export function StatusHeader({
               ? "border-success/40 bg-success/10 text-success"
               : "border-border bg-muted/40 text-muted-foreground"
           }`}
-          title={
-            ready
-              ? "Target wallet and funding key are saved, and the VPS worker heartbeat is current."
-              : `${targetWalletValid ? "" : "Target wallet missing. "}${fundingKeySaved ? "" : "Funding key missing. "}${workerConnected ? "" : "VPS worker offline."}`.trim()
-          }
+          title={readinessMessage}
         >
           {ready ? <CheckCircle2 className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
           <span className="text-[11px] font-semibold uppercase tracking-wider">
-            {ready ? "Ready" : "Setup needed"}
+            {readinessPending ? "Checking" : ready ? "Ready" : "Setup needed"}
           </span>
         </div>
       </div>
@@ -65,7 +69,9 @@ export function StatusHeader({
         <div title={workerStatusMessage}>
           <Stat
             label="Worker"
-            value={workerConnected ? "Online" : "Offline"}
+            value={
+              workerConnected === undefined ? "Checking" : workerConnected ? "Online" : "Offline"
+            }
             accent={workerConnected ? "success" : "muted"}
             pulse={workerConnected}
           />
@@ -83,7 +89,11 @@ export function StatusHeader({
                 : "New entries are off. Follower-network exits for existing positions remain active while the VPS worker is online."
             }
           >
-            {enabled ? "Entries on" : "Entries off · exits active"}
+            {enabled
+              ? coordinatedModeEnabled
+                ? "Entries on · coordinated"
+                : "Entries on · regular"
+              : "Entries off · exits active"}
           </span>
           {syncing && <span className="text-[10px] text-muted-foreground">syncing…</span>}
           <Switch checked={enabled} onCheckedChange={onToggle} />
