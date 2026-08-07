@@ -6,6 +6,21 @@ export type BotConfig = {
   executionRoute: "jito" | "rpc";
   jitoTipSol: number;
   fixedBuyUsd: number;
+  coordinatedModeEnabled: boolean;
+  coordinatedFixedBuyUsd: number;
+  coordinatedTargetWalletCount: number;
+  coordinatedWindowSeconds: number;
+  coordinatedMcMinUsd: number;
+  coordinatedMcMaxUsd: number;
+  coordinatedCoinAgeMinMinutes: number;
+  coordinatedCoinAgeMaxMinutes: number;
+  coordinatedTargetBuyMinUsd: number;
+  coordinatedTargetBuyMaxUsd: number;
+  coordinatedFirstBuyOnly: boolean;
+  coordinatedOncePerToken: boolean;
+  coordinatedFollowerSellCount: number;
+  coordinatedFollowerSellPct: number;
+  coordinatedInactivityHours: number;
   networkScalingEnabled: boolean;
   starterPositionPct: number;
   maxPositionPct: number;
@@ -46,6 +61,21 @@ export const DEFAULT_CONFIG: BotConfig = {
   executionRoute: "jito",
   jitoTipSol: 0.001,
   fixedBuyUsd: 25,
+  coordinatedModeEnabled: false,
+  coordinatedFixedBuyUsd: 25,
+  coordinatedTargetWalletCount: 2,
+  coordinatedWindowSeconds: 30,
+  coordinatedMcMinUsd: 0,
+  coordinatedMcMaxUsd: 15_000,
+  coordinatedCoinAgeMinMinutes: 0,
+  coordinatedCoinAgeMaxMinutes: 60,
+  coordinatedTargetBuyMinUsd: 0,
+  coordinatedTargetBuyMaxUsd: 1_000_000,
+  coordinatedFirstBuyOnly: false,
+  coordinatedOncePerToken: true,
+  coordinatedFollowerSellCount: 1,
+  coordinatedFollowerSellPct: 100,
+  coordinatedInactivityHours: 6,
   networkScalingEnabled: true,
   starterPositionPct: 5,
   maxPositionPct: 15,

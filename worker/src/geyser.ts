@@ -182,6 +182,7 @@ export class GeyserFeed {
 
   private scheduleReconnect(reason: string) {
     if (this.stopped || this.reconnectTimer) return;
+    this.stream = undefined;
     log.warn({ reason }, "geyser reconnect scheduled");
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
@@ -497,4 +498,3 @@ export class GeyserFeed {
     return "";
   }
 }
-

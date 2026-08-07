@@ -126,6 +126,44 @@ function Dashboard() {
     retry: false,
   });
   const keySaved = fundingKeyQ.data?.saved ?? false;
+  const readinessPending = fundingKeyQ.isPending || workerQ.isPending;
+  const readinessIssues: string[] = [];
+  if (!isSolanaPublicKey(cfg.targetWallet || ""))
+    readinessIssues.push("Target wallet missing or invalid.");
+  const configuredTargetCount =
+    (isSolanaPublicKey(cfg.targetWallet || "") ? 1 : 0) + cfg.additionalTargetWallets.length;
+  if (cfg.coordinatedModeEnabled && configuredTargetCount < cfg.coordinatedTargetWalletCount) {
+    readinessIssues.push(
+      `Coordinated mode needs ${cfg.coordinatedTargetWalletCount} target wallets; ${configuredTargetCount} configured.`,
+    );
+  }
+  if (fundingKeyQ.isError) {
+    readinessIssues.push(
+      `Funding-key status check failed: ${fundingKeyQ.error instanceof Error ? fundingKeyQ.error.message : "unknown error"}.`,
+    );
+  } else if (fundingKeyQ.data?.identityMismatch) {
+    readinessIssues.push("Funding key exists under a different HELIX_USER_ID.");
+  } else if (fundingKeyQ.isSuccess && !keySaved) {
+    readinessIssues.push("Funding key missing.");
+  }
+  if (workerQ.isError) {
+    readinessIssues.push(
+      `Worker heartbeat check failed: ${workerQ.error instanceof Error ? workerQ.error.message : "unknown error"}.`,
+    );
+  } else if (workerQ.data?.identityMismatch) {
+    readinessIssues.push("Worker heartbeat exists under a different HELIX_USER_ID.");
+  } else if (workerQ.isSuccess && !workerQ.data.online) {
+    readinessIssues.push("No recent VPS heartbeat.");
+  }
+  if (workerQ.data?.fundingKeyCheckedAt && workerQ.data.fundingKeyReady === false) {
+    readinessIssues.push(workerQ.data.lastError ?? "The worker cannot use the saved funding key.");
+  }
+  const ready = !readinessPending && readinessIssues.length === 0;
+  const readinessMessage = readinessPending
+    ? "Checking funding key and VPS heartbeat…"
+    : ready
+      ? "Target wallet, funding key, and worker heartbeat are ready."
+      : readinessIssues.join(" ");
 
   const handleSaveKey = async () => {
     try {
@@ -162,11 +200,20 @@ function Dashboard() {
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <StatusHeader
           enabled={cfg.enabled}
-          onToggle={(v) => update({ enabled: v })}
-          workerConnected={workerQ.data?.online ?? false}
+          onToggle={(v) => {
+            if (v && !ready) {
+              toast.error(`Entries remain off: ${readinessMessage}`);
+              return;
+            }
+            update({ enabled: v });
+          }}
+          ready={ready}
+          readinessPending={readinessPending}
+          readinessMessage={readinessMessage}
+          workerConnected={workerQ.isSuccess ? workerQ.data.online : undefined}
           workerStatusMessage={
             workerQ.isError
-              ? "Worker heartbeat unavailable. Apply the latest Supabase schema and restart the VPS worker."
+              ? `Worker heartbeat unavailable: ${workerQ.error instanceof Error ? workerQ.error.message : "unknown error"}`
               : workerQ.data?.online
                 ? `Heartbeat current; ${workerQ.data.decodedEventCount} decoded events`
                 : "No recent VPS heartbeat"
@@ -174,8 +221,7 @@ function Dashboard() {
           activePositions={activePositions}
           monitoredWallets={monitored}
           syncing={syncing}
-          targetWalletValid={isSolanaPublicKey(cfg.targetWallet || "")}
-          fundingKeySaved={keySaved}
+          coordinatedModeEnabled={cfg.coordinatedModeEnabled}
         />
 
         <main className="mt-8 grid gap-6 lg:grid-cols-3">

@@ -11,8 +11,7 @@ export type SaveFundingKeyResult =
   { ok: true } | { ok: false; code: "missing_backend_key" | "save_failed"; error: string };
 
 const SINGLE_USER_ID = "00000000-0000-0000-0000-000000000000";
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function currentUserId() {
   const userId = process.env.HELIX_USER_ID?.trim();
@@ -33,6 +32,20 @@ function serviceRoleKey(): string {
     throw new Error(
       "SERVER_SUPABASE_SERVICE_ROLE_KEY is the publishable (anon) key. In Supabase, copy the Secret key (service role) instead.",
     );
+  }
+  if (key.split(".").length === 3) {
+    try {
+      const payload = JSON.parse(Buffer.from(key.split(".")[1], "base64url").toString("utf8")) as {
+        role?: string;
+      };
+      if (payload.role && payload.role !== "service_role") {
+        throw new Error(
+          `SERVER_SUPABASE_SERVICE_ROLE_KEY has JWT role ${payload.role}; expected service_role`,
+        );
+      }
+    } catch (error) {
+      if (error instanceof Error && /expected service_role/.test(error.message)) throw error;
+    }
   }
   return key;
 }
@@ -66,6 +79,21 @@ export function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row
     executionRoute: row.execution_route as "jito" | "rpc",
     jitoTipSol: row.jito_tip_sol,
     fixedBuyUsd: row.fixed_buy_usd,
+    coordinatedModeEnabled: row.coordinated_mode_enabled ?? false,
+    coordinatedFixedBuyUsd: row.coordinated_fixed_buy_usd ?? 25,
+    coordinatedTargetWalletCount: row.coordinated_target_wallet_count ?? 2,
+    coordinatedWindowSeconds: row.coordinated_window_seconds ?? 30,
+    coordinatedMcMinUsd: row.coordinated_mc_min_usd ?? 0,
+    coordinatedMcMaxUsd: row.coordinated_mc_max_usd ?? 15_000,
+    coordinatedCoinAgeMinMinutes: row.coordinated_coin_age_min_minutes ?? 0,
+    coordinatedCoinAgeMaxMinutes: row.coordinated_coin_age_max_minutes ?? 60,
+    coordinatedTargetBuyMinUsd: row.coordinated_target_buy_min_usd ?? 0,
+    coordinatedTargetBuyMaxUsd: row.coordinated_target_buy_max_usd ?? 1_000_000,
+    coordinatedFirstBuyOnly: row.coordinated_first_buy_only ?? false,
+    coordinatedOncePerToken: row.coordinated_once_per_token ?? true,
+    coordinatedFollowerSellCount: row.coordinated_follower_sell_count ?? 1,
+    coordinatedFollowerSellPct: row.coordinated_follower_sell_pct ?? 100,
+    coordinatedInactivityHours: row.coordinated_inactivity_hours ?? 6,
     networkScalingEnabled: row.network_scaling_enabled ?? true,
     starterPositionPct: row.starter_position_pct ?? 5,
     maxPositionPct: row.max_position_pct ?? 15,
@@ -116,6 +144,21 @@ export function configToRow(
     execution_route: cfg.executionRoute,
     jito_tip_sol: cfg.jitoTipSol,
     fixed_buy_usd: cfg.fixedBuyUsd,
+    coordinated_mode_enabled: cfg.coordinatedModeEnabled,
+    coordinated_fixed_buy_usd: cfg.coordinatedFixedBuyUsd,
+    coordinated_target_wallet_count: cfg.coordinatedTargetWalletCount,
+    coordinated_window_seconds: cfg.coordinatedWindowSeconds,
+    coordinated_mc_min_usd: cfg.coordinatedMcMinUsd,
+    coordinated_mc_max_usd: cfg.coordinatedMcMaxUsd,
+    coordinated_coin_age_min_minutes: cfg.coordinatedCoinAgeMinMinutes,
+    coordinated_coin_age_max_minutes: cfg.coordinatedCoinAgeMaxMinutes,
+    coordinated_target_buy_min_usd: cfg.coordinatedTargetBuyMinUsd,
+    coordinated_target_buy_max_usd: cfg.coordinatedTargetBuyMaxUsd,
+    coordinated_first_buy_only: cfg.coordinatedFirstBuyOnly,
+    coordinated_once_per_token: cfg.coordinatedOncePerToken,
+    coordinated_follower_sell_count: cfg.coordinatedFollowerSellCount,
+    coordinated_follower_sell_pct: cfg.coordinatedFollowerSellPct,
+    coordinated_inactivity_hours: cfg.coordinatedInactivityHours,
     network_scaling_enabled: cfg.networkScalingEnabled,
     starter_position_pct: cfg.starterPositionPct,
     max_position_pct: cfg.maxPositionPct,

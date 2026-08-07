@@ -10,7 +10,7 @@
     "save-key": "tsx src/save-key.ts",
     "watch": "tsx watch src/index.ts",
     "test": "tsc -p tsconfig.json && node --test dist/*.test.js",
-    "start": "node --loader tsx dist/index.js",
+    "start": "node dist/index.js",
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {

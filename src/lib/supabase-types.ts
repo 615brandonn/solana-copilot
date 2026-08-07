@@ -10,6 +10,21 @@ export type BotConfigRow = {
   execution_route: string;
   jito_tip_sol: number;
   fixed_buy_usd: number;
+  coordinated_mode_enabled: boolean;
+  coordinated_fixed_buy_usd: number;
+  coordinated_target_wallet_count: number;
+  coordinated_window_seconds: number;
+  coordinated_mc_min_usd: number;
+  coordinated_mc_max_usd: number;
+  coordinated_coin_age_min_minutes: number;
+  coordinated_coin_age_max_minutes: number;
+  coordinated_target_buy_min_usd: number;
+  coordinated_target_buy_max_usd: number;
+  coordinated_first_buy_only: boolean;
+  coordinated_once_per_token: boolean;
+  coordinated_follower_sell_count: number;
+  coordinated_follower_sell_pct: number;
+  coordinated_inactivity_hours: number;
   network_scaling_enabled: boolean;
   starter_position_pct: number;
   max_position_pct: number;
@@ -60,6 +75,8 @@ export type PositionRow = {
   root_buy_count: number;
   last_root_buy_at: string | null;
   last_root_buy_wallet: string | null;
+  entry_mode: "regular" | "coordinated";
+  coordinated_exit_triggered: boolean;
 };
 
 export type TradeRow = {
@@ -97,6 +114,10 @@ export type WorkerHeartbeatRow = {
   last_geyser_message_at: string | null;
   decoded_event_count: number;
   rpc_last_poll_at: string | null;
+  funding_key_ready: boolean;
+  funding_key_checked_at: string | null;
+  funding_wallet_pubkey: string | null;
+  last_error: string | null;
 };
 
 export type StrategyObservationRow = {

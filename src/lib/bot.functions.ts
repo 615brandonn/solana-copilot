@@ -48,25 +48,63 @@ export const saveFundingKey = createServerFn({ method: "POST" })
 
 export const getFundingKeyStatus = createServerFn({ method: "GET" }).handler(async () => {
   const db = adminClient();
+  const userId = currentUserId();
   const { data, error } = await (db as any)
     .from("funding_keys")
     .select("wallet_pubkey")
-    .eq("user_id", currentUserId())
+    .eq("user_id", userId)
     .maybeSingle();
   if (error) throw new Error(error.message);
-  return { saved: !!data, walletPubkey: data?.wallet_pubkey ?? null };
+  if (data) {
+    return {
+      saved: true,
+      walletPubkey: data.wallet_pubkey ?? null,
+      identityMismatch: false,
+    };
+  }
+
+  const { data: otherRows, error: otherError } = await (db as any)
+    .from("funding_keys")
+    .select("user_id")
+    .neq("user_id", userId)
+    .limit(1);
+  if (otherError) throw new Error(otherError.message);
+  return {
+    saved: false,
+    walletPubkey: null,
+    identityMismatch: (otherRows?.length ?? 0) > 0,
+  };
 });
 
 export const getWorkerStatus = createServerFn({ method: "GET" }).handler(async () => {
   const db = adminClient();
+  const userId = currentUserId();
   const { data, error } = await (db as any)
     .from("worker_heartbeat")
     .select("*")
-    .eq("user_id", currentUserId())
+    .eq("user_id", userId)
     .maybeSingle();
   if (error) throw new Error(error.message);
-  if (!data)
-    return { online: false, updatedAt: null, geyserConnected: false, decodedEventCount: 0 };
+  if (!data) {
+    const { data: otherRows, error: otherError } = await (db as any)
+      .from("worker_heartbeat")
+      .select("user_id,updated_at")
+      .neq("user_id", userId)
+      .order("updated_at", { ascending: false })
+      .limit(1);
+    if (otherError) throw new Error(otherError.message);
+    return {
+      online: false,
+      updatedAt: null,
+      geyserConnected: false,
+      decodedEventCount: 0,
+      fundingKeyReady: null,
+      fundingKeyCheckedAt: null,
+      fundingWalletPubkey: null,
+      lastError: null,
+      identityMismatch: (otherRows?.length ?? 0) > 0,
+    };
+  }
   const updatedAtMs = new Date(data.updated_at).getTime();
   const online = Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs < 45_000;
   return {
@@ -74,6 +112,12 @@ export const getWorkerStatus = createServerFn({ method: "GET" }).handler(async (
     updatedAt: data.updated_at,
     geyserConnected: data.geyser_connected,
     decodedEventCount: Number(data.decoded_event_count),
+    fundingKeyReady:
+      typeof data.funding_key_ready === "boolean" ? data.funding_key_ready : null,
+    fundingKeyCheckedAt: data.funding_key_checked_at ?? null,
+    fundingWalletPubkey: data.funding_wallet_pubkey ?? null,
+    lastError: data.last_error ?? null,
+    identityMismatch: false,
   };
 });
 
