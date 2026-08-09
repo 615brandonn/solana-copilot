@@ -163,7 +163,7 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
 
   const { data: fwsRaw, error: fwErr } = await (db as any)
     .from("follower_wallets")
-    .select("wallet, position_id, initial_amount, current_amount, last_updated")
+    .select("wallet, position_id, initial_amount, current_amount, hop_depth, last_updated")
     .in("position_id", posIds)
     .order("last_updated", { ascending: false });
   if (fwErr) throw new Error(fwErr.message);
@@ -172,6 +172,7 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
     position_id: string;
     initial_amount: number | string;
     current_amount: number | string;
+    hop_depth: number | null;
     last_updated: string;
   }>;
 
@@ -181,8 +182,11 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
     const heldPct = initial > 0 ? Math.max(0, Math.min(100, (current / initial) * 100)) : 0;
     return {
       wallet: f.wallet,
+      position_id: f.position_id,
       token_mint: mintByPos.get(f.position_id) ?? "",
+      current_amount: current,
       held_pct: heldPct,
+      hop_depth: Math.max(1, Math.min(3, Number(f.hop_depth ?? 1))),
       last_updated: f.last_updated,
     };
   });
