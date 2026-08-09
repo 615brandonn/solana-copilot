@@ -192,7 +192,10 @@ function Dashboard() {
     refetchInterval: 3000,
   });
   const activePositions = (positionsQ.data as unknown[] | undefined)?.length ?? 0;
-  const monitored = (followersQ.data as unknown[] | undefined)?.length ?? 0;
+  const monitored =
+    (
+      followersQ.data as Array<{ position_id?: string | null; observed_only?: boolean }> | undefined
+    )?.filter((follower) => follower.position_id && follower.observed_only !== true).length ?? 0;
 
   return (
     <div className="min-h-screen">
