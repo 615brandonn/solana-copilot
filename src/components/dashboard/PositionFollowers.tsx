@@ -83,9 +83,19 @@ export function PositionFollowers() {
   return (
     <SectionCard
       title="Wallet holdings & followers"
-      description="Every non-funding coin in your wallet, clearly separated into Helix-managed and wallet-only holdings."
+      description="See each coin you hold, your current balance, and the live balances of follower wallets connected to that coin."
       icon={<Coins className="h-4 w-4" />}
     >
+      <div className="mt-3 grid gap-2 text-[11px] text-muted-foreground sm:grid-cols-2">
+        <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2">
+          <span className="font-medium text-primary">Helix managed:</span> opened by this bot;
+          configured exit rules can act on its tracked followers.
+        </div>
+        <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+          <span className="font-medium text-foreground">Wallet only:</span> held in your wallet and
+          displayed for awareness; follower activity cannot trigger a trade.
+        </div>
+      </div>
       {error && (
         <p className="py-3 text-center text-xs text-destructive">
           {error instanceof Error ? error.message : "Failed to load positions"}
@@ -135,9 +145,14 @@ export function PositionFollowers() {
                         View coin <ExternalLink className="h-3 w-3" />
                       </a>
                     </div>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      Wallet balance:{" "}
-                      <span className="mono text-foreground">{amount(holding.amount)}</span>
+                    <p className="mt-2 break-all text-[10px] text-muted-foreground">
+                      Coin mint: <span className="mono text-foreground">{holding.token_mint}</span>
+                    </p>
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      Your wallet holds{" "}
+                      <span className="mono font-medium text-foreground">
+                        {amount(holding.amount)} tokens
+                      </span>
                       {position ? (
                         <span>
                           {" "}
@@ -182,19 +197,33 @@ export function PositionFollowers() {
                         className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-background/30 px-3 py-2"
                       >
                         <div className="min-w-0">
-                          <div className="mono truncate text-xs" title={follower.wallet}>
-                            {short(follower.wallet)}
+                          <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                            Follower wallet
                           </div>
+                          <a
+                            href={"https://solscan.io/account/" + follower.wallet}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="mono break-all text-[11px] text-foreground transition-colors hover:text-primary"
+                            title="Open this wallet on Solscan"
+                          >
+                            {follower.wallet}
+                          </a>
                           <div className="text-[10px] text-muted-foreground">
                             {follower.observed_only
                               ? `live remaining · ${follower.source_target_count ?? 1} target source${follower.source_target_count === 1 ? "" : "s"}`
                               : `hop ${follower.hop_depth}`}{" "}
-                            · {amount(Number(follower.current_amount))} tokens
+                          </div>
+                          <div className="mt-1 text-[10px] text-muted-foreground">
+                            Current holding:{" "}
+                            <span className="mono font-medium text-foreground">
+                              {amount(Number(follower.current_amount))} tokens
+                            </span>
                           </div>
                         </div>
                         {follower.held_pct === null ? (
                           <span className="shrink-0 text-[10px] uppercase tracking-wider text-muted-foreground">
-                            observed
+                            view only
                           </span>
                         ) : (
                           <span
