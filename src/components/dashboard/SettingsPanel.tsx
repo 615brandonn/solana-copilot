@@ -662,31 +662,34 @@ export function SettingsPanel({ cfg, onChange }: Props) {
             </SettingRow>
           )}
           <SettingRow
-            label="Target inactivity exit"
-            hint="For main-mode positions, sell 100% when none of the configured target wallets buys that coin again within the selected time."
+            label="Inactivity window"
+            hint="When on, sell 100% if no configured target wallet buys the coin again during this window. The timer resets after every target-wallet buy and also applies to existing main-mode positions."
           >
-            <Switch
-              checked={cfg.targetInactivityExitEnabled}
-              onCheckedChange={(v) => onChange({ targetInactivityExitEnabled: v })}
-            />
-          </SettingRow>
-          {cfg.targetInactivityExitEnabled && (
-            <SettingRow
-              label="Inactivity window"
-              hint="The timer starts again after every observed target-wallet buy of the coin."
-            >
+            <div className="flex items-center gap-3">
               <div className="flex items-center gap-2">
-                <Clock3 className="h-4 w-4 text-muted-foreground" />
-                <NumInput
-                  value={cfg.targetInactivityHours}
-                  onChange={(n) => onChange({ targetInactivityHours: n })}
-                  suffix="hr"
-                  step={0.25}
-                  min={0.05}
+                <Switch
+                  aria-label="Enable inactivity exit"
+                  checked={cfg.targetInactivityExitEnabled}
+                  onCheckedChange={(v) => onChange({ targetInactivityExitEnabled: v })}
                 />
+                <span className="mono w-7 text-xs text-muted-foreground">
+                  {cfg.targetInactivityExitEnabled ? "ON" : "OFF"}
+                </span>
               </div>
-            </SettingRow>
-          )}
+              {cfg.targetInactivityExitEnabled && (
+                <div className="flex items-center gap-2">
+                  <Clock3 className="h-4 w-4 text-muted-foreground" />
+                  <NumInput
+                    value={cfg.targetInactivityHours}
+                    onChange={(n) => onChange({ targetInactivityHours: n })}
+                    suffix="hr"
+                    step={0.25}
+                    min={0.05}
+                  />
+                </div>
+              )}
+            </div>
+          </SettingRow>
         </SectionCard>
       </fieldset>
     </div>
