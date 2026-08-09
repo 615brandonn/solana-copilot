@@ -24,6 +24,10 @@ import {
 } from "./coordinated-mode.js";
 import { isFlatPosition, proportionalMirrorSell } from "./follower-math.js";
 import { safeDiagnostic } from "./diagnostics.js";
+import {
+  positiveTokenMints,
+  ZeroBalanceConfirmationTracker,
+} from "./position-reconciliation.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const WSOL = "So11111111111111111111111111111111111111112";
@@ -225,6 +229,41 @@ async function main() {
     }
   }
 
+  const zeroBalanceTracker = new ZeroBalanceConfirmationTracker();
+
+  async function reconcileFlatWalletPositions() {
+    if (!fundingReadiness.ready || !fundingReadiness.walletPubkey) return;
+    const { data: positions, error } = await db
+      .from("positions")
+      .select("id,token_mint")
+      .eq("user_id", cfg.user_id)
+      .is("closed_at", null);
+    if (error) throw new Error(`position reconciliation query failed: ${safeDiagnostic(error)}`);
+
+    // Only a successful RPC snapshot advances the two-observation guard.
+    const positiveMints = await positiveTokenMints(rpc, fundingReadiness.walletPubkey);
+    const confirmedFlat = zeroBalanceTracker.observe(positions ?? [], positiveMints);
+    if (confirmedFlat.length === 0) return;
+
+    const closedAt = new Date().toISOString();
+    for (const positionId of confirmedFlat) {
+      const { error: updateError } = await db
+        .from("positions")
+        .update({ amount_remaining: 0, closed_at: closedAt })
+        .eq("id", positionId)
+        .eq("user_id", cfg.user_id)
+        .is("closed_at", null);
+      if (updateError) {
+        throw new Error(`position reconciliation update failed: ${safeDiagnostic(updateError)}`);
+      }
+      await releaseMonitoredPosition(positionId);
+    }
+    log.info(
+      { closedPositionCount: confirmedFlat.length },
+      "closed positions confirmed flat by consecutive wallet snapshots",
+    );
+  }
+
   // Rehydrate any positions still open from a previous worker run so we keep
   // monitoring their followers across restarts.
   const { data: openPositions } = await db
@@ -342,6 +381,14 @@ async function main() {
         fundingReadiness = next;
       })
       .catch((err) => log.error({ err }, "funding readiness refresh failed"));
+  }, 60_000);
+  reconcileFlatWalletPositions().catch((err) =>
+    log.error({ err: safeDiagnostic(err) }, "position reconciliation failed"),
+  );
+  setInterval(() => {
+    reconcileFlatWalletPositions().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "position reconciliation failed"),
+    );
   }, 60_000);
 
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
