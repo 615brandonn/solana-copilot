@@ -21,9 +21,7 @@ export const db = createClient(
         const headers = new Headers(init?.headers);
         headers.set("apikey", env.BOT_SUPABASE_SERVICE_ROLE_KEY);
         const timeoutSignal = AbortSignal.timeout(5_000);
-        const signal = init?.signal
-          ? AbortSignal.any([init.signal, timeoutSignal])
-          : timeoutSignal;
+        const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
 
         // New-format sb_secret_* keys are opaque, not JWTs. PostgREST accepts
         // them as apikey, but not as an Authorization bearer token.
@@ -84,6 +82,11 @@ export type BotConfigRow = {
   stop_loss_enabled: boolean;
   stop_loss_pct: number;
   proportional_follower_sells: boolean;
+  follower_seller_exit_enabled: boolean;
+  follower_seller_exit_count: number;
+  follower_seller_exit_pct: number;
+  target_inactivity_exit_enabled: boolean;
+  target_inactivity_hours: number;
   additional_target_wallets?: string[];
   network_scaling_enabled?: boolean;
   starter_position_pct?: number;

@@ -8,7 +8,8 @@ import { normalizeSupabaseUrl } from "./supabase-url";
 import { decodeBase58, encodeBase58 } from "./base58";
 
 export type SaveFundingKeyResult =
-  { ok: true } | { ok: false; code: "missing_backend_key" | "save_failed"; error: string };
+  | { ok: true }
+  | { ok: false; code: "missing_backend_key" | "save_failed"; error: string };
 
 const SINGLE_USER_ID = "00000000-0000-0000-0000-000000000000";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -124,6 +125,11 @@ export function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row
     stopLossEnabled: row.stop_loss_enabled,
     stopLossPct: row.stop_loss_pct,
     proportionalFollowerSells: row.proportional_follower_sells,
+    followerSellerExitEnabled: row.follower_seller_exit_enabled ?? false,
+    followerSellerExitCount: row.follower_seller_exit_count ?? 1,
+    followerSellerExitPct: row.follower_seller_exit_pct ?? 100,
+    targetInactivityExitEnabled: row.target_inactivity_exit_enabled ?? false,
+    targetInactivityHours: row.target_inactivity_hours ?? 6,
   };
 }
 
@@ -189,6 +195,11 @@ export function configToRow(
     stop_loss_enabled: cfg.stopLossEnabled,
     stop_loss_pct: cfg.stopLossPct,
     proportional_follower_sells: cfg.proportionalFollowerSells,
+    follower_seller_exit_enabled: cfg.followerSellerExitEnabled,
+    follower_seller_exit_count: cfg.followerSellerExitCount,
+    follower_seller_exit_pct: cfg.followerSellerExitPct,
+    target_inactivity_exit_enabled: cfg.targetInactivityExitEnabled,
+    target_inactivity_hours: cfg.targetInactivityHours,
     updated_at: new Date().toISOString(),
   };
 }

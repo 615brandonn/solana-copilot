@@ -51,7 +51,8 @@ function configuredTargetWallets(config: BotConfigRow): string[] {
 
 async function loadConfig(userId: string): Promise<BotConfigRow | null> {
   const byUser = await db.from("bot_config").select("*").eq("user_id", userId).maybeSingle();
-  if (byUser.error) throw new Error(`bot_config query failed: ${safeDiagnostic(byUser.error.message)}`);
+  if (byUser.error)
+    throw new Error(`bot_config query failed: ${safeDiagnostic(byUser.error.message)}`);
   if (byUser.data) return byUser.data as BotConfigRow;
   const any = await db
     .from("bot_config")
@@ -99,10 +100,7 @@ async function checkFundingWalletReadiness(
   try {
     const secret = await loadSigner(userId);
     if (!secret) {
-      log.error(
-        {},
-        "readiness failed — no funding private key saved for this config user",
-      );
+      log.error({}, "readiness failed — no funding private key saved for this config user");
       return {
         ready: false,
         walletPubkey: null,
@@ -457,8 +455,7 @@ async function main() {
         .upsert(baseHeartbeat, { onConflict: "user_id" }));
     }
 
-    if (error)
-      throw new Error(`worker_heartbeat upsert failed: ${safeDiagnostic(error.message)}`);
+    if (error) throw new Error(`worker_heartbeat upsert failed: ${safeDiagnostic(error.message)}`);
   }
 
   await reconcileFlatWalletPositions().catch((err) =>
@@ -481,9 +478,7 @@ async function main() {
   setInterval(() => {
     reconcileFlatWalletPositions()
       .then(() => refreshObservedFollowerHoldings())
-      .catch((err) =>
-        log.error({ err: safeDiagnostic(err) }, "wallet holdings refresh failed"),
-      );
+      .catch((err) => log.error({ err: safeDiagnostic(err) }, "wallet holdings refresh failed"));
   }, 60_000);
 
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
@@ -491,8 +486,8 @@ async function main() {
     checkTpSl().catch((err) => log.error({ err }, "tp/sl loop failed"));
   }, 4000);
   setInterval(() => {
-    checkCoordinatedInactivity().catch((err) =>
-      log.error({ err }, "coordinated inactivity loop failed"),
+    checkConfiguredPositionExits().catch((err) =>
+      log.error({ err }, "configured position exit loop failed"),
     );
   }, 30_000);
 
@@ -554,58 +549,66 @@ async function main() {
     }
   }
 
-  async function checkCoordinatedInactivity() {
+  async function checkConfiguredPositionExits() {
     const { data: positions, error } = await db
       .from("positions")
       .select(
-        "id,token_mint,amount_remaining,decimals,last_root_buy_at,opened_at,entry_mode,coordinated_exit_triggered",
+        "id,token_mint,amount_remaining,decimals,last_root_buy_at,opened_at,entry_mode,coordinated_exit_triggered,follower_seller_exit_triggered",
       )
       .eq("user_id", cfg.user_id)
-      .eq("entry_mode", "coordinated")
       .is("closed_at", null);
-    if (error) throw new Error(`coordinated inactivity query failed: ${error.message}`);
+    if (error) throw new Error(`configured position exit query failed: ${error.message}`);
     const nowMs = Date.now();
     for (const pos of positions ?? []) {
       if (exitsInFlight.has(pos.id) || Number(pos.amount_remaining) <= 0) continue;
-      if (!pos.coordinated_exit_triggered) {
+      const coordinated = (pos.entry_mode ?? "regular") === "coordinated";
+      const sellerExitEnabled = coordinated || Boolean(cfg.follower_seller_exit_enabled);
+      const sellerExitTriggered = coordinated
+        ? Boolean(pos.coordinated_exit_triggered)
+        : Boolean(pos.follower_seller_exit_triggered);
+      const requiredSellers = coordinated
+        ? Number(cfg.coordinated_follower_sell_count)
+        : Number(cfg.follower_seller_exit_count);
+      const sellerExitPct = coordinated
+        ? Number(cfg.coordinated_follower_sell_pct)
+        : Number(cfg.follower_seller_exit_pct);
+      if (sellerExitEnabled && !sellerExitTriggered) {
         const { count, error: sellerCountError } = await db
           .from("follower_wallets")
           .select("id", { count: "exact", head: true })
           .eq("position_id", pos.id)
           .not("first_sell_at", "is", null);
         if (sellerCountError) {
-          throw new Error(`coordinated seller-count query failed: ${sellerCountError.message}`);
+          throw new Error(`seller-count query failed: ${sellerCountError.message}`);
         }
-        if (
-          shouldTriggerDistinctSellerExit(
-            Number(count ?? 0),
-            Number(cfg.coordinated_follower_sell_count),
-            false,
-          )
-        ) {
-          await executeCoordinatedPercentageExit(
+        if (shouldTriggerDistinctSellerExit(Number(count ?? 0), requiredSellers, false)) {
+          await executePercentageExit(
             pos.id,
             pos.token_mint,
             Number(pos.amount_remaining),
             Number(pos.decimals ?? 0),
-            Number(cfg.coordinated_follower_sell_pct),
-            `coordinated ${count ?? 0} distinct follower seller(s) (retry check)`,
+            sellerExitPct,
+            `${coordinated ? "coordinated" : "main"} ${count ?? 0} distinct follower seller(s) (retry check)`,
+            coordinated ? "coordinated" : "main-follower",
           );
           continue;
         }
       }
-      const deadline = inactivityDeadlineMs(
-        pos.last_root_buy_at ?? pos.opened_at,
-        Number(cfg.coordinated_inactivity_hours),
-      );
+      const inactivityEnabled = coordinated || Boolean(cfg.target_inactivity_exit_enabled);
+      if (!inactivityEnabled) continue;
+      const inactivityHours = coordinated
+        ? Number(cfg.coordinated_inactivity_hours)
+        : Number(cfg.target_inactivity_hours);
+      const deadline = inactivityDeadlineMs(pos.last_root_buy_at ?? pos.opened_at, inactivityHours);
       if (deadline === undefined || nowMs < deadline) continue;
-      await executeCoordinatedPercentageExit(
+      await executePercentageExit(
         pos.id,
         pos.token_mint,
         Number(pos.amount_remaining),
         Number(pos.decimals ?? 0),
         100,
-        `coordinated target inactivity ${cfg.coordinated_inactivity_hours}h`,
+        `${coordinated ? "coordinated" : "main"} target inactivity ${inactivityHours}h`,
+        coordinated ? "coordinated" : "none",
       );
     }
   }
@@ -618,6 +621,7 @@ async function main() {
     reason: string,
     markTpTaken = false,
     markCoordinatedExit = false,
+    markFollowerSellerExit = false,
   ) {
     if (exitsInFlight.has(positionId)) return;
     exitsInFlight.add(positionId);
@@ -648,12 +652,14 @@ async function main() {
         closed_at: string | null;
         tp_taken?: boolean;
         coordinated_exit_triggered?: boolean;
+        follower_seller_exit_triggered?: boolean;
       } = {
         amount_remaining: newRemaining,
         closed_at: closed ? new Date().toISOString() : null,
       };
       if (markTpTaken) update.tp_taken = true;
       if (markCoordinatedExit) update.coordinated_exit_triggered = true;
+      if (markFollowerSellerExit) update.follower_seller_exit_triggered = true;
       await retryDb("save position after exit", () =>
         db.from("positions").update(update).eq("id", positionId),
       );
@@ -677,21 +683,31 @@ async function main() {
     }
   }
 
-  async function executeCoordinatedPercentageExit(
+  async function executePercentageExit(
     positionId: string,
     mint: string,
     remaining: number,
     decimals: number,
     sellPct: number,
     reason: string,
+    trigger: "coordinated" | "main-follower" | "none",
   ) {
     if (exitsInFlight.has(positionId)) return;
     const sellFraction = Math.min(1, Math.max(0, Number(sellPct) / 100));
     const sellUi = remaining * sellFraction;
     const sellRaw = Math.floor(sellUi * Math.pow(10, decimals));
     if (sellRaw <= 0 || sellUi <= 0) return;
-    log.warn({ positionId, mint, sellPct, reason }, "coordinated exit triggered");
-    await executeExitSell(positionId, mint, sellRaw, sellUi, reason, false, true);
+    log.warn({ positionId, mint, sellPct, reason }, "configured exit triggered");
+    await executeExitSell(
+      positionId,
+      mint,
+      sellRaw,
+      sellUi,
+      reason,
+      false,
+      trigger === "coordinated",
+      trigger === "main-follower",
+    );
   }
 
   async function handle(event: FeedEvent) {
@@ -913,7 +929,7 @@ async function main() {
     const { data: pos } = await db
       .from("positions")
       .select(
-        "id,token_mint,amount_tokens,amount_remaining,decimals,mirrored_sold_fraction,entry_mode,coordinated_exit_triggered",
+        "id,token_mint,amount_tokens,amount_remaining,decimals,mirrored_sold_fraction,entry_mode,coordinated_exit_triggered,follower_seller_exit_triggered",
       )
       .eq("id", ctx.positionId)
       .maybeSingle();
@@ -938,15 +954,45 @@ async function main() {
         );
         return;
       }
-      await executeCoordinatedPercentageExit(
+      await executePercentageExit(
         pos.id,
         pos.token_mint,
         Number(pos.amount_remaining),
         Number(pos.decimals ?? 0),
         Number(cfg.coordinated_follower_sell_pct),
         `coordinated ${sellState.distinctSellerCount} distinct follower seller(s)`,
+        "coordinated",
       );
       return;
+    }
+
+    if (cfg.follower_seller_exit_enabled && !pos.follower_seller_exit_triggered) {
+      const thresholdReached = shouldTriggerDistinctSellerExit(
+        sellState.distinctSellerCount,
+        Number(cfg.follower_seller_exit_count),
+        false,
+      );
+      if (!thresholdReached) {
+        log.info(
+          {
+            positionId: pos.id,
+            distinctSellerCount: sellState.distinctSellerCount,
+            required: cfg.follower_seller_exit_count,
+          },
+          "main follower exit waiting",
+        );
+      } else {
+        await executePercentageExit(
+          pos.id,
+          pos.token_mint,
+          Number(pos.amount_remaining),
+          Number(pos.decimals ?? 0),
+          Number(cfg.follower_seller_exit_pct),
+          `main ${sellState.distinctSellerCount} distinct follower seller(s)`,
+          "main-follower",
+        );
+        return;
+      }
     }
 
     if (!cfg.proportional_follower_sells) return;
@@ -1196,6 +1242,7 @@ async function main() {
               entry_slot: event.slot,
               entry_mode: options.entryMode,
               coordinated_exit_triggered: false,
+              follower_seller_exit_triggered: false,
               root_buy_count: options.coordinatedWallets?.length ?? 1,
               last_root_buy_at: targetBuyAt,
               last_root_buy_wallet: event.wallet,

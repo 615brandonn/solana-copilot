@@ -45,6 +45,11 @@ create table if not exists public.bot_config (
   stop_loss_enabled boolean not null default true,
   stop_loss_pct numeric not null default 30,
   proportional_follower_sells boolean not null default true,
+  follower_seller_exit_enabled boolean not null default false,
+  follower_seller_exit_count integer not null default 1,
+  follower_seller_exit_pct numeric not null default 100,
+  target_inactivity_exit_enabled boolean not null default false,
+  target_inactivity_hours numeric not null default 6,
   updated_at timestamptz not null default now(),
   unique (user_id)
 );
@@ -84,6 +89,16 @@ alter table public.bot_config
   add column if not exists large_buy_scanner_history_window integer not null default 20;
 alter table public.bot_config
   add column if not exists coordinated_mode_enabled boolean not null default false;
+alter table public.bot_config
+  add column if not exists follower_seller_exit_enabled boolean not null default false;
+alter table public.bot_config
+  add column if not exists follower_seller_exit_count integer not null default 1;
+alter table public.bot_config
+  add column if not exists follower_seller_exit_pct numeric not null default 100;
+alter table public.bot_config
+  add column if not exists target_inactivity_exit_enabled boolean not null default false;
+alter table public.bot_config
+  add column if not exists target_inactivity_hours numeric not null default 6;
 alter table public.bot_config
   add column if not exists coordinated_fixed_buy_usd numeric not null default 25;
 alter table public.bot_config
@@ -173,6 +188,7 @@ alter table public.positions add column if not exists last_root_buy_at timestamp
 alter table public.positions add column if not exists last_root_buy_wallet text;
 alter table public.positions add column if not exists entry_mode text not null default 'regular';
 alter table public.positions add column if not exists coordinated_exit_triggered boolean not null default false;
+alter table public.positions add column if not exists follower_seller_exit_triggered boolean not null default false;
 alter table public.positions alter column entry_price_usd drop not null;
 create index if not exists positions_user_open_idx on public.positions (user_id) where closed_at is null;
 create index if not exists positions_open_by_mint_idx on public.positions (token_mint) where closed_at is null;
