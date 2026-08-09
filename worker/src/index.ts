@@ -22,6 +22,8 @@ import {
   shouldTriggerDistinctSellerExit,
   type TargetBuyObservation,
 } from "./coordinated-mode.js";
+import { isFlatPosition, proportionalMirrorSell } from "./follower-math.js";
+import { safeDiagnostic } from "./diagnostics.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const WSOL = "So11111111111111111111111111111111111111112";
@@ -43,7 +45,7 @@ function configuredTargetWallets(config: BotConfigRow): string[] {
 
 async function loadConfig(userId: string): Promise<BotConfigRow | null> {
   const byUser = await db.from("bot_config").select("*").eq("user_id", userId).maybeSingle();
-  if (byUser.error) throw new Error(`bot_config query failed: ${byUser.error.message}`);
+  if (byUser.error) throw new Error(`bot_config query failed: ${safeDiagnostic(byUser.error.message)}`);
   if (byUser.data) return byUser.data as BotConfigRow;
   const any = await db
     .from("bot_config")
@@ -52,11 +54,12 @@ async function loadConfig(userId: string): Promise<BotConfigRow | null> {
     .neq("target_wallet", "")
     .order("updated_at", { ascending: false })
     .limit(1);
-  if (any.error) throw new Error(`bot_config identity check failed: ${any.error.message}`);
+  if (any.error)
+    throw new Error(`bot_config identity check failed: ${safeDiagnostic(any.error.message)}`);
   const row = any.data?.[0];
   if (row) {
     throw new Error(
-      `HELIX_USER_ID mismatch: worker requested ${userId}, but the configured dashboard row uses ${row.user_id}`,
+      "HELIX_USER_ID mismatch: worker identity does not match the configured dashboard row",
     );
   }
   return null;
@@ -91,7 +94,7 @@ async function checkFundingWalletReadiness(
     const secret = await loadSigner(userId);
     if (!secret) {
       log.error(
-        { user_id: userId },
+        {},
         "readiness failed — no funding private key saved for this config user",
       );
       return {
@@ -160,11 +163,11 @@ async function waitForConfig(userId: string): Promise<BotConfigRow> {
     try {
       const cfg = await loadConfig(userId);
       if (cfg?.target_wallet) {
-        log.info({ user_id: cfg.user_id, targets: configuredTargetWallets(cfg) }, "config loaded");
+        log.info({ targetCount: configuredTargetWallets(cfg).length }, "config loaded");
         return cfg;
       }
       if (!logged) {
-        log.warn({ userId }, "no target wallet configured yet — polling every 5s");
+        log.warn("no target wallet configured yet — polling every 5s");
         logged = true;
       }
     } catch (err) {
@@ -197,12 +200,12 @@ async function main() {
       try {
         const result = await operation();
         if (!result.error) return result.data;
-        lastError = result.error.message;
+        lastError = safeDiagnostic(result.error.message);
       } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
+        lastError = safeDiagnostic(err);
       }
       if (attempt < attempts) {
-        log.warn({ label, attempt, lastError }, "database operation failed — retrying");
+        log.warn({ label, attempt, error: lastError }, "database operation failed — retrying");
         await delay(attempt * 500);
       }
     }
@@ -325,7 +328,8 @@ async function main() {
         .upsert(baseHeartbeat, { onConflict: "user_id" }));
     }
 
-    if (error) throw new Error(`worker_heartbeat upsert failed: ${error.message}`);
+    if (error)
+      throw new Error(`worker_heartbeat upsert failed: ${safeDiagnostic(error.message)}`);
   }
 
   await writeWorkerHeartbeat().catch((err) => log.error({ err }, "database heartbeat failed"));
@@ -496,7 +500,7 @@ async function main() {
       );
       if (!cur) throw new Error(`position ${positionId} disappeared after exit transaction landed`);
       const newRemaining = Math.max(0, Number(cur.amount_remaining) - sellUi);
-      const closed = newRemaining <= 1e-9;
+      const closed = isFlatPosition(newRemaining);
       const update: {
         amount_remaining: number;
         closed_at: string | null;
@@ -805,8 +809,11 @@ async function main() {
 
     if (!cfg.proportional_follower_sells) return;
 
-    const targetRemaining = Math.max(0, Number(pos.amount_tokens) * (1 - sellState.soldFraction));
-    const sellUi = Number(pos.amount_remaining) - targetRemaining;
+    const sellUi = proportionalMirrorSell(
+      Number(pos.amount_tokens),
+      Number(pos.amount_remaining),
+      sellState.soldFraction,
+    );
     if (sellUi <= 0) return;
 
     const decimals = Number(pos.decimals ?? 0);
@@ -855,7 +862,7 @@ async function main() {
         throw new Error(`position ${positionId} disappeared after mirror sell landed`);
       }
       const newRemaining = Math.max(0, Number(currentPosition.amount_remaining) - sellUi);
-      const closed = newRemaining <= 1e-9;
+      const closed = isFlatPosition(newRemaining);
       await retryDb("save position after mirror sell", () =>
         db
           .from("positions")

@@ -9,6 +9,12 @@ import { db } from "./db.js";
 import type { GeyserFeed } from "./geyser.js";
 import type { RpcBackfillPoller } from "./poller.js";
 import { env } from "./env.js";
+import {
+  chainedTransferAmount,
+  followerSoldFraction,
+  nextFollowerHop,
+} from "./follower-math.js";
+import { safeDiagnostic } from "./diagnostics.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -23,9 +29,9 @@ async function retryDb<T>(
     try {
       const result = await operation();
       if (!result.error) return result.data;
-      lastError = result.error.message;
+      lastError = safeDiagnostic(result.error.message);
     } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
+      lastError = safeDiagnostic(err);
     }
     if (attempt < attempts) {
       log.warn({ label, attempt, lastError }, "follower database operation failed — retrying");
@@ -80,7 +86,7 @@ export class FollowerMonitor {
       txSig?: string;
       slot?: number;
     } = {},
-  ) {
+  ): Promise<boolean> {
     const existing = await retryDb<{
       initial_amount: number;
       current_amount: number;
@@ -99,7 +105,7 @@ export class FollowerMonitor {
         { positionId, recipient, txSig: lineage.txSig },
         "duplicate follower transfer ignored",
       );
-      return;
+      return false;
     }
 
     if (existing) {
@@ -136,6 +142,7 @@ export class FollowerMonitor {
     await this.feed.watch(recipient);
     this.poller?.watch(recipient);
     log.info({ positionId, recipient, amount }, "follower registered / topped up");
+    return true;
   }
 
   /** Follow a token transfer made by an already tracked recipient, up to three hops. */
@@ -148,17 +155,45 @@ export class FollowerMonitor {
   ): Promise<boolean> {
     const ctx = this.activeForMint(tokenMint);
     if (!ctx) return false;
-    const parent = await retryDb<{ hop_depth: number } | null>("load transfer-chain parent", () =>
+    const parent = await retryDb<{
+      hop_depth: number;
+      initial_amount: number;
+      current_amount: number;
+      last_seen_signature: string | null;
+    } | null>("load transfer-chain parent", () =>
       db
         .from("follower_wallets")
-        .select("hop_depth")
+        .select("hop_depth,initial_amount,current_amount,last_seen_signature")
         .eq("position_id", ctx.positionId)
         .eq("wallet", sender)
         .maybeSingle(),
     );
-    if (!parent || Number(parent.hop_depth ?? 1) >= 3) return false;
-    await this.recordTransfer(ctx.positionId, recipient, amount, {
-      hopDepth: Number(parent.hop_depth ?? 1) + 1,
+    if (!parent) return false;
+    const hopDepth = nextFollowerHop(parent.hop_depth);
+    if (hopDepth === null) return false;
+    const moved = chainedTransferAmount(parent.current_amount, amount);
+    if (moved <= 0) return false;
+
+    // Mark the sender first so a retry after a recipient-write failure cannot
+    // subtract the same transfer twice. The recipient write has its own
+    // signature guard, making both halves safely retryable.
+    if (!tx.txSig || parent.last_seen_signature !== tx.txSig) {
+      await retryDb("decrement transfer-chain sender", () =>
+        db
+          .from("follower_wallets")
+          .update({
+            initial_amount: Math.max(0, Number(parent.initial_amount) - moved),
+            current_amount: Math.max(0, Number(parent.current_amount) - moved),
+            last_seen_signature: tx.txSig ?? parent.last_seen_signature ?? null,
+            last_seen_slot: tx.slot ?? null,
+            last_updated: new Date().toISOString(),
+          })
+          .eq("position_id", ctx.positionId)
+          .eq("wallet", sender),
+      );
+    }
+    await this.recordTransfer(ctx.positionId, recipient, moved, {
+      hopDepth,
       parentWallet: sender,
       txSig: tx.txSig,
       slot: tx.slot,
@@ -217,8 +252,6 @@ export class FollowerMonitor {
           .eq("position_id", positionId),
     );
     if (!agg?.length) return null;
-    const init = agg.reduce((s, r) => s + Number(r.initial_amount), 0);
-    const cur = agg.reduce((s, r) => s + Number(r.current_amount), 0);
     const count = await retryDb<number | null>("count distinct follower sellers", () =>
       db
         .from("follower_wallets")
@@ -228,7 +261,7 @@ export class FollowerMonitor {
         .then((result) => ({ data: result.count, error: result.error })),
     );
     return {
-      soldFraction: init === 0 ? 0 : 1 - cur / init,
+      soldFraction: followerSoldFraction(agg),
       distinctSellerCount: Number(count ?? 0),
       firstSellByWallet,
     };

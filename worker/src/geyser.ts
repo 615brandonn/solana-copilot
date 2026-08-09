@@ -98,6 +98,8 @@ export class GeyserFeed {
   private stopped = false;
   private lastMessageAt?: number;
   private decodedEventCount = 0;
+  private processingMessage = false;
+  private pendingMessages: any[] = [];
 
   constructor(onSwap: OnSwap) {
     this.client = createClient();
@@ -165,7 +167,7 @@ export class GeyserFeed {
       this.stream?.end?.();
       this.stream = await this.client.subscribe();
 
-      this.stream.on("data", (msg: any) => this.handleMessage(msg).catch((e: any) => log.error(e)));
+      this.stream.on("data", (msg: any) => this.processMessageWithBackpressure(msg));
       this.stream.on("error", (e: any) => {
         log.error({ err: e }, "geyser stream error");
         this.scheduleReconnect("stream error");
@@ -177,6 +179,35 @@ export class GeyserFeed {
       log.info({ n: this.watched.size }, "geyser subscribed");
     } finally {
       this.reconnecting = false;
+    }
+  }
+
+  private processMessageWithBackpressure(msg: any) {
+    const stream = this.stream;
+    if (!stream) return;
+    // A Yellowstone stream can deliver messages much faster than downstream
+    // database/event handling completes. Pause the readable side immediately
+    // so async handlers cannot accumulate without bound and starve heartbeat
+    // timers or exhaust the VPS memory.
+    stream.pause?.();
+    this.pendingMessages.push(msg);
+    if (this.processingMessage) return;
+    this.processingMessage = true;
+    this.drainMessages(stream)
+      .finally(() => {
+        this.processingMessage = false;
+        if (this.stream === stream && !this.stopped) stream.resume?.();
+      });
+  }
+
+  private async drainMessages(stream: any) {
+    while (this.stream === stream && this.pendingMessages.length > 0) {
+      const msg = this.pendingMessages.shift();
+      try {
+        await this.handleMessage(msg);
+      } catch (err) {
+        log.error({ err }, "geyser message handling failed");
+      }
     }
   }
 
@@ -210,7 +241,7 @@ export class GeyserFeed {
     }
     for (const ev of events) {
       this.decodedEventCount += 1;
-      log.info({ kind: ev.kind, wallet: (ev as any).wallet ?? (ev as any).from, side: (ev as any).side, mint: ev.tokenMint }, "feed event");
+      log.debug({ kind: ev.kind, wallet: (ev as any).wallet ?? (ev as any).from, side: (ev as any).side, mint: ev.tokenMint }, "feed event");
       await this.onSwap(ev);
     }
   }
