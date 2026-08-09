@@ -18,8 +18,8 @@ import { StatusHeader } from "@/components/dashboard/StatusHeader";
 import { WalletPanel } from "@/components/dashboard/WalletPanel";
 import { SettingsPanel } from "@/components/dashboard/SettingsPanel";
 import { ActivityFeed } from "@/components/dashboard/ActivityFeed";
-import { MonitoredWallets } from "@/components/dashboard/MonitoredWallets";
 import { StrategyLab } from "@/components/dashboard/StrategyLab";
+import { PositionFollowers } from "@/components/dashboard/PositionFollowers";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -234,12 +234,12 @@ function Dashboard() {
               onSaveKey={handleSaveKey}
               keySaved={keySaved}
             />
+            <PositionFollowers />
             <SettingsPanel cfg={cfg} onChange={update} />
           </div>
 
           <aside className="space-y-6">
             <ActivityFeed />
-            <MonitoredWallets />
           </aside>
         </main>
 
