@@ -26,6 +26,7 @@ import { isFlatPosition, proportionalMirrorSell } from "./follower-math.js";
 import { safeDiagnostic } from "./diagnostics.js";
 import {
   groupObservedFollowerTransfers,
+  isEligibleFollowerWallet,
   walletTokenHoldings,
   type WalletTokenHolding,
   ZeroBalanceConfirmationTracker,
@@ -38,6 +39,31 @@ const STABLECOIN_MINTS = new Set([
   "Es9vMFrzaCERmJfrF4H2FYD4KCo24RDUuUuJZq8bn6T", // USDT
 ]);
 const rpc = new Connection(env.RPC_URL, { commitment: "processed" });
+const followerRecipientEligibility = new Map<string, boolean>();
+
+async function isEligibleFollowerRecipient(address: string): Promise<boolean> {
+  const cached = followerRecipientEligibility.get(address);
+  if (cached !== undefined) return cached;
+  try {
+    const publicKey = new PublicKey(address);
+    const account = await rpc.getAccountInfo(publicKey, "confirmed");
+    const eligible = isEligibleFollowerWallet(
+      address,
+      account?.owner.toBase58() ?? null,
+    );
+    if (followerRecipientEligibility.size >= 10_000) {
+      followerRecipientEligibility.delete(followerRecipientEligibility.keys().next().value ?? "");
+    }
+    followerRecipientEligibility.set(address, eligible);
+    return eligible;
+  } catch (err) {
+    log.warn(
+      { address, err: safeDiagnostic(err) },
+      "follower recipient classification failed — excluding unknown recipient",
+    );
+    return false;
+  }
+}
 
 function configuredTargetWallets(config: BotConfigRow): string[] {
   return Array.from(
@@ -313,7 +339,17 @@ async function main() {
       }
     }
 
-    const pending = groupObservedFollowerTransfers(transfers, new Set(targets));
+    const grouped = groupObservedFollowerTransfers(transfers, new Set(targets));
+    const pending: typeof grouped = [];
+    for (let offset = 0; offset < grouped.length; offset += 8) {
+      const batch = grouped.slice(offset, offset + 8);
+      const eligibility = await Promise.all(
+        batch.map((row) => isEligibleFollowerRecipient(row.wallet)),
+      );
+      for (const [index, row] of batch.entries()) {
+        if (eligibility[index]) pending.push(row);
+      }
+    }
     const refreshed: ObservedFollowerHolding[] = [];
     for (let offset = 0; offset < pending.length; offset += 8) {
       const batch = pending.slice(offset, offset + 8);
@@ -837,6 +873,13 @@ async function main() {
   }
 
   async function handleTransfer(ev: TransferEvent) {
+    if (!(await isEligibleFollowerRecipient(ev.to))) {
+      log.info(
+        { from: ev.from, to: ev.to, mint: ev.tokenMint, txSig: ev.txSig },
+        "program-controlled or off-curve transfer recipient excluded from follower monitoring",
+      );
+      return;
+    }
     const ctx = monitor.activeForMint(ev.tokenMint);
     if (!targetWallets.has(ev.from)) {
       if (ctx)
