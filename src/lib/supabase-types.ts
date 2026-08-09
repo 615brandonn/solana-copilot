@@ -118,6 +118,15 @@ export type WorkerHeartbeatRow = {
   funding_key_checked_at: string | null;
   funding_wallet_pubkey: string | null;
   last_error: string | null;
+  wallet_holdings: Array<{ token_mint: string; amount: number; decimals: number }>;
+  observed_follower_holdings: Array<{
+    token_mint: string;
+    wallet: string;
+    amount: number;
+    decimals: number;
+    source_target_count: number;
+    last_updated: string;
+  }>;
 };
 
 export type StrategyObservationRow = {

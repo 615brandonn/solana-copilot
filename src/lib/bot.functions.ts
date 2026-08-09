@@ -147,6 +147,17 @@ export const getPositions = createServerFn({ method: "GET" }).handler(async () =
   return data ?? [];
 });
 
+export const getWalletHoldings = createServerFn({ method: "GET" }).handler(async () => {
+  const db = adminClient();
+  const { data, error } = await (db as any)
+    .from("worker_heartbeat")
+    .select("wallet_holdings")
+    .eq("user_id", currentUserId())
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return Array.isArray(data?.wallet_holdings) ? data.wallet_holdings : [];
+});
+
 export const getFollowers = createServerFn({ method: "GET" }).handler(async () => {
   const db = adminClient();
   const { data: positionsRaw, error: posErr } = await db
@@ -156,27 +167,28 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
     .is("closed_at", null);
   if (posErr) throw new Error(posErr.message);
   const positions = (positionsRaw ?? []) as Array<{ id: string; token_mint: string }>;
-  if (positions.length === 0) return [];
-
   const posIds = positions.map((p) => p.id);
   const mintByPos = new Map(positions.map((p) => [p.id, p.token_mint]));
-
-  const { data: fwsRaw, error: fwErr } = await (db as any)
-    .from("follower_wallets")
-    .select("wallet, position_id, initial_amount, current_amount, hop_depth, last_updated")
-    .in("position_id", posIds)
-    .order("last_updated", { ascending: false });
-  if (fwErr) throw new Error(fwErr.message);
-  const fws = (fwsRaw ?? []) as Array<{
+  type ManagedFollower = {
     wallet: string;
     position_id: string;
     initial_amount: number | string;
     current_amount: number | string;
     hop_depth: number | null;
     last_updated: string;
-  }>;
+  };
+  let fws: ManagedFollower[] = [];
+  if (posIds.length > 0) {
+    const { data: fwsRaw, error: fwErr } = await (db as any)
+      .from("follower_wallets")
+      .select("wallet, position_id, initial_amount, current_amount, hop_depth, last_updated")
+      .in("position_id", posIds)
+      .order("last_updated", { ascending: false });
+    if (fwErr) throw new Error(fwErr.message);
+    fws = (fwsRaw ?? []) as ManagedFollower[];
+  }
 
-  return fws.map((f) => {
+  const managed = fws.map((f) => {
     const initial = Number(f.initial_amount) || 0;
     const current = Number(f.current_amount) || 0;
     const heldPct = initial > 0 ? Math.max(0, Math.min(100, (current / initial) * 100)) : 0;
@@ -188,8 +200,36 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
       held_pct: heldPct,
       hop_depth: Math.max(1, Math.min(3, Number(f.hop_depth ?? 1))),
       last_updated: f.last_updated,
+      observed_only: false,
+      source_target_count: null,
     };
   });
+
+  const { data: heartbeat, error: observedError } = await (db as any)
+    .from("worker_heartbeat")
+    .select("observed_follower_holdings")
+    .eq("user_id", currentUserId())
+    .maybeSingle();
+  if (observedError) throw new Error(observedError.message);
+  const managedKeys = new Set(managed.map((f) => `${f.token_mint}:${f.wallet}`));
+  const observedRows = Array.isArray(heartbeat?.observed_follower_holdings)
+    ? heartbeat.observed_follower_holdings
+    : [];
+  const observed = observedRows
+    .filter((row) => !managedKeys.has(`${row.token_mint}:${row.wallet}`))
+    .map((row) => ({
+      wallet: row.wallet,
+      position_id: null,
+      token_mint: row.token_mint,
+      current_amount: Math.max(0, Number(row.amount ?? 0)),
+      held_pct: null,
+      hop_depth: 1,
+      last_updated: row.last_updated,
+      observed_only: true,
+      source_target_count: Math.max(1, Number(row.source_target_count ?? 1)),
+    }));
+
+  return [...managed, ...observed];
 });
 
 export const getStrategyInsights = createServerFn({ method: "GET" }).handler(async () => {

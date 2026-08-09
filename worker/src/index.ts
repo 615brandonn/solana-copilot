@@ -3,7 +3,7 @@
 
 import pino from "pino";
 import { randomUUID } from "node:crypto";
-import { Connection, Keypair } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import { env } from "./env.js";
 import { db, type BotConfigRow } from "./db.js";
@@ -25,7 +25,9 @@ import {
 import { isFlatPosition, proportionalMirrorSell } from "./follower-math.js";
 import { safeDiagnostic } from "./diagnostics.js";
 import {
-  positiveTokenMints,
+  groupObservedFollowerTransfers,
+  walletTokenHoldings,
+  type WalletTokenHolding,
   ZeroBalanceConfirmationTracker,
 } from "./position-reconciliation.js";
 
@@ -230,6 +232,16 @@ async function main() {
   }
 
   const zeroBalanceTracker = new ZeroBalanceConfirmationTracker();
+  let latestWalletHoldings: WalletTokenHolding[] = [];
+  type ObservedFollowerHolding = {
+    token_mint: string;
+    wallet: string;
+    amount: number;
+    decimals: number;
+    source_target_count: number;
+    last_updated: string;
+  };
+  let latestObservedFollowerHoldings: ObservedFollowerHolding[] = [];
 
   async function reconcileFlatWalletPositions() {
     if (!fundingReadiness.ready || !fundingReadiness.walletPubkey) return;
@@ -241,7 +253,8 @@ async function main() {
     if (error) throw new Error(`position reconciliation query failed: ${safeDiagnostic(error)}`);
 
     // Only a successful RPC snapshot advances the two-observation guard.
-    const positiveMints = await positiveTokenMints(rpc, fundingReadiness.walletPubkey);
+    latestWalletHoldings = await walletTokenHoldings(rpc, fundingReadiness.walletPubkey);
+    const positiveMints = new Set(latestWalletHoldings.map((row) => row.token_mint));
     const confirmedFlat = zeroBalanceTracker.observe(positions ?? [], positiveMints);
     if (confirmedFlat.length === 0) return;
 
@@ -262,6 +275,81 @@ async function main() {
       { closedPositionCount: confirmedFlat.length },
       "closed positions confirmed flat by consecutive wallet snapshots",
     );
+  }
+
+  async function refreshObservedFollowerHoldings() {
+    if (latestWalletHoldings.length === 0) {
+      latestObservedFollowerHoldings = [];
+      return;
+    }
+    const heldMints = latestWalletHoldings.map((row) => row.token_mint);
+    const targets = Array.from(targetWallets);
+    const transfers: Array<{
+      token_mint: string;
+      to_wallet: string | null;
+      from_wallet: string | null;
+      event_at: string;
+    }> = [];
+    for (const tokenMint of heldMints) {
+      for (const targetWallet of targets) {
+        const rows = await retryDb<typeof transfers>(
+          "load observed follower transfers",
+          async () => {
+            const result = await db
+              .from("strategy_observations")
+              .select("token_mint,to_wallet,from_wallet,event_at")
+              .eq("user_id", cfg.user_id)
+              .eq("token_mint", tokenMint)
+              .eq("from_wallet", targetWallet)
+              .eq("relationship", "target")
+              .eq("event_kind", "transfer")
+              .not("to_wallet", "is", null)
+              .limit(500);
+            return {
+              data: (result.data ?? []) as typeof transfers,
+              error: result.error,
+            };
+          },
+        );
+        transfers.push(...rows);
+      }
+    }
+
+    const pending = groupObservedFollowerTransfers(transfers, new Set(targets));
+    const refreshed: ObservedFollowerHolding[] = [];
+    for (let offset = 0; offset < pending.length; offset += 8) {
+      const batch = pending.slice(offset, offset + 8);
+      const results = await Promise.allSettled(
+        batch.map(async (row) => {
+          const accounts = await rpc.getParsedTokenAccountsByOwner(
+            new PublicKey(row.wallet),
+            { mint: new PublicKey(row.tokenMint) },
+            "confirmed",
+          );
+          let amount = 0;
+          let decimals = 0;
+          for (const account of accounts.value) {
+            const info = account.account.data.parsed.info as {
+              tokenAmount: { decimals?: number; uiAmountString?: string };
+            };
+            amount += Number(info.tokenAmount.uiAmountString ?? 0);
+            decimals = Number(info.tokenAmount.decimals ?? decimals);
+          }
+          return {
+            token_mint: row.tokenMint,
+            wallet: row.wallet,
+            amount: Math.max(0, amount),
+            decimals,
+            source_target_count: row.sourceTargets.length,
+            last_updated: new Date().toISOString(),
+          } satisfies ObservedFollowerHolding;
+        }),
+      );
+      for (const result of results) {
+        if (result.status === "fulfilled") refreshed.push(result.value);
+      }
+    }
+    latestObservedFollowerHoldings = refreshed;
   }
 
   // Rehydrate any positions still open from a previous worker run so we keep
@@ -352,6 +440,8 @@ async function main() {
       funding_key_checked_at: fundingReadiness.checkedAt,
       funding_wallet_pubkey: fundingReadiness.walletPubkey,
       last_error: fundingReadiness.error,
+      wallet_holdings: latestWalletHoldings,
+      observed_follower_holdings: latestObservedFollowerHoldings,
     };
     let { error } = await db
       .from("worker_heartbeat")
@@ -371,6 +461,9 @@ async function main() {
       throw new Error(`worker_heartbeat upsert failed: ${safeDiagnostic(error.message)}`);
   }
 
+  await reconcileFlatWalletPositions().catch((err) =>
+    log.error({ err: safeDiagnostic(err) }, "position reconciliation failed"),
+  );
   await writeWorkerHeartbeat().catch((err) => log.error({ err }, "database heartbeat failed"));
   setInterval(() => {
     writeWorkerHeartbeat().catch((err) => log.error({ err }, "database heartbeat failed"));
@@ -382,13 +475,15 @@ async function main() {
       })
       .catch((err) => log.error({ err }, "funding readiness refresh failed"));
   }, 60_000);
-  reconcileFlatWalletPositions().catch((err) =>
-    log.error({ err: safeDiagnostic(err) }, "position reconciliation failed"),
+  refreshObservedFollowerHoldings().catch((err) =>
+    log.error({ err: safeDiagnostic(err) }, "observed follower holdings refresh failed"),
   );
   setInterval(() => {
-    reconcileFlatWalletPositions().catch((err) =>
-      log.error({ err: safeDiagnostic(err) }, "position reconciliation failed"),
-    );
+    reconcileFlatWalletPositions()
+      .then(() => refreshObservedFollowerHoldings())
+      .catch((err) =>
+        log.error({ err: safeDiagnostic(err) }, "wallet holdings refresh failed"),
+      );
   }, 60_000);
 
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
