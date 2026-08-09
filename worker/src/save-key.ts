@@ -70,7 +70,7 @@ async function loadConfig(): Promise<BotConfigRow | null> {
   const row = any.data?.[0] as BotConfigRow | undefined;
   if (row) {
     throw new Error(
-      `HELIX_USER_ID mismatch: worker requested ${env.HELIX_USER_ID}, but the configured dashboard row uses ${row.user_id}`,
+      "HELIX_USER_ID mismatch: worker identity does not match the configured dashboard row",
     );
   }
   return null;

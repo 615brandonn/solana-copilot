@@ -20,6 +20,10 @@ export const db = createClient(
       fetch: (input, init) => {
         const headers = new Headers(init?.headers);
         headers.set("apikey", env.BOT_SUPABASE_SERVICE_ROLE_KEY);
+        const timeoutSignal = AbortSignal.timeout(5_000);
+        const signal = init?.signal
+          ? AbortSignal.any([init.signal, timeoutSignal])
+          : timeoutSignal;
 
         // New-format sb_secret_* keys are opaque, not JWTs. PostgREST accepts
         // them as apikey, but not as an Authorization bearer token.
@@ -32,7 +36,7 @@ export const db = createClient(
 
         return fetch(
           input as Parameters<typeof fetch>[0],
-          { ...init, headers } as Parameters<typeof fetch>[1],
+          { ...init, headers, signal } as Parameters<typeof fetch>[1],
         ) as unknown as Promise<Response>;
       },
     },

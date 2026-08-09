@@ -7,6 +7,7 @@ import { decryptPrivateKey } from "./crypto.js";
 import { decodeParsedTransaction } from "./poller.js";
 import { fetch } from "undici";
 import { parseJupiterPrice } from "./price-parser.js";
+import { redactedIdentifier, safeDiagnostic } from "./diagnostics.js";
 
 const WSOL = "So11111111111111111111111111111111111111112";
 const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -95,40 +96,47 @@ function checkJitoTipAccounts() {
 
 async function loadConfig(): Promise<BotConfigRow | null> {
   let lastError = "unknown database error";
-  for (let attempt = 1; attempt <= 4; attempt += 1) {
-    const byUser = await db
-      .from("bot_config")
-      .select("*")
-      .eq("user_id", env.HELIX_USER_ID)
-      .maybeSingle();
-    if (!byUser.error) {
-      if (byUser.data) return byUser.data as BotConfigRow;
-      const any = await db
+  const attempts = 2;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const byUser = await db
         .from("bot_config")
         .select("*")
-        .not("target_wallet", "is", null)
-        .neq("target_wallet", "")
-        .order("updated_at", { ascending: false })
-        .limit(1);
-      if (!any.error) {
-        const row = any.data?.[0] as BotConfigRow | undefined;
-        if (row) {
-          throw new Error(
-            `HELIX_USER_ID mismatch: worker requested ${env.HELIX_USER_ID}, but the configured dashboard row uses ${row.user_id}`,
-          );
+        .eq("user_id", env.HELIX_USER_ID)
+        .maybeSingle();
+      if (!byUser.error) {
+        if (byUser.data) return byUser.data as BotConfigRow;
+        const any = await db
+          .from("bot_config")
+          .select("*")
+          .not("target_wallet", "is", null)
+          .neq("target_wallet", "")
+          .order("updated_at", { ascending: false })
+          .limit(1);
+        if (!any.error) {
+          const row = any.data?.[0] as BotConfigRow | undefined;
+          if (row) {
+            throw new Error(
+              "HELIX_USER_ID mismatch: worker identity does not match the configured dashboard row",
+            );
+          }
+          return null;
         }
-        return null;
+        lastError = safeDiagnostic(any.error.message);
+      } else {
+        lastError = safeDiagnostic(byUser.error.message);
       }
-      lastError = any.error.message;
-    } else {
-      lastError = byUser.error.message;
+    } catch (err) {
+      const message = safeDiagnostic(err);
+      if (message.startsWith("HELIX_USER_ID mismatch")) throw err;
+      lastError = message;
     }
-    if (attempt < 4) {
-      line("Database retry", `attempt ${attempt}/4 failed; retrying in ${attempt}s`);
+    if (attempt < attempts) {
+      line("Database retry", `attempt ${attempt}/${attempts} failed; retrying in ${attempt}s`);
       await delay(attempt * 1000);
     }
   }
-  throw new Error(`bot_config query failed after 4 attempts: ${lastError}`);
+  throw new Error(`bot_config query failed after ${attempts} attempts: ${lastError}`);
 }
 
 async function loadFundingKey(userId: string) {
@@ -295,7 +303,7 @@ function inferBuyTransferredOut(
 
 async function main() {
   console.log("\nHelix Doctor — copy-trading pipeline check\n");
-  line("HELIX_USER_ID", env.HELIX_USER_ID);
+  line("HELIX_USER_ID", redactedIdentifier(env.HELIX_USER_ID));
   line("RPC_URL host", new URL(env.RPC_URL).host);
   line("YELLOWSTONE_GRPC_URL host", new URL(env.YELLOWSTONE_GRPC_URL).host);
   line("YELLOWSTONE_TOKEN set", env.YELLOWSTONE_TOKEN ? "yes" : "no");
@@ -312,8 +320,8 @@ async function main() {
     new Set([cfg.target_wallet ?? "", ...(cfg.additional_target_wallets ?? [])].filter(Boolean)),
   );
   pass("Config row", {
-    user_id: cfg.user_id,
-    target_wallets: targets,
+    user_id: redactedIdentifier(cfg.user_id),
+    target_wallet_count: targets.length,
     entries_enabled: cfg.enabled,
   });
   if (cfg.execution_route === "jito") checkJitoTipAccounts();
