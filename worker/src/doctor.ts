@@ -445,7 +445,7 @@ async function main() {
   const { data: heartbeat, error: heartbeatError } = await db
     .from("worker_heartbeat")
     .select(
-      "updated_at,geyser_connected,decoded_event_count,funding_key_ready,funding_key_checked_at,last_error",
+      "updated_at,geyser_connected,decoded_event_count,funding_key_ready,funding_key_checked_at,last_error,wallet_holdings,observed_follower_holdings",
     )
     .eq("user_id", cfg.user_id)
     .maybeSingle();
@@ -465,6 +465,12 @@ async function main() {
       fundingKeyReady: heartbeat.funding_key_ready,
       fundingKeyCheckedAt: heartbeat.funding_key_checked_at,
       lastError: heartbeat.last_error,
+      walletHoldingCount: Array.isArray(heartbeat.wallet_holdings)
+        ? heartbeat.wallet_holdings.length
+        : 0,
+      observedFollowerHoldingCount: Array.isArray(heartbeat.observed_follower_holdings)
+        ? heartbeat.observed_follower_holdings.length
+        : 0,
     };
     if (ageSeconds <= 45) pass("Worker heartbeat", heartbeatDetails);
     else fail("Worker heartbeat", heartbeatDetails);

@@ -1,18 +1,32 @@
 import { useQuery } from "@tanstack/react-query";
 import { Coins, ExternalLink, Users } from "lucide-react";
-import { getFollowers, getPositions } from "@/lib/bot.functions";
+import { getFollowers, getPositions, getWalletHoldings } from "@/lib/bot.functions";
 import type { PositionRow } from "@/lib/supabase-types";
 import { SectionCard } from "./SettingRow";
 
 type Follower = {
   wallet: string;
-  position_id: string;
+  position_id: string | null;
   token_mint: string;
   current_amount: number;
-  held_pct: number;
+  held_pct: number | null;
   hop_depth: number;
   last_updated: string;
+  observed_only: boolean;
+  source_target_count: number | null;
 };
+
+type WalletHolding = {
+  token_mint: string;
+  amount: number;
+  decimals: number;
+};
+
+const FUNDING_ASSET_MINTS = new Set([
+  "So11111111111111111111111111111111111111112",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "Es9vMFrzaCERmJfrF4H2FYD4KCo24RDUuUuJZq8bn6T",
+]);
 
 function short(address: string) {
   return address.length > 12 ? `${address.slice(0, 6)}…${address.slice(-6)}` : address;
@@ -41,15 +55,35 @@ export function PositionFollowers() {
     refetchInterval: 3000,
     refetchOnWindowFocus: true,
   });
+  const holdingsQ = useQuery({
+    queryKey: ["wallet-holdings"],
+    queryFn: () => getWalletHoldings(),
+    refetchInterval: 15_000,
+    refetchOnWindowFocus: true,
+  });
 
   const positions = (positionsQ.data ?? []) as PositionRow[];
   const followers = (followersQ.data ?? []) as Follower[];
-  const error = positionsQ.error ?? followersQ.error;
+  const holdings = ((holdingsQ.data ?? []) as WalletHolding[]).filter(
+    (holding) => !FUNDING_ASSET_MINTS.has(holding.token_mint),
+  );
+  const positionByMint = new Map(positions.map((position) => [position.token_mint, position]));
+  const holdingMints = new Set(holdings.map((holding) => holding.token_mint));
+  const rows = [
+    ...holdings.map((holding) => ({ holding, position: positionByMint.get(holding.token_mint) })),
+    ...positions
+      .filter((position) => !holdingMints.has(position.token_mint))
+      .map((position) => ({
+        holding: { token_mint: position.token_mint, amount: 0, decimals: 0 },
+        position,
+      })),
+  ].sort((a, b) => Number(Boolean(b.position)) - Number(Boolean(a.position)));
+  const error = positionsQ.error ?? followersQ.error ?? holdingsQ.error;
 
   return (
     <SectionCard
-      title="My positions & followers"
-      description="Coins managed by Helix, with the follower wallets attached to each position."
+      title="Wallet holdings & followers"
+      description="Every non-funding coin in your wallet, clearly separated into Helix-managed and wallet-only holdings."
       icon={<Coins className="h-4 w-4" />}
     >
       {error && (
@@ -57,31 +91,43 @@ export function PositionFollowers() {
           {error instanceof Error ? error.message : "Failed to load positions"}
         </p>
       )}
-      {positions.length === 0 ? (
+      {rows.length === 0 ? (
         <p className="py-6 text-center text-xs text-muted-foreground">
-          {positionsQ.isLoading ? "Loading…" : "No active Helix positions."}
+          {positionsQ.isLoading || holdingsQ.isLoading ? "Loading…" : "No token holdings found."}
         </p>
       ) : (
         <div className="space-y-3 pt-3">
-          {positions.map((position) => {
-            const attached = followers.filter((follower) => follower.position_id === position.id);
-            const cost = usd(Number(position.bot_cost_basis_usd));
+          {rows.map(({ holding, position }) => {
+            const attached = position
+              ? followers.filter(
+                  (follower) => follower.position_id === position.id && !follower.observed_only,
+                )
+              : followers.filter(
+                  (follower) =>
+                    follower.token_mint === holding.token_mint && follower.observed_only,
+                );
+            const cost = position ? usd(Number(position.bot_cost_basis_usd)) : null;
+            const managed = Boolean(position);
             return (
               <article
-                key={position.id}
+                key={holding.token_mint}
                 className="rounded-xl border border-border/70 bg-card/40 p-4"
               >
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="mono text-sm font-semibold" title={position.token_mint}>
-                        {short(position.token_mint)}
+                      <span className="mono text-sm font-semibold" title={holding.token_mint}>
+                        {short(holding.token_mint)}
                       </span>
-                      <span className="rounded-md bg-primary/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-primary">
-                        {position.entry_mode ?? "regular"}
+                      <span
+                        className={`rounded-md px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${managed ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"}`}
+                      >
+                        {managed
+                          ? `Helix managed · ${position?.entry_mode ?? "regular"}`
+                          : "Wallet only"}
                       </span>
                       <a
-                        href={`https://solscan.io/token/${position.token_mint}`}
+                        href={`https://solscan.io/token/${holding.token_mint}`}
                         target="_blank"
                         rel="noreferrer"
                         className="inline-flex items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-primary"
@@ -90,10 +136,17 @@ export function PositionFollowers() {
                       </a>
                     </div>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      Remaining:{" "}
-                      <span className="mono text-foreground">
-                        {amount(Number(position.amount_remaining))}
-                      </span>
+                      Wallet balance:{" "}
+                      <span className="mono text-foreground">{amount(holding.amount)}</span>
+                      {position ? (
+                        <span>
+                          {" "}
+                          · Helix remaining:{" "}
+                          <span className="mono text-foreground">
+                            {amount(Number(position.amount_remaining))}
+                          </span>
+                        </span>
+                      ) : null}
                       {cost ? (
                         <span>
                           {" "}
@@ -102,15 +155,22 @@ export function PositionFollowers() {
                       ) : null}
                     </p>
                   </div>
-                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                    <Users className="h-3.5 w-3.5" />
-                    <span>
-                      {attached.length} follower{attached.length === 1 ? "" : "s"}
-                    </span>
-                  </div>
+                  {attached.length > 0 ? (
+                    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <Users className="h-3.5 w-3.5" />
+                      <span>
+                        {attached.length} follower{attached.length === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                  ) : null}
                 </div>
 
-                {attached.length === 0 ? (
+                {!managed && attached.length === 0 ? (
+                  <p className="mt-3 rounded-lg border border-dashed border-border/60 px-3 py-3 text-xs text-muted-foreground">
+                    Wallet-only holding. No observed target recipients yet; Helix exits are not
+                    active for this coin.
+                  </p>
+                ) : attached.length === 0 ? (
                   <p className="mt-3 rounded-lg border border-dashed border-border/60 px-3 py-3 text-xs text-muted-foreground">
                     No follower wallets have received this coin yet.
                   </p>
@@ -118,7 +178,7 @@ export function PositionFollowers() {
                   <ul className="mt-3 grid gap-2 sm:grid-cols-2">
                     {attached.map((follower) => (
                       <li
-                        key={`${position.id}-${follower.wallet}`}
+                        key={`${position?.id}-${follower.wallet}`}
                         className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-background/30 px-3 py-2"
                       >
                         <div className="min-w-0">
@@ -126,15 +186,23 @@ export function PositionFollowers() {
                             {short(follower.wallet)}
                           </div>
                           <div className="text-[10px] text-muted-foreground">
-                            hop {follower.hop_depth} · {amount(Number(follower.current_amount))}{" "}
-                            tokens
+                            {follower.observed_only
+                              ? `live remaining · ${follower.source_target_count ?? 1} target source${follower.source_target_count === 1 ? "" : "s"}`
+                              : `hop ${follower.hop_depth}`}{" "}
+                            · {amount(Number(follower.current_amount))} tokens
                           </div>
                         </div>
-                        <span
-                          className={`mono shrink-0 text-xs ${follower.held_pct > 0 ? "text-success" : "text-muted-foreground"}`}
-                        >
-                          {follower.held_pct.toFixed(0)}%
-                        </span>
+                        {follower.held_pct === null ? (
+                          <span className="shrink-0 text-[10px] uppercase tracking-wider text-muted-foreground">
+                            observed
+                          </span>
+                        ) : (
+                          <span
+                            className={`mono shrink-0 text-xs ${follower.held_pct > 0 ? "text-success" : "text-muted-foreground"}`}
+                          >
+                            {follower.held_pct.toFixed(0)}%
+                          </span>
+                        )}
                       </li>
                     ))}
                   </ul>
