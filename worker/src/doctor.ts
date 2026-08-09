@@ -338,8 +338,25 @@ async function main() {
     return;
   }
 
+  if (
+    cfg.follower_seller_exit_enabled === undefined ||
+    cfg.follower_seller_exit_count === undefined ||
+    cfg.follower_seller_exit_pct === undefined ||
+    cfg.target_inactivity_exit_enabled === undefined ||
+    cfg.target_inactivity_hours === undefined
+  ) {
+    fail(
+      "Main-mode exit migration",
+      "missing — run supabase/main-mode-exits-migration.sql before deploying this worker",
+    );
+    return;
+  }
+
   const schemaChecks = await Promise.all([
-    db.from("positions").select("entry_mode,coordinated_exit_triggered").limit(1),
+    db
+      .from("positions")
+      .select("entry_mode,coordinated_exit_triggered,follower_seller_exit_triggered")
+      .limit(1),
     db.from("follower_wallets").select("first_sell_at,last_seen_signature,last_seen_slot").limit(1),
   ]);
   if (schemaChecks[0].error || schemaChecks[1].error) {
@@ -366,6 +383,11 @@ async function main() {
     only_first_buy_ever: cfg.only_first_buy_ever,
     only_once_per_token: cfg.only_once_per_token,
     execution_route: cfg.execution_route,
+    follower_seller_exit_enabled: cfg.follower_seller_exit_enabled,
+    follower_seller_exit_count: cfg.follower_seller_exit_count,
+    follower_seller_exit_pct: cfg.follower_seller_exit_pct,
+    target_inactivity_exit_enabled: cfg.target_inactivity_exit_enabled,
+    target_inactivity_hours: cfg.target_inactivity_hours,
   });
 
   line("Coordinated-wallet settings", {

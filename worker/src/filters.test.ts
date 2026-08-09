@@ -48,6 +48,11 @@ const config: BotConfigRow = {
   stop_loss_enabled: true,
   stop_loss_pct: 30,
   proportional_follower_sells: true,
+  follower_seller_exit_enabled: false,
+  follower_seller_exit_count: 1,
+  follower_seller_exit_pct: 100,
+  target_inactivity_exit_enabled: false,
+  target_inactivity_hours: 6,
 };
 
 const event: SwapEvent = {

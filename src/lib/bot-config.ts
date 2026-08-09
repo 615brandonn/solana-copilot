@@ -51,6 +51,11 @@ export type BotConfig = {
   stopLossEnabled: boolean;
   stopLossPct: number; // e.g. 30 = -30%
   proportionalFollowerSells: boolean;
+  followerSellerExitEnabled: boolean;
+  followerSellerExitCount: number;
+  followerSellerExitPct: number;
+  targetInactivityExitEnabled: boolean;
+  targetInactivityHours: number;
 };
 
 export const DEFAULT_CONFIG: BotConfig = {
@@ -106,6 +111,11 @@ export const DEFAULT_CONFIG: BotConfig = {
   stopLossEnabled: true,
   stopLossPct: 30,
   proportionalFollowerSells: true,
+  followerSellerExitEnabled: false,
+  followerSellerExitCount: 1,
+  followerSellerExitPct: 100,
+  targetInactivityExitEnabled: false,
+  targetInactivityHours: 6,
 };
 
 const KEY = "helix.bot.config.v1";

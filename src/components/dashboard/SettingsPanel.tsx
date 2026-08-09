@@ -627,6 +627,66 @@ export function SettingsPanel({ cfg, onChange }: Props) {
               onCheckedChange={(v) => onChange({ proportionalFollowerSells: v })}
             />
           </SettingRow>
+          <SettingRow
+            label="Distinct follower-seller exit"
+            hint="For main-mode positions, trigger one exit after this many different tracked follower wallets sell. Repeated sells by one wallet count once."
+          >
+            <Switch
+              checked={cfg.followerSellerExitEnabled}
+              onCheckedChange={(v) => onChange({ followerSellerExitEnabled: v })}
+            />
+          </SettingRow>
+          {cfg.followerSellerExitEnabled && (
+            <SettingRow
+              label="Follower-seller trigger"
+              hint="Choose the distinct-wallet count and the percentage of your remaining position to sell."
+            >
+              <div className="flex items-center gap-2 mono text-xs">
+                <NumInput
+                  value={cfg.followerSellerExitCount}
+                  onChange={(n) =>
+                    onChange({ followerSellerExitCount: Math.max(1, Math.round(n)) })
+                  }
+                  suffix="wallets"
+                  min={1}
+                />
+                <span className="text-muted-foreground">sell</span>
+                <NumInput
+                  value={cfg.followerSellerExitPct}
+                  onChange={(n) => onChange({ followerSellerExitPct: n })}
+                  suffix="%"
+                  min={0.01}
+                  max={100}
+                />
+              </div>
+            </SettingRow>
+          )}
+          <SettingRow
+            label="Target inactivity exit"
+            hint="For main-mode positions, sell 100% when none of the configured target wallets buys that coin again within the selected time."
+          >
+            <Switch
+              checked={cfg.targetInactivityExitEnabled}
+              onCheckedChange={(v) => onChange({ targetInactivityExitEnabled: v })}
+            />
+          </SettingRow>
+          {cfg.targetInactivityExitEnabled && (
+            <SettingRow
+              label="Inactivity window"
+              hint="The timer starts again after every observed target-wallet buy of the coin."
+            >
+              <div className="flex items-center gap-2">
+                <Clock3 className="h-4 w-4 text-muted-foreground" />
+                <NumInput
+                  value={cfg.targetInactivityHours}
+                  onChange={(n) => onChange({ targetInactivityHours: n })}
+                  suffix="hr"
+                  step={0.25}
+                  min={0.05}
+                />
+              </div>
+            </SettingRow>
+          )}
         </SectionCard>
       </fieldset>
     </div>

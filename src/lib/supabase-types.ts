@@ -55,6 +55,11 @@ export type BotConfigRow = {
   stop_loss_enabled: boolean;
   stop_loss_pct: number;
   proportional_follower_sells: boolean;
+  follower_seller_exit_enabled: boolean;
+  follower_seller_exit_count: number;
+  follower_seller_exit_pct: number;
+  target_inactivity_exit_enabled: boolean;
+  target_inactivity_hours: number;
   updated_at: string;
 };
 
@@ -77,6 +82,7 @@ export type PositionRow = {
   last_root_buy_wallet: string | null;
   entry_mode: "regular" | "coordinated";
   coordinated_exit_triggered: boolean;
+  follower_seller_exit_triggered: boolean;
 };
 
 export type TradeRow = {
