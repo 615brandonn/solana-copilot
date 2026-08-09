@@ -1,4 +1,4 @@
-import { PublicKey, type Connection } from "@solana/web3.js";
+import { PublicKey, SystemProgram, type Connection } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 export type OpenPositionBalance = {
@@ -17,6 +17,19 @@ export type ObservedFollowerTransferGroup = {
   wallet: string;
   sourceTargets: string[];
 };
+
+export function isEligibleFollowerWallet(
+  address: string,
+  ownerProgram: string | null,
+): boolean {
+  try {
+    const publicKey = new PublicKey(address);
+    if (!PublicKey.isOnCurve(publicKey.toBytes())) return false;
+    return ownerProgram === null || ownerProgram === SystemProgram.programId.toBase58();
+  } catch {
+    return false;
+  }
+}
 
 export function groupObservedFollowerTransfers(
   transfers: Array<{ token_mint: string; to_wallet: string | null; from_wallet: string | null }>,

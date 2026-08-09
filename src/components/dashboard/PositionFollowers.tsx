@@ -191,14 +191,14 @@ export function PositionFollowers() {
                   </p>
                 ) : (
                   <ul className="mt-3 grid gap-2 sm:grid-cols-2">
-                    {attached.map((follower) => (
+                    {attached.map((follower, followerIndex) => (
                       <li
                         key={`${position?.id}-${follower.wallet}`}
                         className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-background/30 px-3 py-2"
                       >
                         <div className="min-w-0">
                           <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                            Follower wallet
+                            Follower wallet {followerIndex + 1} of {attached.length}
                           </div>
                           <a
                             href={"https://solscan.io/account/" + follower.wallet}
@@ -211,11 +211,11 @@ export function PositionFollowers() {
                           </a>
                           <div className="text-[10px] text-muted-foreground">
                             {follower.observed_only
-                              ? `live remaining · ${follower.source_target_count ?? 1} target source${follower.source_target_count === 1 ? "" : "s"}`
+                              ? "Observed from target-wallet transfers"
                               : `hop ${follower.hop_depth}`}{" "}
                           </div>
                           <div className="mt-1 text-[10px] text-muted-foreground">
-                            Current holding:{" "}
+                            This wallet's live balance:{" "}
                             <span className="mono font-medium text-foreground">
                               {amount(Number(follower.current_amount))} tokens
                             </span>

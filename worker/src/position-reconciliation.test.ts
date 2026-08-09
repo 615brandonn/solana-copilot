@@ -3,8 +3,10 @@ import test from "node:test";
 import {
   aggregateWalletTokenHoldings,
   groupObservedFollowerTransfers,
+  isEligibleFollowerWallet,
   ZeroBalanceConfirmationTracker,
 } from "./position-reconciliation.js";
+import { PublicKey } from "@solana/web3.js";
 
 const positions = [
   { id: "held", token_mint: "mint-held" },
@@ -63,4 +65,19 @@ test("groups direct follower recipients across configured target wallets", () =>
       sourceTargets: ["target-a", "target-b"],
     },
   ]);
+});
+
+test("accepts normal wallets and rejects program-controlled pool recipients", () => {
+  const normalWallet = "4BDAuaLKXVjZn65haQ3Sr6xWd1HuoPns4qVvaB7yFTBt";
+  const pumpAmmPool = "HXHTLcG2Zqu9zYC4Uye1rx7vHepXQ4UAga6N7ShSou45";
+  const pumpAmmProgram = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+  const [offCurve] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool-recipient")],
+    new PublicKey(pumpAmmProgram),
+  );
+
+  assert.equal(isEligibleFollowerWallet(normalWallet, null), true);
+  assert.equal(isEligibleFollowerWallet(normalWallet, "11111111111111111111111111111111"), true);
+  assert.equal(isEligibleFollowerWallet(pumpAmmPool, pumpAmmProgram), false);
+  assert.equal(isEligibleFollowerWallet(offCurve.toBase58(), null), false);
 });
