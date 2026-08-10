@@ -1,0 +1,123 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { Keypair, PublicKey } from "@solana/web3.js";
+
+import {
+  attributeVerifiedBuy,
+  conservativeNativeSolSpend,
+  hasWalletSpecificSpend,
+  isOnCurveWallet,
+  parseRawTokenAmount,
+  USDC_MINT,
+  verifiedSpendForOutput,
+  type WalletTokenDelta,
+} from "./swap-attribution.js";
+
+const INPUT_MINT = "input-mint";
+const OUTPUT_MINT = "output-mint";
+
+function row(
+  mint: string,
+  pre: number,
+  post: number,
+  decimals = 6,
+  rawExact = true,
+): WalletTokenDelta {
+  const scale = 10 ** decimals;
+  return {
+    mint,
+    pre,
+    post,
+    decimals,
+    preRaw: BigInt(Math.round(pre * scale)),
+    postRaw: BigInt(Math.round(post * scale)),
+    rawExact,
+  };
+}
+
+test("attributes one stablecoin input to one output", () => {
+  assert.deepEqual(
+    verifiedSpendForOutput([row(USDC_MINT, 100, 40), row(OUTPUT_MINT, 0, 1_000)], OUTPUT_MINT, 1),
+    { amountUsd: 60 },
+  );
+});
+
+test("preserves an exact non-stable input amount for quote-only valuation", () => {
+  assert.deepEqual(
+    verifiedSpendForOutput([row(INPUT_MINT, 25, 5), row(OUTPUT_MINT, 0, 1_000)], OUTPUT_MINT, 1),
+    {
+      spentToken: {
+        mint: INPUT_MINT,
+        amountRaw: "20000000",
+        amountTokens: 20,
+        decimals: 6,
+      },
+    },
+  );
+});
+
+test("ambiguous inputs, outputs, and imprecise raw balances fail closed", () => {
+  const output = row(OUTPUT_MINT, 0, 1_000);
+  assert.deepEqual(
+    verifiedSpendForOutput([row("input-a", 10, 0), row("input-b", 10, 0), output], OUTPUT_MINT, 1),
+    {},
+  );
+  assert.deepEqual(verifiedSpendForOutput([row(INPUT_MINT, 10, 0), output], OUTPUT_MINT, 2), {});
+  assert.deepEqual(
+    verifiedSpendForOutput([row(INPUT_MINT, 10, 0, 6, false), output], OUTPUT_MINT, 1),
+    {},
+  );
+});
+
+test("only an unambiguous exact token or adjusted native-SOL input verifies a buy", () => {
+  const output = row(OUTPUT_MINT, 0, 1_000);
+  assert.equal(
+    attributeVerifiedBuy([row(INPUT_MINT, 10, 0), output], OUTPUT_MINT, 1, 0, true).verified,
+    true,
+  );
+  assert.deepEqual(attributeVerifiedBuy([output], OUTPUT_MINT, 1, 0.9, true), {
+    solSpend: 0.9,
+    verified: true,
+  });
+  assert.equal(attributeVerifiedBuy([output], OUTPUT_MINT, 1, 0.9, false).verified, false);
+  assert.equal(attributeVerifiedBuy([output], OUTPUT_MINT, 1, undefined, true).verified, false);
+  assert.equal(
+    attributeVerifiedBuy(
+      [row("input-a", 10, 0), row("input-b", 10, 0), output],
+      OUTPUT_MINT,
+      1,
+      0.9,
+      true,
+    ).verified,
+    false,
+  );
+});
+
+test("wallet-specific spend requires a debit, not a transaction-wide swap log", () => {
+  assert.equal(hasWalletSpecificSpend([row(INPUT_MINT, 0, 10)], 0), false);
+  assert.equal(hasWalletSpecificSpend([row(INPUT_MINT, 10, 0)], 0), true);
+  assert.equal(hasWalletSpecificSpend([], 0.9), true);
+  assert.equal(hasWalletSpecificSpend([], undefined), false);
+});
+
+test("native SOL spend removes fees and a fixed overhead cushion", () => {
+  assert.equal(conservativeNativeSolSpend(-1, 5_000, true), 0.994995);
+  assert.equal(conservativeNativeSolSpend(-0.004, 5_000, true), undefined);
+  assert.equal(conservativeNativeSolSpend(1, 5_000, true), undefined);
+});
+
+test("raw token parsing and on-curve recipient checks fail closed", () => {
+  assert.equal(parseRawTokenAmount("12345678901234567890"), 12345678901234567890n);
+  assert.equal(parseRawTokenAmount("1.2"), undefined);
+  assert.equal(parseRawTokenAmount(-1), undefined);
+  assert.equal(parseRawTokenAmount(Number.MAX_SAFE_INTEGER + 1), undefined);
+
+  const wallet = Keypair.generate().publicKey;
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool")],
+    Keypair.generate().publicKey,
+  );
+  assert.equal(isOnCurveWallet(wallet.toBase58()), true);
+  assert.equal(isOnCurveWallet(pda.toBase58()), false);
+  assert.equal(isOnCurveWallet("not-a-wallet"), false);
+});
