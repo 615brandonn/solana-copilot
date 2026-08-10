@@ -6,6 +6,9 @@ import { decodeParsedTransaction } from "./poller.js";
 import { checkEntry, loadTokenMeta } from "./filters.js";
 import type { SwapEvent, TransferEvent } from "./geyser.js";
 import { priceUsd } from "./prices.js";
+import { resolveTargetBuyValue } from "./target-buy-valuation.js";
+import { quoteTokenSpendUsd } from "./token-spend-quote.js";
+import { hasVerifiedSwapSignal } from "./swap-signal.js";
 
 const WSOL = "So11111111111111111111111111111111111111112";
 const rpc = new Connection(env.RPC_URL, { commitment: "confirmed" });
@@ -76,13 +79,13 @@ function tokenDeltasFor(tx: ParsedTransactionWithMeta, wallet: string) {
 }
 
 async function explainCandidate(cfg: BotConfigRow, event: SwapEvent) {
-  const solPrice = await priceUsd(WSOL);
-  const targetBuyUsd =
-    event.amountUsd ??
-    (solPrice !== undefined && Math.abs(event.solDelta) > 0.0005
-      ? Math.abs(event.solDelta) * solPrice
-      : undefined);
+  const valuation = await resolveTargetBuyValue(event, {
+    quoteTokenSpendUsd,
+    solPriceUsd: () => priceUsd(WSOL),
+  });
+  const targetBuyUsd = valuation.amountUsd;
   event.amountUsd = targetBuyUsd;
+  const solPrice = await priceUsd(WSOL);
 
   const meta = await loadTokenMeta(event.tokenMint);
   const { data: prior } = await db
@@ -111,6 +114,7 @@ async function explainCandidate(cfg: BotConfigRow, event: SwapEvent) {
     tokenMint: event.tokenMint,
     side: event.side,
     targetBuyUsd: targetBuyUsd === undefined ? "unknown" : Number(targetBuyUsd.toFixed(2)),
+    valuationSource: valuation.source,
     wouldPassFilters: decision.pass,
     filterReason: decision.pass ? null : decision.reason,
     tokenMeta: meta,
@@ -143,16 +147,7 @@ async function main() {
   if (!tx)
     throw new Error("RPC could not load that transaction. Check the signature or RPC provider.");
 
-  const logs = (tx.meta?.logMessages ?? []).map((line) => String(line).toLowerCase());
-  const swapSignal = logs.some(
-    (line) =>
-      line.includes("instruction: buy") ||
-      line.includes("instruction: sell") ||
-      line.includes("instruction: swap") ||
-      line.includes("instruction: route") ||
-      line.includes("sharedaccountsroute") ||
-      line.includes("exactoutroute"),
-  );
+  const swapSignal = hasVerifiedSwapSignal(tx.meta?.logMessages ?? []);
 
   const events = decodeParsedTransaction(cfg.target_wallet, tx);
   print("Raw target token deltas", tokenDeltasFor(tx, cfg.target_wallet));
@@ -178,11 +173,11 @@ async function main() {
 
   for (const event of targetBuys) await explainCandidate(cfg, event);
   for (const event of targetTransfers) {
-    print("Transfer fallback candidate", {
+    print("Outbound target transfer", {
       tokenMint: event.tokenMint,
       recipient: event.to,
       amountTokens: event.amountTokens,
-      note: "The live worker treats this as a fallback buy trigger if no position is already open for this mint.",
+      note: "This transfer is not an entry trigger without a separately verified swap. It is used for follower tracking only when a matching Helix position is open.",
     });
   }
 }

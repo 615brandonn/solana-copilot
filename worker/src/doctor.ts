@@ -8,6 +8,8 @@ import { decodeParsedTransaction } from "./poller.js";
 import { fetch } from "undici";
 import { parseJupiterPrice } from "./price-parser.js";
 import { redactedIdentifier, safeDiagnostic } from "./diagnostics.js";
+import { STABLECOIN_MINTS } from "./swap-attribution.js";
+import { hasVerifiedSwapSignal } from "./swap-signal.js";
 
 const WSOL = "So11111111111111111111111111111111111111112";
 const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -178,16 +180,7 @@ function analyzeTargetTx(tx: ParsedTransactionWithMeta, target: string) {
   const preLamports = targetIndex >= 0 ? Number(meta?.preBalances?.[targetIndex] ?? 0) : 0;
   const postLamports = targetIndex >= 0 ? Number(meta?.postBalances?.[targetIndex] ?? 0) : 0;
   const nativeSolDelta = (postLamports - preLamports) / 1e9;
-  const logs = (meta?.logMessages ?? []).map((v: unknown) => String(v).toLowerCase());
-  const swapSignal = logs.some(
-    (v: string) =>
-      v.includes("instruction: buy") ||
-      v.includes("instruction: sell") ||
-      v.includes("instruction: swap") ||
-      v.includes("instruction: route") ||
-      v.includes("sharedaccountsroute") ||
-      v.includes("exactoutroute"),
-  );
+  const swapSignal = hasVerifiedSwapSignal(meta?.logMessages ?? []);
 
   const rows = new Map<string, { mint: string; pre: number; post: number; decimals: number }>();
   const ingest = (balances: readonly TokenBalance[], field: "pre" | "post") => {
@@ -221,11 +214,9 @@ function analyzeTargetTx(tx: ParsedTransactionWithMeta, target: string) {
   const decodedTargetTransfers = decodedEvents.filter(
     (event) => event.kind === "transfer" && event.from === target,
   );
-  const wouldTriggerBuy =
-    deltas.some((row) => row.delta > 0) && (nativeSolDelta < -0.0005 || swapSignal);
-  const wouldTriggerFallbackTransfer =
-    deltas.some((row) => row.delta < 0) && !(Math.abs(nativeSolDelta) > 0.0005 || swapSignal);
-  const inferredBuy = inferBuyTransferredOut(meta, target, nativeSolDelta, swapSignal, deltas);
+  const entryCandidates = decodedTargetBuys.filter(
+    (event) => event.tokenMint !== WSOL && !STABLECOIN_MINTS.has(event.tokenMint),
+  );
 
   return {
     signature: tx?.transaction?.signatures?.[0],
@@ -233,72 +224,11 @@ function analyzeTargetTx(tx: ParsedTransactionWithMeta, target: string) {
     swapSignal,
     targetTokenDeltas: deltas,
     liveDecoderEvents: decodedEvents,
-    inferredSameTxBuy: inferredBuy,
-    wouldTriggerBuy,
-    wouldTriggerInferredBuy: !!inferredBuy,
-    wouldTriggerFallbackTransfer,
-    liveWorkerWouldCopyBuy: decodedTargetBuys.length > 0 || decodedTargetTransfers.length > 0,
+    decodedTargetBuyCandidateCount: entryCandidates.length,
+    decodedTargetTransferCount: decodedTargetTransfers.length,
+    liveWorkerEntryCandidate: entryCandidates.length > 0,
+    liveWorkerFeedEvent: decodedEvents.length > 0,
   };
-}
-
-function inferBuyTransferredOut(
-  meta: TransactionMeta | null,
-  target: string,
-  solDelta: number,
-  swapSignal: boolean,
-  targetDeltas: Array<{ mint: string; delta: number; decimals: number }>,
-) {
-  const likelySpentValue = solDelta < -0.0005 || (Math.abs(solDelta) <= 0.0005 && swapSignal);
-  if (!likelySpentValue) return null;
-
-  const alreadyPositive = new Set(
-    targetDeltas.filter((row) => row.delta > 0).map((row) => row.mint),
-  );
-  const targetNegative = new Set(
-    targetDeltas.filter((row) => row.delta < 0).map((row) => row.mint),
-  );
-  const preByOwnerMint = new Map<string, number>();
-  for (const balance of meta?.preTokenBalances ?? []) {
-    if (!balance?.owner || !balance?.mint || balance.owner === target || balance.mint === WSOL)
-      continue;
-    preByOwnerMint.set(`${balance.owner}::${balance.mint}`, amountFromTokenBalance(balance));
-  }
-
-  const byMint = new Map<
-    string,
-    {
-      mint: string;
-      amountTokens: number;
-      decimals: number;
-      recipients: Array<{ wallet: string; amountTokens: number }>;
-    }
-  >();
-  for (const balance of meta?.postTokenBalances ?? []) {
-    if (!balance?.owner || !balance?.mint || balance.owner === target || balance.mint === WSOL)
-      continue;
-    if (alreadyPositive.has(balance.mint) || targetNegative.has(balance.mint)) continue;
-    const pre = preByOwnerMint.get(`${balance.owner}::${balance.mint}`) ?? 0;
-    const post = amountFromTokenBalance(balance);
-    const delta = post - pre;
-    if (delta <= 1e-12) continue;
-    const cur: {
-      mint: string;
-      amountTokens: number;
-      decimals: number;
-      recipients: Array<{ wallet: string; amountTokens: number }>;
-    } = byMint.get(balance.mint) ?? {
-      mint: balance.mint,
-      amountTokens: 0,
-      decimals: Number(balance?.uiTokenAmount?.decimals ?? 0),
-      recipients: [],
-    };
-    cur.amountTokens += delta;
-    cur.decimals = Number(balance?.uiTokenAmount?.decimals ?? cur.decimals);
-    cur.recipients.push({ wallet: balance.owner, amountTokens: delta });
-    byMint.set(balance.mint, cur);
-  }
-
-  return Array.from(byMint.values()).sort((a, b) => b.amountTokens - a.amountTokens)[0] ?? null;
 }
 
 async function main() {
@@ -536,17 +466,17 @@ async function main() {
     .map((tx) => analyzeTargetTx(tx, target.toBase58()));
   line("Last 5 tx decoder check", analyses);
 
-  const trigger = analyses.find(
-    (row) =>
-      row.liveWorkerWouldCopyBuy ||
-      row.wouldTriggerBuy ||
-      row.wouldTriggerInferredBuy ||
-      row.wouldTriggerFallbackTransfer,
-  );
-  if (trigger)
+  const entryCandidate = analyses.find((row) => row.liveWorkerEntryCandidate);
+  const feedEvent = analyses.find((row) => row.liveWorkerFeedEvent);
+  if (entryCandidate)
     pass(
       "Decoder verdict",
-      "At least one recent tx should trigger the live worker path. If PM2 logs did not show feed event, Laserstream/RPC polling is the likely break.",
+      "At least one recent tx decoded as a target token-buy candidate. Entry settings and market-data filters still decide whether it is copied.",
+    );
+  else if (feedEvent)
+    pass(
+      "Decoder verdict",
+      "Recent target activity reached the worker decoder, but the last five transactions contained no safe token-buy candidate. Transfers, sells, and stablecoin receipts do not trigger entries.",
     );
   else
     warn(

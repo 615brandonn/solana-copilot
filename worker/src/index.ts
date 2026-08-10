@@ -25,6 +25,13 @@ import {
 import { isFlatPosition, proportionalMirrorSell } from "./follower-math.js";
 import { safeDiagnostic } from "./diagnostics.js";
 import {
+  KeyedExecutionQueue,
+  RecentAsyncResultCache,
+  RecentEventDeduper,
+} from "./event-deduper.js";
+import { resolveTargetBuyValue } from "./target-buy-valuation.js";
+import { quoteTokenSpendUsd } from "./token-spend-quote.js";
+import {
   groupObservedFollowerTransfers,
   isEligibleFollowerWallet,
   walletTokenHoldings,
@@ -40,6 +47,13 @@ const STABLECOIN_MINTS = new Set([
 ]);
 const rpc = new Connection(env.RPC_URL, { commitment: "processed" });
 const followerRecipientEligibility = new Map<string, boolean>();
+
+type CopyBuyOptions = {
+  entryMode: "regular" | "coordinated";
+  firstBuy: boolean;
+  targetBuyUsd: number | undefined;
+  coordinatedWallets?: string[];
+};
 
 async function isEligibleFollowerRecipient(address: string): Promise<boolean> {
   const cached = followerRecipientEligibility.get(address);
@@ -216,9 +230,13 @@ async function main() {
   const poller = new RpcBackfillPoller(rpc, async (event) => handle(event));
   const monitor = new FollowerMonitor(feed, poller);
   const coordinatedBuys = new CoordinatedBuyTracker();
-  const entriesInFlight = new Set<string>();
+  const entryExecutionQueue = new KeyedExecutionQueue();
   const exitsInFlight = new Set<string>();
   const pendingTransfers = new Map<string, TransferEvent[]>();
+  const targetBuyDeduper = new RecentEventDeduper();
+  const targetBuyActivityAccounting = new RecentAsyncResultCache<void>();
+  const targetFirstBuyAccounting = new RecentAsyncResultCache<boolean>();
+  const uncertainEntryMints = new Set<string>();
 
   async function retryDb<T>(
     label: string,
@@ -812,15 +830,90 @@ async function main() {
 
   async function handleTargetBuy(event: SwapEvent) {
     if (event.tokenMint === WSOL || STABLECOIN_MINTS.has(event.tokenMint)) return;
-    const solPrice = await priceUsd(WSOL);
-    const targetBuyUsd =
-      event.amountUsd ??
-      (solPrice !== undefined && Math.abs(event.solDelta) > 0.0005
-        ? Math.abs(event.solDelta) * solPrice
-        : undefined);
+    const transactionId = event.txSig || `slot-${event.slot}`;
+    const dedupeKey = `${event.wallet}:${transactionId}:${event.tokenMint}`;
+    if (event.inferredRecipients?.length) {
+      const recipientChecks = await Promise.all(
+        event.inferredRecipients.map((recipient) => isEligibleFollowerRecipient(recipient)),
+      );
+      if (recipientChecks.some((eligible) => !eligible)) {
+        log.info(
+          {
+            wallet: event.wallet,
+            mint: event.tokenMint,
+            txSig: event.txSig,
+            recipientCount: event.inferredRecipients.length,
+          },
+          "inferred target buy rejected — output recipient is not an eligible external wallet",
+        );
+        return;
+      }
+    }
+
+    // Preserve first-buy and inactivity accounting even when valuation is
+    // temporarily unavailable, but share it across Geyser/RPC copies.
+    await targetBuyActivityAccounting.getOrCreate(dedupeKey, () =>
+      recordOpenPositionTargetBuy(event),
+    );
+    const firstBuy = await targetFirstBuyAccounting.getOrCreate(dedupeKey, () =>
+      observeTargetFirstBuy(event.wallet, event.tokenMint),
+    );
+
+    const valuation = await resolveTargetBuyValue(event, {
+      quoteTokenSpendUsd,
+      solPriceUsd: () => priceUsd(WSOL),
+    });
+    const targetBuyUsd = valuation.amountUsd;
     event.amountUsd = targetBuyUsd;
-    await recordOpenPositionTargetBuy(event);
-    const firstBuy = await observeTargetFirstBuy(event.wallet, event.tokenMint);
+    log.info(
+      {
+        wallet: event.wallet,
+        mint: event.tokenMint,
+        txSig: event.txSig,
+        valuationSource: valuation.source,
+        targetBuyUsd: targetBuyUsd === undefined ? "unknown" : Number(targetBuyUsd.toFixed(2)),
+        inputMint: event.spentToken?.mint,
+      },
+      "target buy value resolved",
+    );
+
+    const requiresKnownValue = cfg.coordinated_mode_enabled
+      ? true
+      : Number(cfg.min_target_buy_usd) > 0;
+    if (requiresKnownValue && targetBuyUsd === undefined) {
+      log.info(
+        { wallet: event.wallet, mint: event.tokenMint, txSig: event.txSig },
+        "target buy value unavailable — waiting for a richer duplicate observation",
+      );
+      return;
+    }
+
+    if (!targetBuyDeduper.claim(dedupeKey, event.timestampMs)) {
+      log.info(
+        { wallet: event.wallet, mint: event.tokenMint, txSig: event.txSig },
+        "duplicate target buy observation ignored",
+      );
+      return;
+    }
+
+    // A proven pre-submission failure may be retried by the other feed. Once a
+    // submission is possible or uncertain, retain the claim to prevent a
+    // duplicate purchase.
+    try {
+      await processTargetBuy(event, targetBuyUsd, firstBuy);
+    } catch (err) {
+      if (!uncertainEntryMints.has(event.tokenMint)) {
+        targetBuyDeduper.release(dedupeKey);
+      }
+      throw err;
+    }
+  }
+
+  async function processTargetBuy(
+    event: SwapEvent,
+    targetBuyUsd: number | undefined,
+    firstBuy: boolean,
+  ) {
 
     if (!cfg.enabled) {
       log.info(
@@ -913,49 +1006,10 @@ async function main() {
       return;
     }
 
-    if (cfg.enabled) {
-      // Some Laserstream payloads show the target's immediate post-buy token
-      // movement as a transfer, while the actual swap has no positive net
-      // target balance left to decode. Since this target's pattern is buy →
-      // split to follower wallets, use that outbound transfer as a fallback
-      // entry trigger instead of silently missing the trade.
-      log.warn(
-        {
-          from: ev.from,
-          to: ev.to,
-          mint: ev.tokenMint,
-          amountTokens: ev.amountTokens,
-          txSig: ev.txSig,
-        },
-        "target transfer with no open position — using as fallback buy trigger",
-      );
-
-      await handleTargetBuy({
-        kind: "swap",
-        wallet: ev.from,
-        side: "buy",
-        tokenMint: ev.tokenMint,
-        amountTokens: ev.amountTokens,
-        decimals: ev.decimals,
-        amountUsd: undefined,
-        solDelta: 0,
-        slot: ev.slot,
-        txSig: ev.txSig,
-        timestampMs: ev.timestampMs,
-        isPumpFun: ev.tokenMint.endsWith("pump"),
-      });
-
-      const opened = monitor.activeForMint(ev.tokenMint);
-      if (opened) {
-        await monitor.recordTransfer(opened.positionId, ev.to, ev.amountTokens, {
-          hopDepth: 1,
-          parentWallet: ev.from,
-          txSig: ev.txSig,
-          slot: ev.slot,
-        });
-      }
-      return;
-    }
+    log.info(
+      { from: ev.from, to: ev.to, mint: ev.tokenMint, txSig: ev.txSig },
+      "target transfer observed without a verified swap — not treated as an entry",
+    );
   }
 
   async function handleFollowerSell(ev: SwapEvent) {
@@ -1129,14 +1183,33 @@ async function main() {
   async function tryCopyBuy(
     event: SwapEvent,
     reason = "target copy buy",
-    options: {
-      entryMode: "regular" | "coordinated";
-      firstBuy: boolean;
-      targetBuyUsd: number | undefined;
-      coordinatedWallets?: string[];
-    },
+    options: CopyBuyOptions,
   ): Promise<string | null> {
-    if (!cfg.enabled || entriesInFlight.has(event.tokenMint)) return null;
+    if (!cfg.enabled) return null;
+    return entryExecutionQueue.run(event.tokenMint, () =>
+      tryCopyBuyLocked(event, reason, options),
+    );
+  }
+
+  async function tryCopyBuyLocked(
+    event: SwapEvent,
+    reason: string,
+    options: CopyBuyOptions,
+  ): Promise<string | null> {
+    if (!cfg.enabled) {
+      log.info(
+        { mint: event.tokenMint, txSig: event.txSig },
+        "entry cancelled after queue wait — Entries is OFF",
+      );
+      return null;
+    }
+    if (uncertainEntryMints.has(event.tokenMint)) {
+      log.error(
+        { mint: event.tokenMint, txSig: event.txSig },
+        "entry blocked — an earlier submission for this coin needs reconciliation",
+      );
+      return null;
+    }
     if (event.tokenMint === WSOL || STABLECOIN_MINTS.has(event.tokenMint)) {
       log.info(
         { mint: event.tokenMint, txSig: event.txSig },
@@ -1205,8 +1278,7 @@ async function main() {
       return null;
     }
 
-    entriesInFlight.add(event.tokenMint);
-    try {
+    {
       let secret: string | null = null;
       try {
         secret = await loadSigner(cfg.user_id);
@@ -1229,6 +1301,13 @@ async function main() {
           ? Number(cfg.coordinated_fixed_buy_usd)
           : Number(cfg.fixed_buy_usd);
       const amountLamports = Math.floor((buyUsd / solPrice) * 1e9);
+      if (!cfg.enabled) {
+        log.info(
+          { mint: event.tokenMint, txSig: event.txSig },
+          "entry cancelled immediately before submission — Entries is OFF",
+        );
+        return null;
+      }
       log.info(
         {
           mint: event.tokenMint,
@@ -1254,12 +1333,14 @@ async function main() {
           outputDecimals: event.decimals,
         });
       } catch (err) {
+        uncertainEntryMints.add(event.tokenMint);
         log.error(
           { err, mint: event.tokenMint, amountLamports, route: cfg.execution_route },
-          "copy buy failed before transaction landed",
+          "copy buy failed or landing is uncertain — coin quarantined",
         );
         return null;
       }
+      uncertainEntryMints.add(event.tokenMint);
 
       const receivedUi = result.outUiAmount ?? 0;
       const entryPrice =
@@ -1300,6 +1381,7 @@ async function main() {
           `copy buy ${result.txSig} landed but position ${positionId} could not be read back`,
         );
       }
+      uncertainEntryMints.delete(event.tokenMint);
 
       const { error: tradeError } = await db.from("trades").insert({
         user_id: cfg.user_id,
@@ -1356,8 +1438,6 @@ async function main() {
         "copy buy landed — follower monitor armed",
       );
       return pos.id;
-    } finally {
-      entriesInFlight.delete(event.tokenMint);
     }
   }
 }

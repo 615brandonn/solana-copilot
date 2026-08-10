@@ -142,3 +142,27 @@ test("fails closed when target buy size or strict market data is unavailable", (
     { pass: false, reason: "liquidity unavailable" },
   );
 });
+
+test("applies the existing minimum to a newly resolved target-buy value", () => {
+  const fiftyDollarMinimum = { ...config, min_target_buy_usd: 50 };
+  assert.deepEqual(
+    checkEntry(
+      fiftyDollarMinimum,
+      { ...event, amountUsd: 80 },
+      meta,
+      { first: true, already: false },
+      NOW_MS,
+    ),
+    { pass: true },
+  );
+  assert.deepEqual(
+    checkEntry(
+      fiftyDollarMinimum,
+      { ...event, amountUsd: 40 },
+      meta,
+      { first: true, already: false },
+      NOW_MS,
+    ),
+    { pass: false, reason: "target buy $40 < min $50" },
+  );
+});
