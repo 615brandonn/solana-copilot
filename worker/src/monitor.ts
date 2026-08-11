@@ -58,6 +58,11 @@ export class FollowerMonitor {
   private active = new Map<string, PositionCtx>();
   // tokenMint -> positionId (for quick reverse lookup on incoming swap/transfer events)
   private byMint = new Map<string, string>();
+  // positionId -> follower wallets currently retained by that position.  The
+  // feed itself is keyed only by wallet, so this map provides the reference
+  // counting needed when the same wallet holds more than one copied token.
+  private followersByPosition = new Map<string, Set<string>>();
+  private reconcilingFollowers = false;
 
   constructor(
     private feed: GeyserFeed,
@@ -72,7 +77,57 @@ export class FollowerMonitor {
   async onCopyBuy(ctx: PositionCtx) {
     this.active.set(ctx.positionId, ctx);
     this.byMint.set(ctx.tokenMint, ctx.positionId);
+    if (!this.followersByPosition.has(ctx.positionId)) {
+      this.followersByPosition.set(ctx.positionId, new Set());
+    }
     log.info(ctx, "follower monitor armed");
+  }
+
+  /**
+   * Restore all persisted follower wallets for every open position. This is
+   * intentionally idempotent and is safe to run at startup and periodically.
+   * It repairs subscriptions lost during a process/stream restart or a
+   * temporary database failure without changing any sell percentages.
+   */
+  async reconcileFollowersFromDatabase(): Promise<number> {
+    if (this.reconcilingFollowers) return 0;
+    const positionIds = Array.from(this.active.keys());
+    if (positionIds.length === 0) return 0;
+
+    this.reconcilingFollowers = true;
+    try {
+      const rows = await retryDb<
+        Array<{
+          position_id: string;
+          wallet: string;
+          current_amount: number;
+        }> | null
+      >("reconcile follower subscriptions", () =>
+        db
+          .from("follower_wallets")
+          .select("position_id,wallet,current_amount")
+          .in("position_id", positionIds)
+          .gt("current_amount", 0),
+      );
+
+      let recovered = 0;
+      for (const row of rows ?? []) {
+        if (!this.active.has(row.position_id)) continue;
+        const followers = this.followersByPosition.get(row.position_id);
+        if (followers?.has(row.wallet)) continue;
+        await this.retainFollower(row.position_id, row.wallet);
+        recovered += 1;
+      }
+      if (recovered > 0) {
+        log.warn(
+          { recovered, openPositions: positionIds.length },
+          "follower subscriptions repaired from database",
+        );
+      }
+      return recovered;
+    } finally {
+      this.reconcilingFollowers = false;
+    }
   }
 
   /** Register (or top up) a follower wallet after target transfers tokens to it. */
@@ -139,8 +194,7 @@ export class FollowerMonitor {
         }),
       );
     }
-    await this.feed.watch(recipient);
-    this.poller?.watch(recipient);
+    await this.retainFollower(positionId, recipient);
     log.info({ positionId, recipient, amount }, "follower registered / topped up");
     return true;
   }
@@ -273,25 +327,40 @@ export class FollowerMonitor {
     const rows = await retryDb<Array<{ wallet: string }> | null>("load followers for release", () =>
       db.from("follower_wallets").select("wallet").eq("position_id", positionId),
     );
-    for (const r of rows ?? []) {
-      const count = await retryDb<number | null>("count shared follower watches", () =>
-        db
-          .from("follower_wallets")
-          .select("id", { count: "exact", head: true })
-          .eq("wallet", r.wallet)
-          .neq("position_id", positionId)
-          .then((result) => ({ data: result.count, error: result.error })),
-      );
-      if (!count) {
-        await this.feed.unwatch(r.wallet);
-        this.poller?.unwatch(r.wallet);
-      }
+    const retained = this.followersByPosition.get(positionId) ?? new Set<string>();
+    for (const row of rows ?? []) retained.add(row.wallet);
+
+    // Remove this position before checking whether another open position still
+    // owns the same follower wallet.
+    this.followersByPosition.delete(positionId);
+    this.active.delete(positionId);
+    if (ctx) this.byMint.delete(ctx.tokenMint);
+    for (const wallet of retained) {
+      if (this.isWalletRetained(wallet)) continue;
+      await this.feed.unwatch(wallet);
+      this.poller?.unwatch(wallet);
     }
     await retryDb("delete released followers", () =>
       db.from("follower_wallets").delete().eq("position_id", positionId),
     );
-    this.active.delete(positionId);
-    if (ctx) this.byMint.delete(ctx.tokenMint);
     log.info({ positionId }, "follower monitoring released");
+  }
+
+  private isWalletRetained(wallet: string): boolean {
+    for (const followers of this.followersByPosition.values()) {
+      if (followers.has(wallet)) return true;
+    }
+    return false;
+  }
+
+  private async retainFollower(positionId: string, wallet: string) {
+    const followers = this.followersByPosition.get(positionId) ?? new Set<string>();
+    if (followers.has(wallet)) return;
+    const alreadyWatched = this.isWalletRetained(wallet);
+    followers.add(wallet);
+    this.followersByPosition.set(positionId, followers);
+    if (alreadyWatched) return;
+    await this.feed.watch(wallet);
+    this.poller?.watch(wallet);
   }
 }

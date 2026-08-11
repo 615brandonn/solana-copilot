@@ -9,7 +9,7 @@ import { env } from "./env.js";
 import { db, type BotConfigRow } from "./db.js";
 import { GeyserFeed, type FeedEvent, type SwapEvent, type TransferEvent } from "./geyser.js";
 import { FollowerMonitor } from "./monitor.js";
-import { executeSwap } from "./executor.js";
+import { executeSwap, type ExecuteResult } from "./executor.js";
 import { decryptPrivateKey } from "./crypto.js";
 import { checkEntry, loadTokenMeta } from "./filters.js";
 import { RpcBackfillPoller } from "./poller.js";
@@ -38,6 +38,13 @@ import {
   type WalletTokenHolding,
   ZeroBalanceConfirmationTracker,
 } from "./position-reconciliation.js";
+import {
+  observationFromEvent,
+  StrategyRecorder,
+  strategyReactionMs,
+  type StrategyDecision,
+  type StrategyObservationPatch,
+} from "./strategy-recorder.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const WSOL = "So11111111111111111111111111111111111111112";
@@ -61,10 +68,7 @@ async function isEligibleFollowerRecipient(address: string): Promise<boolean> {
   try {
     const publicKey = new PublicKey(address);
     const account = await rpc.getAccountInfo(publicKey, "confirmed");
-    const eligible = isEligibleFollowerWallet(
-      address,
-      account?.owner.toBase58() ?? null,
-    );
+    const eligible = isEligibleFollowerWallet(address, account?.owner.toBase58() ?? null);
     if (followerRecipientEligibility.size >= 10_000) {
       followerRecipientEligibility.delete(followerRecipientEligibility.keys().next().value ?? "");
     }
@@ -263,6 +267,73 @@ async function main() {
   let targetWallets = new Set(configuredTargetWallets(cfg));
   if (targetWallets.size === 0) throw new Error("config loaded without a target wallet");
 
+  let lastStrategyRecorderErrorAt = 0;
+  const strategyRecorder = new StrategyRecorder(
+    async (rows) => {
+      const { error } = await db.rpc("record_strategy_observations", { p_rows: rows });
+      if (error)
+        throw new Error(`strategy recorder batch failed: ${safeDiagnostic(error.message)}`);
+    },
+    {
+      onError: (err) => {
+        const now = Date.now();
+        if (now - lastStrategyRecorderErrorAt < 30_000) return;
+        lastStrategyRecorderErrorAt = now;
+        log.warn(
+          { err: safeDiagnostic(err) },
+          "strategy recorder unavailable — trading continues and observations remain buffered",
+        );
+      },
+      onDrop: (dropped) => {
+        if (dropped === 1 || dropped % 100 === 0) {
+          log.warn({ dropped }, "strategy recorder queue full — oldest observation dropped");
+        }
+      },
+    },
+  );
+  strategyRecorder.start();
+
+  function recordStrategyEvent(event: FeedEvent, patch: StrategyObservationPatch = {}) {
+    const actor = event.kind === "swap" ? event.wallet : event.from;
+    const position = monitor.activeForMint(event.tokenMint);
+    const relationship = targetWallets.has(actor) ? "target" : position ? "follower" : "observed";
+    const primaryTarget =
+      cfg.target_wallet ?? position?.targetWallet ?? Array.from(targetWallets)[0];
+    if (!primaryTarget) return;
+    const additionalTarget = targetWallets.has(actor) && actor !== primaryTarget;
+    strategyRecorder.record(
+      observationFromEvent(
+        event,
+        {
+          userId: cfg.user_id,
+          targetWallet: primaryTarget,
+          relationship,
+          positionId: position?.positionId,
+        },
+        {
+          ...patch,
+          metadata: {
+            ...(patch.metadata ?? {}),
+            ...(additionalTarget ? { additionalTargetWallet: true } : {}),
+          },
+        },
+      ),
+    );
+  }
+
+  function recordStrategyDecision(
+    event: FeedEvent,
+    decision: StrategyDecision,
+    reason: string,
+    patch: StrategyObservationPatch = {},
+  ) {
+    recordStrategyEvent(event, {
+      ...patch,
+      bot_decision: decision,
+      bot_reason: reason,
+    });
+  }
+
   async function releaseMonitoredPosition(positionId: string) {
     await monitor.releasePosition(positionId);
     // A target wallet can also appear in a transfer chain. Reassert target
@@ -346,6 +417,7 @@ async function main() {
               .eq("relationship", "target")
               .eq("event_kind", "transfer")
               .not("to_wallet", "is", null)
+              .order("event_at", { ascending: false })
               .limit(500);
             return {
               data: (result.data ?? []) as typeof transfers,
@@ -406,11 +478,15 @@ async function main() {
 
   // Rehydrate any positions still open from a previous worker run so we keep
   // monitoring their followers across restarts.
-  const { data: openPositions } = await db
-    .from("positions")
-    .select("id,token_mint,amount_remaining")
-    .eq("user_id", cfg.user_id)
-    .is("closed_at", null);
+  const openPositions = await retryDb<
+    Array<{ id: string; token_mint: string; amount_remaining: number }> | null
+  >("load open positions for follower recovery", () =>
+    db
+      .from("positions")
+      .select("id,token_mint,amount_remaining")
+      .eq("user_id", cfg.user_id)
+      .is("closed_at", null),
+  );
   for (const pos of openPositions ?? []) {
     if (Number(pos.amount_remaining) <= 0) continue;
     await monitor.onCopyBuy({
@@ -418,15 +494,8 @@ async function main() {
       tokenMint: pos.token_mint,
       targetWallet: cfg.target_wallet ?? Array.from(targetWallets)[0],
     });
-    const { data: followers } = await db
-      .from("follower_wallets")
-      .select("wallet")
-      .eq("position_id", pos.id);
-    for (const f of followers ?? []) {
-      await feed.watch(f.wallet);
-      poller.watch(f.wallet);
-    }
   }
+  await monitor.reconcileFollowersFromDatabase();
 
   while (true) {
     try {
@@ -438,6 +507,15 @@ async function main() {
     }
   }
   poller.start(Array.from(targetWallets));
+
+  // A transient database/stream failure must not leave a persisted follower
+  // wallet unmonitored for the rest of the worker's lifetime. Reconciliation
+  // only restores missing watches; the hot sell path remains event-driven.
+  setInterval(() => {
+    monitor
+      .reconcileFollowersFromDatabase()
+      .catch((err) => log.error({ err: safeDiagnostic(err) }, "follower subscription repair failed"));
+  }, 10_000);
 
   setInterval(async () => {
     try {
@@ -466,7 +544,12 @@ async function main() {
 
   setInterval(() => {
     log.info(
-      { target: cfg.target_wallet, geyser: feed.health(), rpcFallback: poller.health() },
+      {
+        target: cfg.target_wallet,
+        geyser: feed.health(),
+        rpcFallback: poller.health(),
+        strategyRecorder: strategyRecorder.health(),
+      },
       "stream heartbeat",
     );
   }, 30000);
@@ -676,14 +759,25 @@ async function main() {
     markTpTaken = false,
     markCoordinatedExit = false,
     markFollowerSellerExit = false,
-  ) {
-    if (exitsInFlight.has(positionId)) return;
+    strategyEvent?: SwapEvent,
+  ): Promise<ExecuteResult | null> {
+    if (exitsInFlight.has(positionId)) return null;
     exitsInFlight.add(positionId);
     try {
       const secret = await loadSigner(cfg.user_id);
       if (!secret) {
         log.error("no funding key for tp/sl sell");
-        return;
+        if (strategyEvent) {
+          recordStrategyDecision(strategyEvent, "failed", "funding key is not available for sell", {
+            position_id: positionId,
+          });
+        }
+        return null;
+      }
+      if (strategyEvent) {
+        recordStrategyDecision(strategyEvent, "mirror_submitted", reason, {
+          position_id: positionId,
+        });
       }
       const result = await executeSwap({
         signerSecret: secret,
@@ -694,6 +788,15 @@ async function main() {
         route: cfg.execution_route,
         jitoTipSol: cfg.jito_tip_sol,
       });
+      if (strategyEvent) {
+        recordStrategyDecision(strategyEvent, "mirrored", "follower-triggered exit landed", {
+          position_id: positionId,
+          bot_tx_sig: result.txSig,
+          reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
+          execution_ms: result.latencyMs,
+          metadata: { persistencePending: true },
+        });
+      }
       const cur = await retryDb<{ amount_remaining: number } | null>(
         "load position after exit",
         () => db.from("positions").select("amount_remaining").eq("id", positionId).maybeSingle(),
@@ -732,6 +835,21 @@ async function main() {
       );
       log.info({ sig: result.txSig, reason, closed }, "exit sell landed");
       if (closed) await releaseMonitoredPosition(positionId);
+      if (strategyEvent) {
+        recordStrategyDecision(
+          strategyEvent,
+          "mirrored",
+          "follower-triggered exit landed and saved",
+          {
+            position_id: positionId,
+            bot_tx_sig: result.txSig,
+            reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
+            execution_ms: result.latencyMs,
+            metadata: { persistencePending: false, closed },
+          },
+        );
+      }
+      return result;
     } finally {
       exitsInFlight.delete(positionId);
     }
@@ -745,14 +863,15 @@ async function main() {
     sellPct: number,
     reason: string,
     trigger: "coordinated" | "main-follower" | "none",
-  ) {
-    if (exitsInFlight.has(positionId)) return;
+    strategyEvent?: SwapEvent,
+  ): Promise<ExecuteResult | null> {
+    if (exitsInFlight.has(positionId)) return null;
     const sellFraction = Math.min(1, Math.max(0, Number(sellPct) / 100));
     const sellUi = remaining * sellFraction;
     const sellRaw = Math.floor(sellUi * Math.pow(10, decimals));
-    if (sellRaw <= 0 || sellUi <= 0) return;
+    if (sellRaw <= 0 || sellUi <= 0) return null;
     log.warn({ positionId, mint, sellPct, reason }, "configured exit triggered");
-    await executeExitSell(
+    return executeExitSell(
       positionId,
       mint,
       sellRaw,
@@ -761,10 +880,14 @@ async function main() {
       false,
       trigger === "coordinated",
       trigger === "main-follower",
+      strategyEvent,
     );
   }
 
   async function handle(event: FeedEvent) {
+    // This is bounded in-memory work. Supabase persistence happens on the
+    // recorder timer and cannot delay the serial Geyser hot path.
+    recordStrategyEvent(event);
     try {
       if (event.kind === "transfer") return handleTransfer(event);
       if (event.kind === "swap") {
@@ -783,8 +906,10 @@ async function main() {
           },
           "swap event ignored — not target buy or follower sell",
         );
+        recordStrategyDecision(event, "tracked", "observed wallet buy outside target entry flow");
       }
     } catch (err) {
+      recordStrategyDecision(event, "failed", safeDiagnostic(err));
       log.error({ err }, "handler failed");
     }
   }
@@ -829,7 +954,10 @@ async function main() {
   }
 
   async function handleTargetBuy(event: SwapEvent) {
-    if (event.tokenMint === WSOL || STABLECOIN_MINTS.has(event.tokenMint)) return;
+    if (event.tokenMint === WSOL || STABLECOIN_MINTS.has(event.tokenMint)) {
+      recordStrategyDecision(event, "skipped", "output is SOL or a stablecoin");
+      return;
+    }
     const transactionId = event.txSig || `slot-${event.slot}`;
     const dedupeKey = `${event.wallet}:${transactionId}:${event.tokenMint}`;
     if (event.inferredRecipients?.length) {
@@ -845,6 +973,11 @@ async function main() {
             recipientCount: event.inferredRecipients.length,
           },
           "inferred target buy rejected — output recipient is not an eligible external wallet",
+        );
+        recordStrategyDecision(
+          event,
+          "skipped",
+          "inferred output recipient is program controlled, off-curve, or unavailable",
         );
         return;
       }
@@ -865,6 +998,13 @@ async function main() {
     });
     const targetBuyUsd = valuation.amountUsd;
     event.amountUsd = targetBuyUsd;
+    recordStrategyEvent(event, {
+      amount_usd: targetBuyUsd,
+      metadata: {
+        valuationSource: valuation.source,
+        inputMint: event.spentToken?.mint,
+      },
+    });
     log.info(
       {
         wallet: event.wallet,
@@ -885,6 +1025,9 @@ async function main() {
         { wallet: event.wallet, mint: event.tokenMint, txSig: event.txSig },
         "target buy value unavailable — waiting for a richer duplicate observation",
       );
+      recordStrategyDecision(event, "filtered", "target buy size unavailable", {
+        metadata: { valuationSource: valuation.source },
+      });
       return;
     }
 
@@ -914,12 +1057,12 @@ async function main() {
     targetBuyUsd: number | undefined,
     firstBuy: boolean,
   ) {
-
     if (!cfg.enabled) {
       log.info(
         { wallet: event.wallet, mint: event.tokenMint },
         "entries off — target buy observed but not copied",
       );
+      recordStrategyDecision(event, "skipped", "new entries disabled");
       return;
     }
 
@@ -954,6 +1097,18 @@ async function main() {
         },
         "coordinated buy waiting / filtered",
       );
+      recordStrategyDecision(
+        event,
+        coordination.reason.startsWith("waiting for") ? "tracked" : "filtered",
+        coordination.reason,
+        {
+          metadata: {
+            entryMode: "coordinated",
+            qualifyingWallets: coordination.qualifyingWallets,
+            requiredWallets: cfg.coordinated_target_wallet_count,
+          },
+        },
+      );
       return;
     }
 
@@ -971,24 +1126,46 @@ async function main() {
         { from: ev.from, to: ev.to, mint: ev.tokenMint, txSig: ev.txSig },
         "program-controlled or off-curve transfer recipient excluded from follower monitoring",
       );
+      recordStrategyDecision(ev, "skipped", "transfer recipient is not an eligible wallet");
       return;
     }
     const ctx = monitor.activeForMint(ev.tokenMint);
     if (!targetWallets.has(ev.from)) {
-      if (ctx)
-        await monitor.recordChainedTransfer(ev.tokenMint, ev.from, ev.to, ev.amountTokens, {
-          txSig: ev.txSig,
-          slot: ev.slot,
-        });
+      if (ctx) {
+        const tracked = await monitor.recordChainedTransfer(
+          ev.tokenMint,
+          ev.from,
+          ev.to,
+          ev.amountTokens,
+          {
+            txSig: ev.txSig,
+            slot: ev.slot,
+          },
+        );
+        recordStrategyDecision(
+          ev,
+          tracked ? "tracked" : "skipped",
+          tracked ? "follower transfer retained" : "follower transfer not attributable",
+          { position_id: ctx.positionId },
+        );
+      } else {
+        recordStrategyDecision(ev, "skipped", "no active copied position for transfer");
+      }
       return;
     }
     if (ctx) {
-      await monitor.recordTransfer(ctx.positionId, ev.to, ev.amountTokens, {
+      const tracked = await monitor.recordTransfer(ctx.positionId, ev.to, ev.amountTokens, {
         hopDepth: 1,
         parentWallet: ev.from,
         txSig: ev.txSig,
         slot: ev.slot,
       });
+      recordStrategyDecision(
+        ev,
+        tracked ? "tracked" : "skipped",
+        tracked ? "target transfer wallet retained" : "duplicate target transfer ignored",
+        { position_id: ctx.positionId },
+      );
       return;
     }
 
@@ -1003,6 +1180,7 @@ async function main() {
         { from: ev.from, to: ev.to, mint: ev.tokenMint },
         "coordinated transfer held pending an entry",
       );
+      recordStrategyDecision(ev, "tracked", "coordinated transfer held pending an entry");
       return;
     }
 
@@ -1010,18 +1188,32 @@ async function main() {
       { from: ev.from, to: ev.to, mint: ev.tokenMint, txSig: ev.txSig },
       "target transfer observed without a verified swap — not treated as an entry",
     );
+    recordStrategyDecision(ev, "tracked", "target transfer observed without an open position");
   }
 
   async function handleFollowerSell(ev: SwapEvent) {
     const ctx = monitor.activeForMint(ev.tokenMint);
-    if (!ctx) return;
-    if (targetWallets.has(ev.wallet)) return; // Only follower wallets drive the mirror
+    if (!ctx) {
+      recordStrategyDecision(ev, "skipped", "no active copied position for this token");
+      return;
+    }
+    if (targetWallets.has(ev.wallet)) {
+      recordStrategyDecision(ev, "tracked", "direct target sell observed", {
+        position_id: ctx.positionId,
+      });
+      return; // Only follower wallets drive the mirror
+    }
 
     const sellState = await monitor.recordFollowerSell(ctx.positionId, ev.wallet, ev.amountTokens, {
       txSig: ev.txSig,
       slot: ev.slot,
     });
-    if (sellState === null) return;
+    if (sellState === null) {
+      recordStrategyDecision(ev, "skipped", "sell wallet is not retained or event is duplicate", {
+        position_id: ctx.positionId,
+      });
+      return;
+    }
 
     const { data: pos } = await db
       .from("positions")
@@ -1030,10 +1222,20 @@ async function main() {
       )
       .eq("id", ctx.positionId)
       .maybeSingle();
-    if (!pos) return;
+    if (!pos) {
+      recordStrategyDecision(ev, "failed", "active position could not be loaded", {
+        position_id: ctx.positionId,
+      });
+      return;
+    }
 
     if ((pos.entry_mode ?? "regular") === "coordinated") {
-      if (pos.coordinated_exit_triggered) return;
+      if (pos.coordinated_exit_triggered) {
+        recordStrategyDecision(ev, "tracked", "coordinated follower exit already triggered", {
+          position_id: pos.id,
+        });
+        return;
+      }
       if (
         !shouldTriggerDistinctSellerExit(
           sellState.distinctSellerCount,
@@ -1049,16 +1251,22 @@ async function main() {
           },
           "coordinated follower exit waiting",
         );
+        recordStrategyDecision(ev, "tracked", "waiting for coordinated follower-seller threshold", {
+          position_id: pos.id,
+          metadata: { distinctSellerCount: sellState.distinctSellerCount },
+        });
         return;
       }
+      const exitReason = `coordinated ${sellState.distinctSellerCount} distinct follower seller(s)`;
       await executePercentageExit(
         pos.id,
         pos.token_mint,
         Number(pos.amount_remaining),
         Number(pos.decimals ?? 0),
         Number(cfg.coordinated_follower_sell_pct),
-        `coordinated ${sellState.distinctSellerCount} distinct follower seller(s)`,
+        exitReason,
         "coordinated",
+        ev,
       );
       return;
     }
@@ -1078,38 +1286,72 @@ async function main() {
           },
           "main follower exit waiting",
         );
+        recordStrategyDecision(ev, "tracked", "waiting for follower-seller threshold", {
+          position_id: pos.id,
+          metadata: { distinctSellerCount: sellState.distinctSellerCount },
+        });
       } else {
+        const exitReason = `main ${sellState.distinctSellerCount} distinct follower seller(s)`;
         await executePercentageExit(
           pos.id,
           pos.token_mint,
           Number(pos.amount_remaining),
           Number(pos.decimals ?? 0),
           Number(cfg.follower_seller_exit_pct),
-          `main ${sellState.distinctSellerCount} distinct follower seller(s)`,
+          exitReason,
           "main-follower",
+          ev,
         );
         return;
       }
     }
 
-    if (!cfg.proportional_follower_sells) return;
+    if (!cfg.proportional_follower_sells) {
+      recordStrategyDecision(
+        ev,
+        "tracked",
+        "follower sell recorded; proportional mirroring is off",
+        {
+          position_id: pos.id,
+        },
+      );
+      return;
+    }
 
     const sellUi = proportionalMirrorSell(
       Number(pos.amount_tokens),
       Number(pos.amount_remaining),
       sellState.soldFraction,
     );
-    if (sellUi <= 0) return;
+    if (sellUi <= 0) {
+      recordStrategyDecision(ev, "tracked", "follower sell required no additional mirror amount", {
+        position_id: pos.id,
+      });
+      return;
+    }
 
     const decimals = Number(pos.decimals ?? 0);
     const sellRaw = Math.floor(sellUi * Math.pow(10, decimals));
-    if (sellRaw <= 0) return;
+    if (sellRaw <= 0) {
+      recordStrategyDecision(ev, "tracked", "calculated mirror amount rounded to zero", {
+        position_id: pos.id,
+      });
+      return;
+    }
 
     log.info(
       { positionId: pos.id, soldFraction: sellState.soldFraction, sellUi, sellRaw },
       "mirroring follower sell",
     );
-    await executeMirrorSell(pos.id, pos.token_mint, sellRaw, sellUi, sellState.soldFraction, ctx);
+    await executeMirrorSell(
+      pos.id,
+      pos.token_mint,
+      sellRaw,
+      sellUi,
+      sellState.soldFraction,
+      ctx,
+      ev,
+    );
   }
 
   async function executeMirrorSell(
@@ -1119,16 +1361,29 @@ async function main() {
     sellUi: number,
     soldFraction: number,
     ctx: { positionId: string; tokenMint: string; targetWallet: string },
-  ) {
-    if (exitsInFlight.has(positionId)) return;
+    strategyEvent: SwapEvent,
+  ): Promise<ExecuteResult | null> {
+    if (exitsInFlight.has(positionId)) return null;
     exitsInFlight.add(positionId);
     try {
       const secret = await loadSigner(cfg.user_id);
       if (!secret) {
         log.error("no funding key for sell");
-        return;
+        recordStrategyDecision(strategyEvent, "failed", "funding key is not available for sell", {
+          position_id: positionId,
+        });
+        return null;
       }
 
+      recordStrategyDecision(
+        strategyEvent,
+        "mirror_submitted",
+        "proportional follower sell submitted",
+        {
+          position_id: positionId,
+          metadata: { soldFraction },
+        },
+      );
       const result = await executeSwap({
         signerSecret: secret,
         inputMint: mint,
@@ -1137,6 +1392,13 @@ async function main() {
         slippageBps: 500,
         route: cfg.execution_route,
         jitoTipSol: cfg.jito_tip_sol,
+      });
+      recordStrategyDecision(strategyEvent, "mirrored", "proportional follower sell landed", {
+        position_id: positionId,
+        bot_tx_sig: result.txSig,
+        reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
+        execution_ms: result.latencyMs,
+        metadata: { soldFraction, persistencePending: true },
       });
 
       const currentPosition = await retryDb<{ amount_remaining: number } | null>(
@@ -1175,6 +1437,19 @@ async function main() {
 
       log.info({ sig: result.txSig, ms: result.latencyMs, closed }, "mirror sell landed");
       if (closed) await releaseMonitoredPosition(positionId);
+      recordStrategyDecision(
+        strategyEvent,
+        "mirrored",
+        "proportional follower sell landed and saved",
+        {
+          position_id: positionId,
+          bot_tx_sig: result.txSig,
+          reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
+          execution_ms: result.latencyMs,
+          metadata: { soldFraction, persistencePending: false, closed },
+        },
+      );
+      return result;
     } finally {
       exitsInFlight.delete(positionId);
     }
@@ -1185,10 +1460,11 @@ async function main() {
     reason = "target copy buy",
     options: CopyBuyOptions,
   ): Promise<string | null> {
-    if (!cfg.enabled) return null;
-    return entryExecutionQueue.run(event.tokenMint, () =>
-      tryCopyBuyLocked(event, reason, options),
-    );
+    if (!cfg.enabled) {
+      recordStrategyDecision(event, "skipped", "new entries disabled");
+      return null;
+    }
+    return entryExecutionQueue.run(event.tokenMint, () => tryCopyBuyLocked(event, reason, options));
   }
 
   async function tryCopyBuyLocked(
@@ -1201,6 +1477,7 @@ async function main() {
         { mint: event.tokenMint, txSig: event.txSig },
         "entry cancelled after queue wait — Entries is OFF",
       );
+      recordStrategyDecision(event, "skipped", "Entries turned off while entry was queued");
       return null;
     }
     if (uncertainEntryMints.has(event.tokenMint)) {
@@ -1208,6 +1485,7 @@ async function main() {
         { mint: event.tokenMint, txSig: event.txSig },
         "entry blocked — an earlier submission for this coin needs reconciliation",
       );
+      recordStrategyDecision(event, "skipped", "coin quarantined after an uncertain submission");
       return null;
     }
     if (event.tokenMint === WSOL || STABLECOIN_MINTS.has(event.tokenMint)) {
@@ -1215,6 +1493,7 @@ async function main() {
         { mint: event.tokenMint, txSig: event.txSig },
         "target buy skipped — output is SOL/stablecoin, not a token entry",
       );
+      recordStrategyDecision(event, "skipped", "output is SOL or a stablecoin");
       return null;
     }
 
@@ -1247,10 +1526,25 @@ async function main() {
         { mint: event.tokenMint, positionId: openPosition.id },
         "entry skipped — position already open for coin",
       );
+      recordStrategyDecision(event, "skipped", "a copied position for this token is already open", {
+        position_id: openPosition.id,
+      });
       return null;
     }
 
     const meta = await loadTokenMeta(event.tokenMint);
+    const metaPatch: StrategyObservationPatch = {
+      market_cap_usd: meta.marketCapUsd,
+      liquidity_usd: meta.liquidityUsd,
+      has_socials: Boolean(meta.socials.website || meta.socials.twitter || meta.socials.telegram),
+      metadata: {
+        entryMode: options.entryMode,
+        pairCreatedAtMs: meta.pairCreatedAtMs,
+        isPumpFun: meta.isPumpFun,
+        firstBuy: options.firstBuy,
+      },
+    };
+    recordStrategyEvent(event, metaPatch);
     const { data: prior, error: priorError } = await db
       .from("traded_tokens")
       .select("token_mint")
@@ -1275,6 +1569,14 @@ async function main() {
         },
         "filtered",
       );
+      recordStrategyDecision(event, "filtered", decision.reason, {
+        ...metaPatch,
+        amount_usd: options.targetBuyUsd,
+        metadata: {
+          ...metaPatch.metadata,
+          alreadyTraded: Boolean(prior),
+        },
+      });
       return null;
     }
 
@@ -1284,16 +1586,19 @@ async function main() {
         secret = await loadSigner(cfg.user_id);
       } catch (err) {
         log.error({ err, user_id: cfg.user_id }, "funding key decrypt failed for copy buy");
+        recordStrategyDecision(event, "failed", "funding key could not be loaded", metaPatch);
         return null;
       }
       if (!secret) {
         log.error({ user_id: cfg.user_id }, "no funding key saved for this config user");
+        recordStrategyDecision(event, "failed", "funding key is not available", metaPatch);
         return null;
       }
 
       const solPrice = await priceUsd(WSOL);
       if (solPrice === undefined) {
         log.error({ mint: event.tokenMint }, "copy buy blocked — live SOL/USD price unavailable");
+        recordStrategyDecision(event, "failed", "live SOL/USD price is unavailable", metaPatch);
         return null;
       }
       const buyUsd =
@@ -1305,6 +1610,12 @@ async function main() {
         log.info(
           { mint: event.tokenMint, txSig: event.txSig },
           "entry cancelled immediately before submission — Entries is OFF",
+        );
+        recordStrategyDecision(
+          event,
+          "skipped",
+          "Entries turned off immediately before submission",
+          metaPatch,
         );
         return null;
       }
@@ -1319,8 +1630,17 @@ async function main() {
         },
         "submitting copy buy",
       );
+      recordStrategyDecision(event, "copy_submitted", reason, {
+        ...metaPatch,
+        amount_usd: options.targetBuyUsd,
+        metadata: {
+          ...metaPatch.metadata,
+          configuredBuyUsd: buyUsd,
+          route: cfg.execution_route,
+        },
+      });
 
-      let result;
+      let result: ExecuteResult;
       try {
         result = await executeSwap({
           signerSecret: secret,
@@ -1334,6 +1654,21 @@ async function main() {
         });
       } catch (err) {
         uncertainEntryMints.add(event.tokenMint);
+        recordStrategyDecision(
+          event,
+          "failed",
+          "copy submission failed or landing is uncertain; coin quarantined",
+          {
+            ...metaPatch,
+            amount_usd: options.targetBuyUsd,
+            reaction_ms: strategyReactionMs(event),
+            metadata: {
+              ...metaPatch.metadata,
+              diagnostic: safeDiagnostic(err),
+              quarantined: true,
+            },
+          },
+        );
         log.error(
           { err, mint: event.tokenMint, amountLamports, route: cfg.execution_route },
           "copy buy failed or landing is uncertain — coin quarantined",
@@ -1341,6 +1676,20 @@ async function main() {
         return null;
       }
       uncertainEntryMints.add(event.tokenMint);
+      recordStrategyDecision(event, "copied", "copy buy landed; saving position", {
+        ...metaPatch,
+        amount_usd: options.targetBuyUsd,
+        bot_tx_sig: result.txSig,
+        reaction_ms: strategyReactionMs(event, Date.now(), result.latencyMs),
+        execution_ms: result.latencyMs,
+        metadata: {
+          ...metaPatch.metadata,
+          configuredBuyUsd: buyUsd,
+          receivedTokens: result.outUiAmount,
+          route: result.route,
+          persistencePending: true,
+        },
+      });
 
       const receivedUi = result.outUiAmount ?? 0;
       const entryPrice =
@@ -1437,6 +1786,22 @@ async function main() {
         },
         "copy buy landed — follower monitor armed",
       );
+      recordStrategyDecision(event, "copied", "copy buy landed and follower monitoring was armed", {
+        ...metaPatch,
+        position_id: pos.id,
+        amount_usd: options.targetBuyUsd,
+        bot_tx_sig: result.txSig,
+        reaction_ms: strategyReactionMs(event, Date.now(), result.latencyMs),
+        execution_ms: result.latencyMs,
+        metadata: {
+          ...metaPatch.metadata,
+          configuredBuyUsd: buyUsd,
+          receivedTokens: receivedUi,
+          entryPriceUsd: entryPrice,
+          route: result.route,
+          persistencePending: false,
+        },
+      });
       return pos.id;
     }
   }
