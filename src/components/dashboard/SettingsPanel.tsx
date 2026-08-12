@@ -692,6 +692,101 @@ export function SettingsPanel({ cfg, onChange }: Props) {
           </SettingRow>
         </SectionCard>
       </fieldset>
+
+      <SectionCard
+        title="Sell coverage"
+        description="Global target-sale and custody-transfer responses for regular and coordinated positions"
+        icon={<TrendingUp className="h-4 w-4" />}
+      >
+        <SettingRow
+          label="Direct target-wallet sells"
+          hint="Optional response when a target linked to this position completes a verified on-chain sale. Transfers and ambiguous transactions never use this rule."
+        >
+          <RadioGroup
+            value={cfg.directTargetSellExitMode}
+            onValueChange={(value) =>
+              onChange({
+                directTargetSellExitMode: value as BotConfig["directTargetSellExitMode"],
+              })
+            }
+            className="grid grid-cols-2 gap-x-4 gap-y-2"
+          >
+            {[
+              ["off", "OFF"],
+              ["proportional", "PROPORTIONAL"],
+              ["fixed_pct", "FIXED %"],
+              ["full", "FULL EXIT"],
+            ].map(([value, label]) => (
+              <div key={value} className="flex items-center gap-2">
+                <RadioGroupItem value={value} id={`target-sell-${value}`} />
+                <Label htmlFor={`target-sell-${value}`} className="mono text-xs">
+                  {label}
+                </Label>
+              </div>
+            ))}
+          </RadioGroup>
+        </SettingRow>
+        {cfg.directTargetSellExitMode === "fixed_pct" && (
+          <SettingRow
+            label="Direct target exit size"
+            hint="Sell this percentage of your remaining position once per unique verified target-sale transaction."
+          >
+            <NumInput
+              value={cfg.directTargetSellExitPct}
+              onChange={(n) => onChange({ directTargetSellExitPct: n })}
+              suffix="%"
+              min={0.01}
+              max={100}
+            />
+          </SettingRow>
+        )}
+        <SettingRow
+          label="Defensive custody-outflow exit"
+          hint="Optional high-risk rule for transfers from a tracked follower into a pool, vault, bridge, exchange-like wallet, or other untrackable destination. Keep off unless you want deposits to trigger a defensive exit."
+        >
+          <Switch
+            checked={cfg.terminalOutflowExitEnabled}
+            onCheckedChange={(v) => onChange({ terminalOutflowExitEnabled: v })}
+          />
+        </SettingRow>
+        {cfg.terminalOutflowExitEnabled && (
+          <SettingRow
+            label="Custody-outflow exit size"
+            hint="Sell this percentage once per unique terminal transfer. A deposit is not proof of an actual market sale."
+          >
+            <NumInput
+              value={cfg.terminalOutflowExitPct}
+              onChange={(n) => onChange({ terminalOutflowExitPct: n })}
+              suffix="%"
+              min={0.01}
+              max={100}
+            />
+          </SettingRow>
+        )}
+        <SettingRow
+          label="Target custody-transfer exit"
+          hint="Very high risk. Optionally exits when a target authoritatively linked to the position transfers into a confirmed program/off-curve destination. A CEX, vault, or pool deposit is not proof of a sale, so this defaults OFF."
+        >
+          <Switch
+            checked={cfg.targetTerminalOutflowExitEnabled}
+            onCheckedChange={(v) => onChange({ targetTerminalOutflowExitEnabled: v })}
+          />
+        </SettingRow>
+        {cfg.targetTerminalOutflowExitEnabled && (
+          <SettingRow
+            label="Target custody exit size"
+            hint="Sell this percentage once per unique, fresh, safely classified transfer from a linked target. Unknown destination classifications never trigger it."
+          >
+            <NumInput
+              value={cfg.targetTerminalOutflowExitPct}
+              onChange={(n) => onChange({ targetTerminalOutflowExitPct: n })}
+              suffix="%"
+              min={0.01}
+              max={100}
+            />
+          </SettingRow>
+        )}
+      </SectionCard>
     </div>
   );
 }

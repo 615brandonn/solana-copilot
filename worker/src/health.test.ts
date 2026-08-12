@@ -18,8 +18,19 @@ test("rejects invalid heartbeat timestamps", () => {
 
 test("recognizes old heartbeat schemas so the worker can use the compatible payload", () => {
   assert.equal(
-    isMissingReadinessColumnError("Could not find the 'funding_key_ready' column in the schema cache"),
+    isMissingReadinessColumnError(
+      "Could not find the 'funding_key_ready' column in the schema cache",
+    ),
     true,
   );
-  assert.equal(isMissingReadinessColumnError("permission denied for table worker_heartbeat"), false);
+  assert.equal(
+    isMissingReadinessColumnError(
+      "Could not find the 'follower_balance_mismatch_count' column in the schema cache",
+    ),
+    true,
+  );
+  assert.equal(
+    isMissingReadinessColumnError("permission denied for table worker_heartbeat"),
+    false,
+  );
 });

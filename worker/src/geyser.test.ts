@@ -9,6 +9,7 @@ import { VERIFIED_SWAP_PROGRAMS } from "./swap-signal.js";
 const target = Keypair.generate().publicKey.toBase58();
 const payer = Keypair.generate().publicKey.toBase58();
 const recipient = Keypair.generate().publicKey.toBase58();
+const otherRecipient = Keypair.generate().publicKey.toBase58();
 const INPUT_MINT = "input-token-mint";
 const OUTPUT_MINT = "output-token-mint";
 const OTHER_OUTPUT_MINT = "other-output-token-mint";
@@ -43,11 +44,11 @@ function decode(options: {
 }): FeedEvent[] {
   const accountKeys =
     options.targetSigner === false
-      ? [payer, target, recipient]
+      ? [payer, target, recipient, otherRecipient]
       : options.secondSigner
-        ? [target, payer, recipient]
-        : [target, recipient];
-  const requiredSignatures = options.targetSigner === false || options.secondSigner ? 2 : 1;
+        ? [target, payer, recipient, otherRecipient]
+        : [target, recipient, otherRecipient];
+  const requiredSignatures = options.secondSigner ? 2 : 1;
   const targetIndex = accountKeys.indexOf(target);
   const preBalances = accountKeys.map(() => 1_000_000_000);
   const postBalances = preBalances.map((balance, index) =>
@@ -176,4 +177,272 @@ test("Geyser aggregates recipient accounts before inferring an external buy", ()
     ],
   });
   assert.equal(buys(reallocation).length, 0);
+});
+
+test("a failed subscription write stays pending and is retried for the same wallet", async () => {
+  let writes = 0;
+  let shouldFail = true;
+  const stream = {
+    write: (_request: unknown, callback: (error?: Error) => void) => {
+      writes += 1;
+      callback(shouldFail ? new Error("private endpoint failed") : undefined);
+    },
+  };
+  const feed = Object.create(GeyserFeed.prototype) as any;
+  feed.desiredWatched = new Set<string>();
+  feed.watched = new Set<string>();
+  feed.stream = stream;
+  feed.streamGeneration = 1;
+  feed.stopped = false;
+  feed.reconnectTimer = undefined;
+  feed.scheduleReconnect = () => {};
+
+  await assert.rejects(feed.watch(target), /Geyser operation failed/);
+  assert.equal(feed.desiredWatched.has(target), true);
+  assert.equal(feed.watched.has(target), false);
+  assert.equal(feed.health().pendingSubscriptionCount, 1);
+  assert.equal(feed.health().connected, false);
+  assert.equal(feed.health().transportConnected, true);
+
+  shouldFail = false;
+  await feed.watch(target);
+  assert.equal(writes, 2);
+  assert.equal(feed.watched.has(target), true);
+  assert.equal(feed.health().pendingSubscriptionCount, 0);
+  assert.equal(feed.health().subscriptionReady, true);
+  assert.equal(feed.health().messageFresh, false);
+  assert.equal(feed.health().connected, false);
+  feed.lastMessageAt = Date.now();
+  feed.lastMessageGeneration = 1;
+  assert.equal(feed.health().connected, true);
+});
+
+test("a disconnected watch is desired but never reported as server-subscribed", async () => {
+  const feed = Object.create(GeyserFeed.prototype) as any;
+  feed.desiredWatched = new Set<string>();
+  feed.watched = new Set<string>();
+  feed.stream = undefined;
+  feed.lastMessageAt = undefined;
+  feed.decodedEventCount = 0;
+
+  await feed.watch(target);
+  const health = feed.health();
+  assert.equal(health.desiredWatchedCount, 1);
+  assert.equal(health.watchedCount, 0);
+  assert.equal(health.pendingSubscriptionCount, 1);
+  assert.equal(health.connected, false);
+});
+
+test("Geyser health requires recent message evidence, not only a writable stream", () => {
+  const now = 1_000_000;
+  const feed = Object.create(GeyserFeed.prototype) as any;
+  feed.desiredWatched = new Set([target]);
+  feed.watched = new Set([target]);
+  feed.stream = {};
+  feed.streamGeneration = 1;
+  feed.pendingMessages = [];
+  feed.discardedQueuedMessageCount = 0;
+  feed.decodedEventCount = 0;
+
+  feed.lastMessageAt = now - 59_000;
+  feed.lastMessageGeneration = 1;
+  assert.equal(feed.health(now).messageFresh, true);
+  assert.equal(feed.health(now).connected, true);
+
+  feed.lastMessageAt = now - 61_000;
+  assert.equal(feed.health(now).messageFresh, false);
+  assert.equal(feed.health(now).connected, false);
+  assert.equal(feed.health(now).transportConnected, true);
+
+  feed.lastMessageAt = now - 1_000;
+  feed.lastMessageGeneration = 0;
+  assert.equal(feed.health(now).connected, false);
+});
+
+test("a replacement stream discards the old queue and drains its own paused message", async () => {
+  const handled: string[] = [];
+  let releaseFirst!: () => void;
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    markFirstStarted = resolve;
+  });
+  const firstRelease = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const oldStream = {
+    pause() {},
+    resume() {},
+  };
+  let newStreamResumed = 0;
+  const newStream = {
+    pause() {},
+    resume() {
+      newStreamResumed += 1;
+    },
+  };
+  const feed = Object.create(GeyserFeed.prototype) as any;
+  feed.stream = oldStream;
+  feed.streamGeneration = 1;
+  feed.pendingMessages = [];
+  feed.processingMessage = false;
+  feed.stopped = false;
+  feed.discardedQueuedMessageCount = 0;
+  feed.handleMessage = async (message: { id: string }) => {
+    handled.push(message.id);
+    if (message.id === "old-in-flight") {
+      markFirstStarted();
+      await firstRelease;
+    }
+  };
+
+  feed.processMessageWithBackpressure({ id: "old-in-flight" }, oldStream, 1);
+  await firstStarted;
+  feed.processMessageWithBackpressure({ id: "old-queued" }, oldStream, 1);
+  assert.equal(feed.pendingMessages.length, 1);
+
+  feed.stream = undefined;
+  feed.streamGeneration = 2;
+  feed.discardQueuedMessages("test reconnect");
+  feed.stream = newStream;
+  feed.streamGeneration = 3;
+  feed.processMessageWithBackpressure({ id: "new-live" }, newStream, 3);
+  releaseFirst();
+
+  for (let attempt = 0; attempt < 10 && !handled.includes("new-live"); attempt += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(handled, ["old-in-flight", "new-live"]);
+  assert.equal(feed.discardedQueuedMessageCount, 1);
+  assert.ok(newStreamResumed > 0);
+});
+
+test("a delayed queued Geyser event is freshness-gated as catch-up", async () => {
+  const delivered: FeedEvent[] = [];
+  const receivedAtMs = Date.now() - 6_000;
+  const feed = Object.create(GeyserFeed.prototype) as any;
+  feed.stream = {};
+  feed.streamGeneration = 7;
+  feed.decodedEventCount = 0;
+  feed.discardedQueuedMessageCount = 0;
+  feed.decodeEvents = () => [
+    {
+      kind: "transfer",
+      from: target,
+      to: recipient,
+      tokenMint: OUTPUT_MINT,
+      amountTokens: 10,
+      decimals: 6,
+      slot: 123,
+      txSig: "delayed-signature",
+      timestampMs: Date.now(),
+    } satisfies FeedEvent,
+  ];
+  feed.onSwap = async (event: FeedEvent) => {
+    delivered.push(event);
+  };
+
+  await feed.handleMessage({ transaction: { transaction: {} } }, 7, receivedAtMs);
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0]?.delivery, "catchup");
+  assert.equal(delivered[0]?.blockTimeMs, receivedAtMs);
+  assert.equal(delivered[0]?.observedAtMs, receivedAtMs);
+});
+
+test("Geyser accepts a multi-signer sell only with one watched-wallet debit and one proceeds asset", () => {
+  const events = decode({
+    secondSigner: true,
+    preTokens: [tokenBalance(target, OUTPUT_MINT, 100), tokenBalance(target, USDC_MINT, 0)],
+    postTokens: [tokenBalance(target, OUTPUT_MINT, 25), tokenBalance(target, USDC_MINT, 60)],
+  });
+
+  const sells = events.filter((event) => event.kind === "swap" && event.side === "sell");
+  assert.equal(sells.length, 1);
+  const sell = sells[0];
+  assert.ok(sell?.kind === "swap");
+  assert.equal(sell.tokenMint, OUTPUT_MINT);
+  assert.equal(sell.verifiedSwap, true);
+  assert.deepEqual(sell.sellAttribution, {
+    verified: true,
+    tokenBalanceBefore: 100,
+    tokenBalanceAfter: 25,
+    soldFraction: 0.75,
+    proceedsMint: USDC_MINT,
+    proceedsAmount: 60,
+    signerCount: 2,
+  });
+});
+
+test("Geyser rejects untrusted and ambiguous target sells", () => {
+  const untrustedProgram = "11111111111111111111111111111111";
+  const untrusted = decode({
+    logs: [
+      `Program ${untrustedProgram} invoke [1]`,
+      "Program log: Instruction: Swap",
+      `Program ${untrustedProgram} success`,
+    ],
+    preTokens: [tokenBalance(target, OUTPUT_MINT, 100), tokenBalance(target, USDC_MINT, 0)],
+    postTokens: [tokenBalance(target, OUTPUT_MINT, 0), tokenBalance(target, USDC_MINT, 60)],
+  });
+  assert.equal(
+    untrusted.some((event) => event.kind === "swap" && event.side === "sell"),
+    false,
+  );
+
+  const nonSigner = decode({
+    targetSigner: false,
+    preTokens: [tokenBalance(target, OUTPUT_MINT, 100), tokenBalance(target, USDC_MINT, 0)],
+    postTokens: [tokenBalance(target, OUTPUT_MINT, 0), tokenBalance(target, USDC_MINT, 60)],
+  });
+  assert.equal(
+    nonSigner.some((event) => event.kind === "swap" && event.side === "sell"),
+    false,
+  );
+
+  const ambiguous = decode({
+    preTokens: [
+      tokenBalance(target, OUTPUT_MINT, 100),
+      tokenBalance(target, USDC_MINT, 0),
+      tokenBalance(target, OTHER_OUTPUT_MINT, 0),
+    ],
+    postTokens: [
+      tokenBalance(target, OUTPUT_MINT, 0),
+      tokenBalance(target, USDC_MINT, 60),
+      tokenBalance(target, OTHER_OUTPUT_MINT, 5),
+    ],
+  });
+  assert.equal(
+    ambiguous.some((event) => event.kind === "swap" && event.side === "sell"),
+    false,
+  );
+});
+
+test("Geyser emits a single conserving batch with every split-transfer recipient", () => {
+  const events = decode({
+    logs: [],
+    preTokens: [
+      tokenBalance(target, OUTPUT_MINT, 100),
+      tokenBalance(recipient, OUTPUT_MINT, 5),
+      tokenBalance(otherRecipient, OUTPUT_MINT, 10),
+    ],
+    postTokens: [
+      tokenBalance(target, OUTPUT_MINT, 0),
+      tokenBalance(recipient, OUTPUT_MINT, 65),
+      tokenBalance(otherRecipient, OUTPUT_MINT, 50),
+    ],
+  });
+  const transfers = events.filter((event) => event.kind === "transfer");
+  assert.equal(transfers.length, 1);
+  const batch = transfers[0];
+  assert.ok(batch?.kind === "transfer");
+  assert.equal(batch.amountTokens, 100);
+  const recipients = (batch.recipients ?? []).map((row) => ({
+    to: row.wallet,
+    amount: row.amountTokens,
+    pre: row.recipientPreAmount,
+  }));
+  const expected = [
+    { to: recipient, amount: 60, pre: 5 },
+    { to: otherRecipient, amount: 40, pre: 10 },
+  ].sort((a, b) => a.to.localeCompare(b.to));
+  assert.deepEqual(recipients, expected);
 });

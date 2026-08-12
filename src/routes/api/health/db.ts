@@ -23,18 +23,27 @@ export const Route = createFileRoute("/api/health/db")({
           const db = createClient<Database>(normalizeSupabaseUrl(url), key, {
             auth: { persistSession: false, autoRefreshToken: false },
           });
-          const { count, error } = await db.from("bot_config").select("*", { count: "exact", head: true });
+          const { count, error } = await db
+            .from("bot_config")
+            .select("*", { count: "exact", head: true });
           if (error) {
+            const safeCode =
+              typeof error.code === "string" && /^[a-z0-9_-]{1,32}$/i.test(error.code)
+                ? error.code
+                : null;
             return Response.json({
               ok: false,
-              error: error.message,
-              code: error.code,
+              error: "Supabase database health check failed.",
+              code: safeCode,
               hint: "Check that schema.sql was run and the service role key is correct.",
             });
           }
           return Response.json({ ok: true, message: "Connected to Supabase", rowCount: count });
-        } catch (e: any) {
-          return Response.json({ ok: false, error: e.message });
+        } catch {
+          return Response.json({
+            ok: false,
+            error: "Supabase database health check could not complete.",
+          });
         }
       },
     },

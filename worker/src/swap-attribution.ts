@@ -36,6 +36,16 @@ export type VerifiedBuyAttribution = VerifiedSpend & {
   verified: boolean;
 };
 
+export type VerifiedSellAttribution = {
+  verified: boolean;
+  tokenBalanceBefore?: number;
+  tokenBalanceAfter?: number;
+  soldFraction?: number;
+  proceedsMint?: string;
+  proceedsAmount?: number;
+  signerCount: number;
+};
+
 export function parseRawTokenAmount(value: unknown): bigint | undefined {
   if (typeof value !== "string" && typeof value !== "number" && typeof value !== "bigint") {
     return undefined;
@@ -153,6 +163,65 @@ export function attributeVerifiedBuy(
     return { solSpend, verified: true };
   }
   return { verified: false };
+}
+
+/**
+ * Attribute a sale to a watched wallet from its own balance changes. This is
+ * deliberately stricter than merely seeing a transaction-wide "Swap" log:
+ * the wallet must sign, exactly one token must leave it, and exactly one
+ * proceeds asset must return to it. Native SOL and WSOL are treated as the
+ * same proceeds asset so account closing does not manufacture ambiguity.
+ */
+export function attributeVerifiedSell(
+  rows: WalletTokenDelta[],
+  soldMint: string,
+  nativeSolDelta: number,
+  hasSwapSignal: boolean,
+  walletSigned: boolean,
+  signerCount: number,
+): VerifiedSellAttribution {
+  const rejected = { verified: false, signerCount };
+  if (!hasSwapSignal || !walletSigned || !Number.isInteger(signerCount) || signerCount < 1) {
+    return rejected;
+  }
+
+  const sold = rows.find((row) => row.mint === soldMint);
+  if (!sold || !Number.isFinite(sold.pre) || !Number.isFinite(sold.post) || sold.pre <= 0) {
+    return rejected;
+  }
+  const soldAmount = sold.pre - sold.post;
+  if (!Number.isFinite(soldAmount) || soldAmount <= TOKEN_EPSILON) return rejected;
+
+  const debits = rows.filter((row) => tokenDelta(row) < -TOKEN_EPSILON);
+  if (debits.length !== 1 || debits[0]?.mint !== soldMint) return rejected;
+
+  const positiveTokens = rows.filter(
+    (row) => row.mint !== soldMint && row.mint !== WSOL_MINT && tokenDelta(row) > TOKEN_EPSILON,
+  );
+  const wsolProceeds = rows
+    .filter((row) => row.mint === WSOL_MINT)
+    .reduce((sum, row) => sum + Math.max(0, tokenDelta(row)), 0);
+  const nativeProceeds = Number.isFinite(nativeSolDelta)
+    ? Math.max(0, nativeSolDelta)
+    : 0;
+  const solProceeds = wsolProceeds + nativeProceeds;
+  const proceedsCount = positiveTokens.length + (solProceeds > MATERIAL_SOL_DELTA ? 1 : 0);
+  if (proceedsCount !== 1) return rejected;
+
+  const tokenProceeds = positiveTokens[0];
+  const proceedsMint = tokenProceeds?.mint ?? WSOL_MINT;
+  const proceedsAmount = tokenProceeds ? tokenDelta(tokenProceeds) : solProceeds;
+  if (!Number.isFinite(proceedsAmount) || proceedsAmount <= 0) return rejected;
+
+  return {
+    verified: true,
+    tokenBalanceBefore: sold.pre,
+    tokenBalanceAfter: Math.max(0, sold.post),
+    soldFraction: Math.min(1, Math.max(0, soldAmount / sold.pre)),
+    proceedsMint,
+    proceedsAmount,
+    signerCount,
+  };
 }
 
 export function isOnCurveWallet(address: string): boolean {

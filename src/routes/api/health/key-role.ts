@@ -18,10 +18,15 @@ export const Route = createFileRoute("/api/health/key-role")({
         const key = process.env.SERVER_SUPABASE_SERVICE_ROLE_KEY ?? "";
         const role = decodeJwtRole(key);
         return Response.json({
-          role,
+          configured: key.length > 0,
+          serviceRoleVerified: role === "service_role",
           looksLikeJwt: key.split(".").length === 3,
-          keyLength: key.length,
-          hint: role === "service_role" ? "Correct service role key" : "This key is NOT the service role key. Go to Supabase → Settings → API → copy the Secret key (service role).",
+          hint:
+            role === "service_role"
+              ? "Service-role JWT verified."
+              : key.startsWith("sb_secret_")
+                ? "Supabase secret key is configured."
+                : "Server key role could not be verified.",
         });
       },
     },

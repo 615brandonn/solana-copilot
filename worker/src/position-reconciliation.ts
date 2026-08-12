@@ -6,6 +6,11 @@ export type OpenPositionBalance = {
   token_mint: string;
 };
 
+export type OpenPositionAmount = OpenPositionBalance & {
+  amount_remaining: number;
+  decimals?: number;
+};
+
 export type WalletTokenHolding = {
   token_mint: string;
   amount: number;
@@ -93,6 +98,43 @@ export class ZeroBalanceConfirmationTracker {
       const count = (this.misses.get(position.id) ?? 0) + 1;
       this.misses.set(position.id, count);
       if (count >= 2) confirmed.push(position.id);
+    }
+    return confirmed;
+  }
+}
+
+/**
+ * Confirms any downward funding-wallet balance change twice before capping
+ * database accounting to the chain. It never increases/adopts a position.
+ */
+export class ReducedBalanceConfirmationTracker {
+  private pending = new Map<string, { amount: number; count: number }>();
+
+  observe(
+    positions: OpenPositionAmount[],
+    holdings: ReadonlyMap<string, number>,
+  ): Array<{ id: string; amountRemaining: number }> {
+    const openIds = new Set(positions.map((position) => position.id));
+    for (const id of this.pending.keys()) {
+      if (!openIds.has(id)) this.pending.delete(id);
+    }
+
+    const confirmed: Array<{ id: string; amountRemaining: number }> = [];
+    for (const position of positions) {
+      const recorded = Math.max(0, Number(position.amount_remaining) || 0);
+      const actual = Math.max(0, Number(holdings.get(position.token_mint) ?? 0));
+      const decimals = Math.max(0, Math.min(18, Number(position.decimals ?? 9) || 0));
+      const tolerance = Math.max(1e-9, 1 / 10 ** decimals);
+      if (actual + tolerance >= recorded) {
+        this.pending.delete(position.id);
+        continue;
+      }
+
+      const prior = this.pending.get(position.id);
+      const sameObservation = prior !== undefined && Math.abs(prior.amount - actual) <= tolerance;
+      const next = { amount: actual, count: sameObservation ? prior.count + 1 : 1 };
+      this.pending.set(position.id, next);
+      if (next.count >= 2) confirmed.push({ id: position.id, amountRemaining: actual });
     }
     return confirmed;
   }

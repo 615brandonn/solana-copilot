@@ -56,6 +56,12 @@ export type BotConfig = {
   followerSellerExitPct: number;
   targetInactivityExitEnabled: boolean;
   targetInactivityHours: number;
+  directTargetSellExitMode: "off" | "proportional" | "fixed_pct" | "full";
+  directTargetSellExitPct: number;
+  terminalOutflowExitEnabled: boolean;
+  terminalOutflowExitPct: number;
+  targetTerminalOutflowExitEnabled: boolean;
+  targetTerminalOutflowExitPct: number;
 };
 
 export const DEFAULT_CONFIG: BotConfig = {
@@ -116,6 +122,12 @@ export const DEFAULT_CONFIG: BotConfig = {
   followerSellerExitPct: 100,
   targetInactivityExitEnabled: false,
   targetInactivityHours: 6,
+  directTargetSellExitMode: "off",
+  directTargetSellExitPct: 100,
+  terminalOutflowExitEnabled: false,
+  terminalOutflowExitPct: 100,
+  targetTerminalOutflowExitEnabled: false,
+  targetTerminalOutflowExitPct: 100,
 };
 
 const KEY = "helix.bot.config.v1";

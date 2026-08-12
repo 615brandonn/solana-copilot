@@ -154,6 +154,22 @@ function Dashboard() {
     readinessIssues.push("Worker heartbeat exists under a different HELIX_USER_ID.");
   } else if (workerQ.isSuccess && !workerQ.data.online) {
     readinessIssues.push("No recent VPS heartbeat.");
+  } else if (workerQ.data?.followerBalanceReconciliationDegraded) {
+    readinessIssues.push(
+      "Follower-wallet balance reconciliation is degraded; new entries are blocked.",
+    );
+  } else if ((workerQ.data?.followerBalanceMismatchCount ?? 0) > 0) {
+    readinessIssues.push(
+      `${workerQ.data?.followerBalanceMismatchCount} follower-wallet balance mismatch(es) need review; new entries are blocked.`,
+    );
+  } else if ((workerQ.data?.rpcBacklogWalletCount ?? 0) > 0) {
+    readinessIssues.push(
+      `RPC catch-up is still draining for ${workerQ.data?.rpcBacklogWalletCount} monitored wallet(s).`,
+    );
+  } else if (workerQ.data?.monitoringDegraded) {
+    readinessIssues.push(
+      "Transaction monitoring is degraded; new entries are blocked while exits stay active.",
+    );
   }
   if (workerQ.data?.fundingKeyCheckedAt && workerQ.data.fundingKeyReady === false) {
     readinessIssues.push(workerQ.data.lastError ?? "The worker cannot use the saved funding key.");
@@ -164,6 +180,30 @@ function Dashboard() {
     : ready
       ? "Target wallet, funding key, and worker heartbeat are ready."
       : readinessIssues.join(" ");
+  const workerDegraded =
+    workerQ.data?.monitoringDegraded === true ||
+    workerQ.data?.followerBalanceReconciliationDegraded === true ||
+    (workerQ.data?.followerBalanceMismatchCount ?? 0) > 0 ||
+    (workerQ.data?.rpcBacklogWalletCount ?? 0) > 0;
+  const workerStatusMessage = workerQ.isError
+    ? `Worker heartbeat unavailable: ${workerQ.error instanceof Error ? workerQ.error.message : "unknown error"}`
+    : !workerQ.data?.online
+      ? "No recent VPS heartbeat"
+      : workerQ.data.followerBalanceReconciliationDegraded
+        ? "Heartbeat current; follower-wallet balance reconciliation is degraded; exits remain active"
+        : workerQ.data.followerBalanceMismatchCount > 0
+          ? `Heartbeat current; ${workerQ.data.followerBalanceMismatchCount} follower-wallet balance mismatch(es) block new entries; exits remain active`
+          : workerQ.data.rpcBacklogWalletCount > 0
+            ? `Heartbeat current; RPC catch-up pending for ${workerQ.data.rpcBacklogWalletCount} monitored wallet(s)`
+            : workerQ.data.monitoringDegraded
+              ? "Heartbeat current, but transaction monitoring is degraded; exits remain active"
+              : workerQ.data.followerBalanceCandidateCount > 0
+                ? `Heartbeat current; verifying ${workerQ.data.followerBalanceCandidateCount} first-snapshot follower balance difference(s); entries remain available unless confirmed twice`
+                : workerQ.data.geyserConnected
+                  ? `Heartbeat current; Geyser connected; ${workerQ.data.decodedEventCount} decoded events`
+                  : workerQ.data.rpcLastSuccessAt
+                    ? `Heartbeat current; RPC fallback healthy; ${workerQ.data.decodedEventCount} decoded events`
+                    : `Heartbeat current; ${workerQ.data.decodedEventCount} decoded events`;
 
   const handleSaveKey = async () => {
     try {
@@ -214,13 +254,8 @@ function Dashboard() {
           readinessPending={readinessPending}
           readinessMessage={readinessMessage}
           workerConnected={workerQ.isSuccess ? workerQ.data.online : undefined}
-          workerStatusMessage={
-            workerQ.isError
-              ? `Worker heartbeat unavailable: ${workerQ.error instanceof Error ? workerQ.error.message : "unknown error"}`
-              : workerQ.data?.online
-                ? `Heartbeat current; ${workerQ.data.decodedEventCount} decoded events`
-                : "No recent VPS heartbeat"
-          }
+          workerDegraded={workerDegraded}
+          workerStatusMessage={workerStatusMessage}
           activePositions={activePositions}
           monitoredWallets={monitored}
           syncing={syncing}

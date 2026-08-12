@@ -97,7 +97,17 @@ export const getWorkerStatus = createServerFn({ method: "GET" }).handler(async (
       online: false,
       updatedAt: null,
       geyserConnected: false,
+      lastGeyserMessageAt: null,
       decodedEventCount: 0,
+      rpcLastPollAt: null,
+      rpcLastSuccessAt: null,
+      rpcBacklogWalletCount: 0,
+      monitoringDegraded: false,
+      followerBalanceLastCheckedAt: null,
+      followerBalanceCandidateCount: 0,
+      followerBalanceMismatchCount: 0,
+      followerBalanceReconciliationDegraded: false,
+      followerBalanceLastError: null,
       fundingKeyReady: null,
       fundingKeyCheckedAt: null,
       fundingWalletPubkey: null,
@@ -111,9 +121,21 @@ export const getWorkerStatus = createServerFn({ method: "GET" }).handler(async (
     online,
     updatedAt: data.updated_at,
     geyserConnected: data.geyser_connected,
+    lastGeyserMessageAt: data.last_geyser_message_at ?? null,
     decodedEventCount: Number(data.decoded_event_count),
-    fundingKeyReady:
-      typeof data.funding_key_ready === "boolean" ? data.funding_key_ready : null,
+    rpcLastPollAt: data.rpc_last_poll_at ?? null,
+    rpcLastSuccessAt: data.rpc_last_success_at ?? null,
+    rpcBacklogWalletCount: Math.max(0, Number(data.rpc_backlog_wallet_count ?? 0)),
+    monitoringDegraded: data.monitoring_degraded === true,
+    followerBalanceLastCheckedAt: data.follower_balance_last_checked_at ?? null,
+    followerBalanceCandidateCount: Math.max(0, Number(data.follower_balance_candidate_count ?? 0)),
+    followerBalanceMismatchCount: Math.max(0, Number(data.follower_balance_mismatch_count ?? 0)),
+    followerBalanceReconciliationDegraded:
+      typeof data.follower_balance_reconciliation_degraded === "boolean"
+        ? data.follower_balance_reconciliation_degraded
+        : true,
+    followerBalanceLastError: data.follower_balance_last_error ?? null,
+    fundingKeyReady: typeof data.funding_key_ready === "boolean" ? data.funding_key_ready : null,
     fundingKeyCheckedAt: data.funding_key_checked_at ?? null,
     fundingWalletPubkey: data.funding_wallet_pubkey ?? null,
     lastError: data.last_error ?? null,
@@ -175,14 +197,26 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
     initial_amount: number | string;
     current_amount: number | string;
     hop_depth: number | null;
+    trigger_eligible: boolean;
+    unexplained_outflow_amount: number | string;
     last_updated: string;
+  };
+  type ObservedFollower = {
+    token_mint: string;
+    wallet: string;
+    amount: number | string;
+    last_updated: string;
+    source_target_count: number | string;
   };
   let fws: ManagedFollower[] = [];
   if (posIds.length > 0) {
     const { data: fwsRaw, error: fwErr } = await (db as any)
       .from("follower_wallets")
-      .select("wallet, position_id, initial_amount, current_amount, hop_depth, last_updated")
+      .select(
+        "wallet, position_id, initial_amount, current_amount, hop_depth, trigger_eligible, unexplained_outflow_amount, last_updated",
+      )
       .in("position_id", posIds)
+      .is("released_at", null)
       .order("last_updated", { ascending: false });
     if (fwErr) throw new Error(fwErr.message);
     fws = (fwsRaw ?? []) as ManagedFollower[];
@@ -198,9 +232,10 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
       token_mint: mintByPos.get(f.position_id) ?? "",
       current_amount: current,
       held_pct: heldPct,
-      hop_depth: Math.max(1, Math.min(3, Number(f.hop_depth ?? 1))),
+      hop_depth: Math.max(1, Math.min(5, Number(f.hop_depth ?? 1))),
       last_updated: f.last_updated,
-      observed_only: false,
+      observed_only: !f.trigger_eligible,
+      unresolved_outflow_amount: Math.max(0, Number(f.unexplained_outflow_amount ?? 0)),
       source_target_count: null,
     };
   });
@@ -212,8 +247,8 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
     .maybeSingle();
   if (observedError) throw new Error(observedError.message);
   const managedKeys = new Set(managed.map((f) => `${f.token_mint}:${f.wallet}`));
-  const observedRows = Array.isArray(heartbeat?.observed_follower_holdings)
-    ? heartbeat.observed_follower_holdings
+  const observedRows: ObservedFollower[] = Array.isArray(heartbeat?.observed_follower_holdings)
+    ? (heartbeat.observed_follower_holdings as ObservedFollower[])
     : [];
   const observed = observedRows
     .filter((row) => !managedKeys.has(`${row.token_mint}:${row.wallet}`))
@@ -226,6 +261,7 @@ export const getFollowers = createServerFn({ method: "GET" }).handler(async () =
       hop_depth: 1,
       last_updated: row.last_updated,
       observed_only: true,
+      unresolved_outflow_amount: 0,
       source_target_count: Math.max(1, Number(row.source_target_count ?? 1)),
     }));
 

@@ -4,6 +4,7 @@ import { Keypair, PublicKey } from "@solana/web3.js";
 
 import {
   attributeVerifiedBuy,
+  attributeVerifiedSell,
   conservativeNativeSolSpend,
   hasWalletSpecificSpend,
   isOnCurveWallet,
@@ -120,4 +121,50 @@ test("raw token parsing and on-curve recipient checks fail closed", () => {
   assert.equal(isOnCurveWallet(wallet.toBase58()), true);
   assert.equal(isOnCurveWallet(pda.toBase58()), false);
   assert.equal(isOnCurveWallet("not-a-wallet"), false);
+});
+
+test("verifies a single- or multi-signer sell only with attributable proceeds", () => {
+  const sold = row(OUTPUT_MINT, 100, 25);
+  const usdc = row(USDC_MINT, 0, 60);
+  assert.deepEqual(attributeVerifiedSell([sold, usdc], OUTPUT_MINT, 0, true, true, 2), {
+    verified: true,
+    tokenBalanceBefore: 100,
+    tokenBalanceAfter: 25,
+    soldFraction: 0.75,
+    proceedsMint: USDC_MINT,
+    proceedsAmount: 60,
+    signerCount: 2,
+  });
+  assert.equal(
+    attributeVerifiedSell([sold], OUTPUT_MINT, 1, true, true, 1).verified,
+    true,
+  );
+});
+
+test("sell attribution rejects transfers, unrelated signers, and ambiguous balance flows", () => {
+  const sold = row(OUTPUT_MINT, 100, 0);
+  assert.equal(attributeVerifiedSell([sold], OUTPUT_MINT, 1, false, true, 1).verified, false);
+  assert.equal(attributeVerifiedSell([sold], OUTPUT_MINT, 1, true, false, 1).verified, false);
+  assert.equal(
+    attributeVerifiedSell(
+      [sold, row(USDC_MINT, 0, 60), row(INPUT_MINT, 0, 5)],
+      OUTPUT_MINT,
+      0,
+      true,
+      true,
+      1,
+    ).verified,
+    false,
+  );
+  assert.equal(
+    attributeVerifiedSell(
+      [sold, row(INPUT_MINT, 10, 0), row(USDC_MINT, 0, 60)],
+      OUTPUT_MINT,
+      0,
+      true,
+      true,
+      1,
+    ).verified,
+    false,
+  );
 });

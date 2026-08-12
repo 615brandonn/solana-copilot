@@ -130,6 +130,12 @@ export function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row
     followerSellerExitPct: row.follower_seller_exit_pct ?? 100,
     targetInactivityExitEnabled: row.target_inactivity_exit_enabled ?? false,
     targetInactivityHours: row.target_inactivity_hours ?? 6,
+    directTargetSellExitMode: row.direct_target_sell_exit_mode ?? "off",
+    directTargetSellExitPct: row.direct_target_sell_exit_pct ?? 100,
+    terminalOutflowExitEnabled: row.terminal_outflow_exit_enabled ?? false,
+    terminalOutflowExitPct: row.terminal_outflow_exit_pct ?? 100,
+    targetTerminalOutflowExitEnabled: row.target_terminal_outflow_exit_enabled ?? false,
+    targetTerminalOutflowExitPct: row.target_terminal_outflow_exit_pct ?? 100,
   };
 }
 
@@ -200,6 +206,12 @@ export function configToRow(
     follower_seller_exit_pct: cfg.followerSellerExitPct,
     target_inactivity_exit_enabled: cfg.targetInactivityExitEnabled,
     target_inactivity_hours: cfg.targetInactivityHours,
+    direct_target_sell_exit_mode: cfg.directTargetSellExitMode,
+    direct_target_sell_exit_pct: cfg.directTargetSellExitPct,
+    terminal_outflow_exit_enabled: cfg.terminalOutflowExitEnabled,
+    terminal_outflow_exit_pct: cfg.terminalOutflowExitPct,
+    target_terminal_outflow_exit_enabled: cfg.targetTerminalOutflowExitEnabled,
+    target_terminal_outflow_exit_pct: cfg.targetTerminalOutflowExitPct,
     updated_at: new Date().toISOString(),
   };
 }

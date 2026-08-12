@@ -60,10 +60,10 @@ export function StrategyLab() {
   const query = useQuery({
     queryKey: ["strategy-insights"],
     queryFn: () => getStrategyInsights(),
-    refetchInterval: 3_000,
-    refetchIntervalInBackground: true,
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
-    staleTime: 1_500,
+    staleTime: 10_000,
     retry: false,
   });
   const insights = query.data as StrategyInsights | undefined;
@@ -81,7 +81,7 @@ export function StrategyLab() {
       >
         {query.isError ? (
           <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
-            Strategy Lab is waiting for its Supabase v11 update. Trading continues normally.
+            Strategy Lab data is temporarily unavailable. Trading continues normally.
           </div>
         ) : (
           <>
@@ -92,10 +92,12 @@ export function StrategyLab() {
                   <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-success" />
                 </span>
                 <span className="mono text-[10px] font-semibold uppercase tracking-[0.18em] text-success">
-                  Live learning
+                  {number(insights?.total_observations) > 0
+                    ? "Live observations"
+                    : "Waiting for observations"}
                 </span>
                 <span className="text-[11px] text-muted-foreground">
-                  updates automatically every 3 seconds
+                  updates automatically every 15 seconds
                 </span>
               </div>
               <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">

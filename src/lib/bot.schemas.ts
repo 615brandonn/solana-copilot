@@ -64,6 +64,12 @@ export const BotConfigSchema = z
     followerSellerExitPct: z.number().finite().positive().max(100),
     targetInactivityExitEnabled: z.boolean(),
     targetInactivityHours: z.number().finite().min(0.05).max(720),
+    directTargetSellExitMode: z.enum(["off", "proportional", "fixed_pct", "full"]),
+    directTargetSellExitPct: z.number().finite().positive().max(100),
+    terminalOutflowExitEnabled: z.boolean(),
+    terminalOutflowExitPct: z.number().finite().positive().max(100),
+    targetTerminalOutflowExitEnabled: z.boolean(),
+    targetTerminalOutflowExitPct: z.number().finite().positive().max(100),
   })
   .refine((config) => config.mcMinUsd <= config.mcMaxUsd, {
     message: "Market-cap minimum cannot exceed maximum",
