@@ -60,6 +60,12 @@ export type BotConfigRow = {
   follower_seller_exit_pct: number;
   target_inactivity_exit_enabled: boolean;
   target_inactivity_hours: number;
+  direct_target_sell_exit_mode: "off" | "proportional" | "fixed_pct" | "full";
+  direct_target_sell_exit_pct: number;
+  terminal_outflow_exit_enabled: boolean;
+  terminal_outflow_exit_pct: number;
+  target_terminal_outflow_exit_enabled: boolean;
+  target_terminal_outflow_exit_pct: number;
   updated_at: string;
 };
 
@@ -120,6 +126,14 @@ export type WorkerHeartbeatRow = {
   last_geyser_message_at: string | null;
   decoded_event_count: number;
   rpc_last_poll_at: string | null;
+  rpc_last_success_at: string | null;
+  rpc_backlog_wallet_count: number;
+  monitoring_degraded: boolean;
+  follower_balance_last_checked_at: string | null;
+  follower_balance_candidate_count: number;
+  follower_balance_mismatch_count: number;
+  follower_balance_reconciliation_degraded: boolean;
+  follower_balance_last_error: string | null;
   funding_key_ready: boolean;
   funding_key_checked_at: string | null;
   funding_wallet_pubkey: string | null;
@@ -133,6 +147,24 @@ export type WorkerHeartbeatRow = {
     source_target_count: number;
     last_updated: string;
   }>;
+};
+
+export type FollowerBalanceAlertRow = {
+  id: string;
+  user_id: string;
+  wallet: string;
+  token_mint: string;
+  expected_amount: number;
+  observed_amount: number;
+  shortfall_amount: number;
+  active_position_count: number;
+  occurrence_count: number;
+  first_detected_at: string;
+  last_detected_at: string;
+  confirmed_at: string | null;
+  resolved_at: string | null;
+  resolution_reason: "balance_recovered" | "no_longer_active" | null;
+  resolution_observed_amount: number | null;
 };
 
 export type StrategyObservationRow = {
@@ -259,6 +291,11 @@ export type Database = {
         Row: WorkerHeartbeatRow;
         Insert: WorkerHeartbeatRow;
         Update: Partial<WorkerHeartbeatRow>;
+      };
+      follower_balance_alerts: {
+        Row: FollowerBalanceAlertRow;
+        Insert: Omit<FollowerBalanceAlertRow, "id" | "first_detected_at" | "last_detected_at">;
+        Update: Partial<FollowerBalanceAlertRow>;
       };
       strategy_observations: {
         Row: StrategyObservationRow;

@@ -13,6 +13,7 @@ type Follower = {
   hop_depth: number;
   last_updated: string;
   observed_only: boolean;
+  unresolved_outflow_amount?: number;
   source_target_count: number | null;
 };
 
@@ -109,9 +110,7 @@ export function PositionFollowers() {
         <div className="space-y-3 pt-3">
           {rows.map(({ holding, position }) => {
             const attached = position
-              ? followers.filter(
-                  (follower) => follower.position_id === position.id && !follower.observed_only,
-                )
+              ? followers.filter((follower) => follower.position_id === position.id)
               : followers.filter(
                   (follower) =>
                     follower.token_mint === holding.token_mint && follower.observed_only,
@@ -211,15 +210,23 @@ export function PositionFollowers() {
                           </a>
                           <div className="text-[10px] text-muted-foreground">
                             {follower.observed_only
-                              ? "Observed from target-wallet transfers"
+                              ? `observation only · hop ${follower.hop_depth}`
                               : `hop ${follower.hop_depth}`}{" "}
                           </div>
                           <div className="mt-1 text-[10px] text-muted-foreground">
-                            This wallet's live balance:{" "}
+                            {follower.position_id
+                              ? "Tracked cohort remaining: "
+                              : "Observed live balance: "}
                             <span className="mono font-medium text-foreground">
                               {amount(Number(follower.current_amount))} tokens
                             </span>
                           </div>
+                          {Number(follower.unresolved_outflow_amount ?? 0) > 0 ? (
+                            <div className="mt-1 text-[10px] text-amber-500">
+                              Unresolved transfer out:{" "}
+                              {amount(Number(follower.unresolved_outflow_amount))} tokens
+                            </div>
+                          ) : null}
                         </div>
                         {follower.held_pct === null ? (
                           <span className="shrink-0 text-[10px] uppercase tracking-wider text-muted-foreground">

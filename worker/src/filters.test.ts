@@ -53,6 +53,12 @@ const config: BotConfigRow = {
   follower_seller_exit_pct: 100,
   target_inactivity_exit_enabled: false,
   target_inactivity_hours: 6,
+  direct_target_sell_exit_mode: "off",
+  direct_target_sell_exit_pct: 100,
+  terminal_outflow_exit_enabled: false,
+  terminal_outflow_exit_pct: 100,
+  target_terminal_outflow_exit_enabled: false,
+  target_terminal_outflow_exit_pct: 100,
 };
 
 const event: SwapEvent = {

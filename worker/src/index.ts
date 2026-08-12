@@ -8,12 +8,29 @@ import bs58 from "bs58";
 import { env } from "./env.js";
 import { db, type BotConfigRow } from "./db.js";
 import { GeyserFeed, type FeedEvent, type SwapEvent, type TransferEvent } from "./geyser.js";
-import { FollowerMonitor } from "./monitor.js";
+import { FollowerMonitor, type ChainedTransferBatchState } from "./monitor.js";
 import { executeSwap, type ExecuteResult } from "./executor.js";
+import { SubmissionUncertainError, isPostSubmissionError } from "./execution-safety.js";
+import {
+  canReclaimEntryClaim,
+  entryClaimFailureDisposition,
+  entryClaimMatchesPersistedPosition,
+  isUnresolvedEntryClaim,
+  type EntryClaimStatus,
+} from "./entry-claim-policy.js";
 import { decryptPrivateKey } from "./crypto.js";
 import { checkEntry, loadTokenMeta } from "./filters.js";
 import { RpcBackfillPoller } from "./poller.js";
+import { createSupabaseRpcCursorStore } from "./rpc-cursor.js";
+import { PendingTransferBuffer } from "./pending-transfer-buffer.js";
+import { computeTargetSellAmount } from "./target-sell-policy.js";
 import { isMissingReadinessColumnError, toIsoTimestamp } from "./health.js";
+import {
+  createRpcFollowerTokenBalanceReader,
+  createSupabaseFollowerBalanceStore,
+  FollowerBalanceReconciler,
+} from "./follower-balance-reconciler.js";
+import { evaluateEntryMonitoringGate } from "./entry-monitoring-gate.js";
 import { priceUsd } from "./prices.js";
 import {
   checkCoordinatedEntry,
@@ -30,10 +47,24 @@ import {
   RecentEventDeduper,
 } from "./event-deduper.js";
 import { resolveTargetBuyValue } from "./target-buy-valuation.js";
+import {
+  transferEventForRecipient,
+  transferRecipients,
+  type ClassifiedTransferRecipient,
+} from "./transfer-batch.js";
+import {
+  canReclaimSellClaim,
+  periodicSellIdentity,
+  sellClaimFailureDisposition,
+  type SellTriggerKind,
+} from "./sell-claim-policy.js";
+import { authoritativeCoordinatedTargetLinks } from "./target-link-backfill.js";
+import { targetTerminalOutflowExitPct } from "./target-outflow-policy.js";
 import { quoteTokenSpendUsd } from "./token-spend-quote.js";
 import {
   groupObservedFollowerTransfers,
   isEligibleFollowerWallet,
+  ReducedBalanceConfirmationTracker,
   walletTokenHoldings,
   type WalletTokenHolding,
   ZeroBalanceConfirmationTracker,
@@ -41,6 +72,7 @@ import {
 import {
   observationFromEvent,
   StrategyRecorder,
+  strategyEventsFromFeedEvent,
   strategyReactionMs,
   type StrategyDecision,
   type StrategyObservationPatch,
@@ -53,7 +85,8 @@ const STABLECOIN_MINTS = new Set([
   "Es9vMFrzaCERmJfrF4H2FYD4KCo24RDUuUuJZq8bn6T", // USDT
 ]);
 const rpc = new Connection(env.RPC_URL, { commitment: "processed" });
-const followerRecipientEligibility = new Map<string, boolean>();
+type RecipientClassification = "eligible" | "program_or_off_curve" | "unknown";
+const followerRecipientEligibility = new Map<string, RecipientClassification>();
 
 type CopyBuyOptions = {
   entryMode: "regular" | "coordinated";
@@ -62,25 +95,43 @@ type CopyBuyOptions = {
   coordinatedWallets?: string[];
 };
 
-async function isEligibleFollowerRecipient(address: string): Promise<boolean> {
+type EntryClaimRow = {
+  id: string;
+  user_id: string;
+  source_tx_sig: string;
+  source_wallet: string;
+  token_mint: string;
+  planned_position_id: string;
+  entry_mode: "regular" | "coordinated";
+  amount_lamports: number | string;
+  status: EntryClaimStatus;
+  bot_tx_sig: string | null;
+};
+
+async function classifyFollowerRecipient(address: string): Promise<RecipientClassification> {
   const cached = followerRecipientEligibility.get(address);
   if (cached !== undefined) return cached;
   try {
     const publicKey = new PublicKey(address);
     const account = await rpc.getAccountInfo(publicKey, "confirmed");
     const eligible = isEligibleFollowerWallet(address, account?.owner.toBase58() ?? null);
+    const classification: RecipientClassification = eligible ? "eligible" : "program_or_off_curve";
     if (followerRecipientEligibility.size >= 10_000) {
       followerRecipientEligibility.delete(followerRecipientEligibility.keys().next().value ?? "");
     }
-    followerRecipientEligibility.set(address, eligible);
-    return eligible;
+    followerRecipientEligibility.set(address, classification);
+    return classification;
   } catch (err) {
     log.warn(
       { address, err: safeDiagnostic(err) },
       "follower recipient classification failed — excluding unknown recipient",
     );
-    return false;
+    return "unknown";
   }
+}
+
+async function isEligibleFollowerRecipient(address: string): Promise<boolean> {
+  return (await classifyFollowerRecipient(address)) === "eligible";
 }
 
 function configuredTargetWallets(config: BotConfigRow): string[] {
@@ -124,7 +175,7 @@ async function loadSigner(userId: string): Promise<string | null> {
     .select("ciphertext")
     .eq("user_id", userId)
     .maybeSingle();
-  if (error) throw new Error(`funding_keys query failed: ${error.message}`);
+  if (error) throw new Error(`funding_keys query failed: ${safeDiagnostic(error.message)}`);
   if (!data) return null;
   return decryptPrivateKey(data.ciphertext);
 }
@@ -189,17 +240,20 @@ async function checkFundingWalletReadiness(
       }
     } catch (err) {
       log.warn(
-        { err, fundingWallet: walletPubkey },
+        { err: safeDiagnostic(err), fundingWallet: walletPubkey },
         "funding key is valid but wallet balance check failed",
       );
     }
     return { ready: true, walletPubkey, error: null, checkedAt };
   } catch (err) {
-    log.error({ err }, "readiness failed — could not decrypt/check funding wallet");
+    log.error(
+      { err: safeDiagnostic(err) },
+      "readiness failed — could not decrypt/check funding wallet",
+    );
     return {
       ready: false,
       walletPubkey: null,
-      error: err instanceof Error ? err.message : String(err),
+      error: safeDiagnostic(err),
       checkedAt,
     };
   }
@@ -219,7 +273,10 @@ async function waitForConfig(userId: string): Promise<BotConfigRow> {
         logged = true;
       }
     } catch (err) {
-      log.error({ err }, "config unavailable — preserving worker and retrying in 5s");
+      log.error(
+        { err: safeDiagnostic(err) },
+        "config unavailable — preserving worker and retrying in 5s",
+      );
     }
     await delay(5000);
   }
@@ -230,13 +287,43 @@ async function main() {
   let cfg = await waitForConfig(USER_ID);
   let fundingReadiness = await checkFundingWalletReadiness(cfg.user_id, cfg.fixed_buy_usd);
 
-  const feed = new GeyserFeed(async (event) => handle(event));
-  const poller = new RpcBackfillPoller(rpc, async (event) => handle(event));
-  const monitor = new FollowerMonitor(feed, poller);
+  const feed: GeyserFeed = new GeyserFeed(async (event): Promise<void> => {
+    await handle(event);
+  });
+  const rpcCursorStore = createSupabaseRpcCursorStore(db, cfg.user_id);
+  const poller: RpcBackfillPoller = new RpcBackfillPoller(
+    rpc,
+    async (event): Promise<void> => {
+      await handle(event);
+    },
+    rpcCursorStore,
+  );
+  const monitor: FollowerMonitor = new FollowerMonitor(feed, poller);
+  const followerBalanceReconciler = new FollowerBalanceReconciler(
+    cfg.user_id,
+    createSupabaseFollowerBalanceStore(db),
+    createRpcFollowerTokenBalanceReader(rpc),
+    6,
+  );
+  const currentEntryMonitoringGate = () => {
+    const geyser = feed.health();
+    const rpcFallback = poller.health();
+    return evaluateEntryMonitoringGate({
+      geyserConnected: Boolean(geyser.connected),
+      rpcLastSuccessAt: rpcFallback.lastSuccessAt ?? null,
+      rpcBacklogWalletCount: Number(rpcFallback.backlogWalletCount ?? 0),
+      followerBalances: followerBalanceReconciler.health(),
+    });
+  };
   const coordinatedBuys = new CoordinatedBuyTracker();
   const entryExecutionQueue = new KeyedExecutionQueue();
+  const exitExecutionQueue = new KeyedExecutionQueue();
   const exitsInFlight = new Set<string>();
-  const pendingTransfers = new Map<string, TransferEvent[]>();
+  const pendingTransfers = new PendingTransferBuffer({
+    ttlMs: 5 * 60_000,
+    maxEntries: 5_000,
+    maxEntriesPerMint: 250,
+  });
   const targetBuyDeduper = new RecentEventDeduper();
   const targetBuyActivityAccounting = new RecentAsyncResultCache<void>();
   const targetFirstBuyAccounting = new RecentAsyncResultCache<boolean>();
@@ -264,8 +351,186 @@ async function main() {
     throw new Error(`${label} failed after ${attempts} attempts: ${lastError}`);
   }
 
+  async function updateEntryClaim(
+    claimId: string,
+    values: Record<string, unknown>,
+    required = true,
+  ): Promise<boolean> {
+    const { error } = await db
+      .from("entry_signal_claims")
+      .update({ ...values, updated_at: new Date().toISOString() })
+      .eq("id", claimId)
+      .eq("user_id", cfg.user_id);
+    if (!error) return true;
+    log.error({ err: safeDiagnostic(error), claimId }, "entry claim status update failed");
+    if (required) {
+      throw new Error(`entry claim status update failed: ${safeDiagnostic(error)}`);
+    }
+    return false;
+  }
+
+  async function claimEntrySubmission(
+    event: SwapEvent,
+    entryMode: "regular" | "coordinated",
+    amountLamports: number,
+  ): Promise<EntryClaimRow | null> {
+    const sourceTxSig = event.txSig || `slot-${event.slot}`;
+    const plannedPositionId = randomUUID();
+    const fields =
+      "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig";
+    const { data: inserted, error: insertError } = await db
+      .from("entry_signal_claims")
+      .insert({
+        user_id: cfg.user_id,
+        source_tx_sig: sourceTxSig,
+        source_wallet: event.wallet,
+        token_mint: event.tokenMint,
+        planned_position_id: plannedPositionId,
+        entry_mode: entryMode,
+        amount_lamports: amountLamports,
+        status: "claimed",
+      })
+      .select(fields)
+      .maybeSingle();
+    if (!insertError && inserted) return inserted as EntryClaimRow;
+
+    if (insertError?.code !== "23505") {
+      throw new Error(
+        `entry signal claim failed: ${safeDiagnostic(insertError ?? "missing claim")}`,
+      );
+    }
+
+    // A uniqueness conflict can be either the same durable event or a different
+    // unresolved entry for this mint. Only the exact event in an explicit
+    // failed_pre_submit state is reclaimable.
+    const { data: existing, error: existingError } = await db
+      .from("entry_signal_claims")
+      .select(fields)
+      .eq("user_id", cfg.user_id)
+      .eq("source_tx_sig", sourceTxSig)
+      .eq("source_wallet", event.wallet)
+      .eq("token_mint", event.tokenMint)
+      .maybeSingle();
+    if (existingError) {
+      throw new Error(`entry signal claim recovery failed: ${safeDiagnostic(existingError)}`);
+    }
+    const existingClaim = existing as EntryClaimRow | null;
+    if (!existingClaim || !canReclaimEntryClaim(existingClaim.status)) {
+      log.warn(
+        { mint: event.tokenMint, hasMatchingEventClaim: Boolean(existingClaim) },
+        "entry blocked by an existing durable claim",
+      );
+      return null;
+    }
+
+    const { data: reclaimed, error: reclaimError } = await db
+      .from("entry_signal_claims")
+      .update({
+        status: "claimed",
+        amount_lamports: amountLamports,
+        error_code: null,
+        bot_tx_sig: null,
+        submission_started_at: null,
+        landed_at: null,
+        persisted_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", existingClaim.id)
+      .eq("user_id", cfg.user_id)
+      .eq("status", "failed_pre_submit")
+      .select(fields)
+      .maybeSingle();
+    if (reclaimError || !reclaimed) {
+      throw new Error(
+        `entry signal reclaim failed: ${safeDiagnostic(reclaimError ?? "claim changed")}`,
+      );
+    }
+    return reclaimed as EntryClaimRow;
+  }
+
+  let reconcilingEntryClaims = false;
+  async function reconcileUnresolvedEntryClaims(): Promise<number> {
+    if (reconcilingEntryClaims) return 0;
+    reconcilingEntryClaims = true;
+    try {
+      const claims = await retryDb<EntryClaimRow[] | null>("load unresolved entry claims", () =>
+        db
+          .from("entry_signal_claims")
+          .select(
+            "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig",
+          )
+          .eq("user_id", cfg.user_id)
+          .in("status", ["claimed", "submitted", "landed", "uncertain"])
+          .order("created_at", { ascending: true }),
+      );
+      let resolved = 0;
+      for (const claim of claims ?? []) {
+        if (!isUnresolvedEntryClaim(claim.status)) continue;
+        uncertainEntryMints.add(claim.token_mint);
+        const { data: position, error: positionError } = await db
+          .from("positions")
+          .select("id,token_mint,entry_tx_sig")
+          .eq("user_id", cfg.user_id)
+          .eq("id", claim.planned_position_id)
+          .maybeSingle();
+        if (positionError) {
+          throw new Error(
+            `entry claim position reconciliation failed: ${safeDiagnostic(positionError)}`,
+          );
+        }
+        if (entryClaimMatchesPersistedPosition(claim, position)) {
+          await updateEntryClaim(claim.id, {
+            status: "persisted",
+            error_code: null,
+            persisted_at: new Date().toISOString(),
+          });
+          uncertainEntryMints.delete(claim.token_mint);
+          resolved += 1;
+          continue;
+        }
+
+        // A confirmed signature without the exact planned position proves only
+        // that Helix may hold tokens. It does not authorize adopting that balance
+        // or buying again; keep the mint quarantined for manual reconciliation.
+        if (claim.bot_tx_sig) {
+          try {
+            const statuses = await rpc.getSignatureStatuses([claim.bot_tx_sig], {
+              searchTransactionHistory: true,
+            });
+            const status = statuses.value[0];
+            if (status && !status.err && claim.status !== "landed") {
+              await updateEntryClaim(claim.id, {
+                status: "landed",
+                landed_at: new Date().toISOString(),
+                error_code: "landed-position-not-persisted",
+              });
+            }
+          } catch (err) {
+            log.warn(
+              { err: safeDiagnostic(err), mint: claim.token_mint },
+              "entry signature reconciliation unavailable — quarantine retained",
+            );
+          }
+        }
+      }
+      if ((claims?.length ?? 0) > 0) {
+        log.warn(
+          {
+            unresolvedEntryClaimCount: (claims?.length ?? 0) - resolved,
+            resolvedEntryClaimCount: resolved,
+          },
+          "durable entry claims reconciled — unresolved mints remain quarantined",
+        );
+      }
+      return resolved;
+    } finally {
+      reconcilingEntryClaims = false;
+    }
+  }
+
   let targetWallets = new Set(configuredTargetWallets(cfg));
   if (targetWallets.size === 0) throw new Error("config loaded without a target wallet");
+  monitor.setBaseWatchedWallets(targetWallets);
 
   let lastStrategyRecorderErrorAt = 0;
   const strategyRecorder = new StrategyRecorder(
@@ -294,31 +559,33 @@ async function main() {
   strategyRecorder.start();
 
   function recordStrategyEvent(event: FeedEvent, patch: StrategyObservationPatch = {}) {
-    const actor = event.kind === "swap" ? event.wallet : event.from;
-    const position = monitor.activeForMint(event.tokenMint);
-    const relationship = targetWallets.has(actor) ? "target" : position ? "follower" : "observed";
-    const primaryTarget =
-      cfg.target_wallet ?? position?.targetWallet ?? Array.from(targetWallets)[0];
-    if (!primaryTarget) return;
-    const additionalTarget = targetWallets.has(actor) && actor !== primaryTarget;
-    strategyRecorder.record(
-      observationFromEvent(
-        event,
-        {
-          userId: cfg.user_id,
-          targetWallet: primaryTarget,
-          relationship,
-          positionId: position?.positionId,
-        },
-        {
-          ...patch,
-          metadata: {
-            ...(patch.metadata ?? {}),
-            ...(additionalTarget ? { additionalTargetWallet: true } : {}),
+    for (const strategyEvent of strategyEventsFromFeedEvent(event)) {
+      const actor = strategyEvent.kind === "swap" ? strategyEvent.wallet : strategyEvent.from;
+      const position = monitor.activeForMint(strategyEvent.tokenMint);
+      const relationship = targetWallets.has(actor) ? "target" : position ? "follower" : "observed";
+      const primaryTarget =
+        cfg.target_wallet ?? position?.targetWallet ?? Array.from(targetWallets)[0];
+      if (!primaryTarget) continue;
+      const additionalTarget = targetWallets.has(actor) && actor !== primaryTarget;
+      strategyRecorder.record(
+        observationFromEvent(
+          strategyEvent,
+          {
+            userId: cfg.user_id,
+            targetWallet: primaryTarget,
+            relationship,
+            positionId: position?.positionId,
           },
-        },
-      ),
-    );
+          {
+            ...patch,
+            metadata: {
+              ...(patch.metadata ?? {}),
+              ...(additionalTarget ? { additionalTargetWallet: true } : {}),
+            },
+          },
+        ),
+      );
+    }
   }
 
   function recordStrategyDecision(
@@ -345,6 +612,7 @@ async function main() {
   }
 
   const zeroBalanceTracker = new ZeroBalanceConfirmationTracker();
+  const reducedBalanceTracker = new ReducedBalanceConfirmationTracker();
   let latestWalletHoldings: WalletTokenHolding[] = [];
   type ObservedFollowerHolding = {
     token_mint: string;
@@ -360,7 +628,7 @@ async function main() {
     if (!fundingReadiness.ready || !fundingReadiness.walletPubkey) return;
     const { data: positions, error } = await db
       .from("positions")
-      .select("id,token_mint")
+      .select("id,token_mint,amount_remaining,decimals")
       .eq("user_id", cfg.user_id)
       .is("closed_at", null);
     if (error) throw new Error(`position reconciliation query failed: ${safeDiagnostic(error)}`);
@@ -368,11 +636,33 @@ async function main() {
     // Only a successful RPC snapshot advances the two-observation guard.
     latestWalletHoldings = await walletTokenHoldings(rpc, fundingReadiness.walletPubkey);
     const positiveMints = new Set(latestWalletHoldings.map((row) => row.token_mint));
+    const holdingAmounts = new Map(
+      latestWalletHoldings.map((row) => [row.token_mint, Number(row.amount)]),
+    );
+    const confirmedReductions = reducedBalanceTracker.observe(positions ?? [], holdingAmounts);
     const confirmedFlat = zeroBalanceTracker.observe(positions ?? [], positiveMints);
-    if (confirmedFlat.length === 0) return;
+    if (confirmedFlat.length === 0 && confirmedReductions.length === 0) return;
 
     const closedAt = new Date().toISOString();
+    const flatIds = new Set(confirmedFlat);
+    for (const reduction of confirmedReductions) {
+      const isFlat = flatIds.has(reduction.id) || reduction.amountRemaining <= 1e-9;
+      const { error: updateError } = await db
+        .from("positions")
+        .update({
+          amount_remaining: isFlat ? 0 : reduction.amountRemaining,
+          closed_at: isFlat ? closedAt : null,
+        })
+        .eq("id", reduction.id)
+        .eq("user_id", cfg.user_id)
+        .is("closed_at", null);
+      if (updateError) {
+        throw new Error(`position reconciliation update failed: ${safeDiagnostic(updateError)}`);
+      }
+      if (isFlat) await releaseMonitoredPosition(reduction.id);
+    }
     for (const positionId of confirmedFlat) {
+      if (confirmedReductions.some((row) => row.id === positionId)) continue;
       const { error: updateError } = await db
         .from("positions")
         .update({ amount_remaining: 0, closed_at: closedAt })
@@ -385,8 +675,11 @@ async function main() {
       await releaseMonitoredPosition(positionId);
     }
     log.info(
-      { closedPositionCount: confirmedFlat.length },
-      "closed positions confirmed flat by consecutive wallet snapshots",
+      {
+        reducedPositionCount: confirmedReductions.length,
+        closedPositionCount: confirmedFlat.length,
+      },
+      "position balances reconciled from consecutive wallet snapshots",
     );
   }
 
@@ -476,14 +769,29 @@ async function main() {
     latestObservedFollowerHoldings = refreshed;
   }
 
+  // Reconcile durable buy claims before accepting any feed work. Only an exact
+  // planned-position/signature match is released; wallet holdings are never
+  // auto-adopted as Helix positions.
+  await reconcileUnresolvedEntryClaims();
+
   // Rehydrate any positions still open from a previous worker run so we keep
   // monitoring their followers across restarts.
-  const openPositions = await retryDb<
-    Array<{ id: string; token_mint: string; amount_remaining: number }> | null
-  >("load open positions for follower recovery", () =>
+  const openPositions = await retryDb<Array<{
+    id: string;
+    token_mint: string;
+    amount_remaining: number;
+    last_root_buy_wallet: string | null;
+    entry_slot: number | null;
+    entry_mode: string | null;
+    root_buy_count: number | null;
+    opened_at: string | null;
+    last_root_buy_at: string | null;
+  }> | null>("load open positions for follower recovery", () =>
     db
       .from("positions")
-      .select("id,token_mint,amount_remaining")
+      .select(
+        "id,token_mint,amount_remaining,last_root_buy_wallet,entry_slot,entry_mode,root_buy_count,opened_at,last_root_buy_at",
+      )
       .eq("user_id", cfg.user_id)
       .is("closed_at", null),
   );
@@ -492,21 +800,73 @@ async function main() {
     await monitor.onCopyBuy({
       positionId: pos.id,
       tokenMint: pos.token_mint,
-      targetWallet: cfg.target_wallet ?? Array.from(targetWallets)[0],
+      targetWallet: pos.last_root_buy_wallet ?? cfg.target_wallet ?? Array.from(targetWallets)[0],
+      entrySlot: Number(pos.entry_slot ?? 0) || undefined,
     });
+    if (pos.last_root_buy_wallet && targetWallets.has(pos.last_root_buy_wallet)) {
+      await linkTargetToPosition(pos.id, pos.last_root_buy_wallet, "recovered");
+    }
+    await backfillCoordinatedTargetLinks(pos);
   }
   await monitor.reconcileFollowersFromDatabase();
 
-  while (true) {
-    try {
-      await feed.start(Array.from(targetWallets));
-      break;
-    } catch (err) {
-      log.error({ err }, "geyser start failed — retrying in 2s");
-      await delay(2000);
+  // On the first deployment of durable cursors, recover transfers made since
+  // the oldest still-open entry instead of silently baselining every target at
+  // the current head. Historical buys are action-gated, while transfers can
+  // safely repair follower lineage for an existing position.
+  const oldestOpenEntrySlot = (openPositions ?? [])
+    .map((position) => Number(position.entry_slot ?? 0))
+    .filter((slot) => Number.isSafeInteger(slot) && slot > 0)
+    .reduce<number | undefined>(
+      (oldest, slot) => (oldest === undefined ? slot : Math.min(oldest, slot)),
+      undefined,
+    );
+  if (oldestOpenEntrySlot !== undefined) {
+    for (const wallet of targetWallets) {
+      poller.watch(wallet, { anchorSlot: oldestOpenEntrySlot });
     }
   }
+
+  // Establish durable RPC recovery first. A Geyser outage must never prevent
+  // target/follower catch-up from running; the normal entry gate remains closed
+  // until one monitoring path is demonstrably healthy.
   poller.start(Array.from(targetWallets));
+  const startGeyserUntilConnected = async () => {
+    while (true) {
+      try {
+        await feed.start(Array.from(targetWallets));
+        return;
+      } catch (err) {
+        log.error({ err: safeDiagnostic(err) }, "geyser start failed — retrying in 2s");
+        await delay(2000);
+      }
+    }
+  };
+  void startGeyserUntilConnected();
+
+  const runFollowerBalanceReconciliation = () => {
+    followerBalanceReconciler
+      .run()
+      .then((health) => {
+        const level = health.degraded || health.mismatchCount > 0 ? "warn" : "info";
+        log[level](
+          {
+            checkedBalanceCount: health.checkedBalanceCount,
+            candidateMismatchCount: health.candidateMismatchCount,
+            mismatchCount: health.mismatchCount,
+            degraded: health.degraded,
+            lastCheckedAt: toIsoTimestamp(health.lastCheckedAt),
+            diagnostic: health.lastError,
+          },
+          "follower balance reconciliation completed — observations never trigger sells",
+        );
+      })
+      .catch(() =>
+        log.error("follower balance reconciliation crashed safely; provider details suppressed"),
+      );
+  };
+  runFollowerBalanceReconciliation();
+  setInterval(runFollowerBalanceReconciliation, 30_000);
 
   // A transient database/stream failure must not leave a persisted follower
   // wallet unmonitored for the rest of the worker's lifetime. Reconciliation
@@ -514,7 +874,9 @@ async function main() {
   setInterval(() => {
     monitor
       .reconcileFollowersFromDatabase()
-      .catch((err) => log.error({ err: safeDiagnostic(err) }, "follower subscription repair failed"));
+      .catch((err: unknown) =>
+        log.error({ err: safeDiagnostic(err) }, "follower subscription repair failed"),
+      );
   }, 10_000);
 
   setInterval(async () => {
@@ -524,21 +886,23 @@ async function main() {
       const previousTargets = targetWallets;
       const nextTargets = new Set(configuredTargetWallets(next));
       cfg = next;
+      monitor.setBaseWatchedWallets(nextTargets);
       for (const wallet of previousTargets) {
         if (nextTargets.has(wallet)) continue;
-        await feed.unwatch(wallet);
+        if (monitor.isFollowerRetained(wallet)) continue;
         poller.unwatch(wallet);
+        await feed.unwatch(wallet);
       }
       for (const wallet of nextTargets) {
         if (previousTargets.has(wallet)) continue;
-        await feed.watch(wallet);
         poller.watch(wallet);
+        await feed.watch(wallet);
       }
       targetWallets = nextTargets;
       if (Array.from(previousTargets).sort().join(",") !== Array.from(nextTargets).sort().join(","))
         log.info({ targets: Array.from(nextTargets) }, "target wallet subscriptions updated");
     } catch (err) {
-      log.error({ err }, "config refresh failed");
+      log.error({ err: safeDiagnostic(err) }, "config refresh failed");
     }
   }, 3000);
 
@@ -548,6 +912,8 @@ async function main() {
         target: cfg.target_wallet,
         geyser: feed.health(),
         rpcFallback: poller.health(),
+        followerBalanceReconciliation: followerBalanceReconciler.health(),
+        entryMonitoringGate: currentEntryMonitoringGate(),
         strategyRecorder: strategyRecorder.health(),
       },
       "stream heartbeat",
@@ -559,6 +925,8 @@ async function main() {
   async function writeWorkerHeartbeat() {
     const geyser = feed.health();
     const rpcFallback = poller.health();
+    const followerBalances = followerBalanceReconciler.health();
+    const entryMonitoringGate = currentEntryMonitoringGate();
     const baseHeartbeat = {
       user_id: cfg.user_id,
       target_wallet: cfg.target_wallet ?? null,
@@ -571,6 +939,14 @@ async function main() {
     };
     const readinessHeartbeat = {
       ...baseHeartbeat,
+      rpc_last_success_at: toIsoTimestamp(rpcFallback.lastSuccessAt),
+      rpc_backlog_wallet_count: Number(rpcFallback.backlogWalletCount ?? 0),
+      monitoring_degraded: entryMonitoringGate.blocked,
+      follower_balance_last_checked_at: toIsoTimestamp(followerBalances.lastCheckedAt),
+      follower_balance_candidate_count: followerBalances.candidateMismatchCount,
+      follower_balance_mismatch_count: followerBalances.mismatchCount,
+      follower_balance_reconciliation_degraded: followerBalances.degraded,
+      follower_balance_last_error: followerBalances.lastError,
       funding_key_ready: fundingReadiness.ready,
       funding_key_checked_at: fundingReadiness.checkedAt,
       funding_wallet_pubkey: fundingReadiness.walletPubkey,
@@ -584,7 +960,7 @@ async function main() {
 
     if (error && isMissingReadinessColumnError(error.message)) {
       log.warn(
-        { err: error },
+        { err: safeDiagnostic(error) },
         "heartbeat readiness columns missing — writing compatible base heartbeat",
       );
       ({ error } = await db
@@ -598,16 +974,20 @@ async function main() {
   await reconcileFlatWalletPositions().catch((err) =>
     log.error({ err: safeDiagnostic(err) }, "position reconciliation failed"),
   );
-  await writeWorkerHeartbeat().catch((err) => log.error({ err }, "database heartbeat failed"));
+  await writeWorkerHeartbeat().catch((err) =>
+    log.error({ err: safeDiagnostic(err) }, "database heartbeat failed"),
+  );
   setInterval(() => {
-    writeWorkerHeartbeat().catch((err) => log.error({ err }, "database heartbeat failed"));
+    writeWorkerHeartbeat().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "database heartbeat failed"),
+    );
   }, 20_000);
   setInterval(() => {
     checkFundingWalletReadiness(cfg.user_id, cfg.fixed_buy_usd)
       .then((next) => {
         fundingReadiness = next;
       })
-      .catch((err) => log.error({ err }, "funding readiness refresh failed"));
+      .catch((err) => log.error({ err: safeDiagnostic(err) }, "funding readiness refresh failed"));
   }, 60_000);
   refreshObservedFollowerHoldings().catch((err) =>
     log.error({ err: safeDiagnostic(err) }, "observed follower holdings refresh failed"),
@@ -617,14 +997,19 @@ async function main() {
       .then(() => refreshObservedFollowerHoldings())
       .catch((err) => log.error({ err: safeDiagnostic(err) }, "wallet holdings refresh failed"));
   }, 60_000);
+  setInterval(() => {
+    reconcileUnresolvedEntryClaims().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "durable entry claim reconciliation failed"),
+    );
+  }, 60_000);
 
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
   setInterval(() => {
-    checkTpSl().catch((err) => log.error({ err }, "tp/sl loop failed"));
+    checkTpSl().catch((err) => log.error({ err: safeDiagnostic(err) }, "tp/sl loop failed"));
   }, 4000);
   setInterval(() => {
     checkConfiguredPositionExits().catch((err) =>
-      log.error({ err }, "configured position exit loop failed"),
+      log.error({ err: safeDiagnostic(err) }, "configured position exit loop failed"),
     );
   }, 30_000);
 
@@ -648,39 +1033,47 @@ async function main() {
 
       if (cfg.stop_loss_enabled && gainPct <= -Math.abs(cfg.stop_loss_pct)) {
         const decimals = Number(pos.decimals ?? 0);
-        const sellRaw = Math.floor(remaining * Math.pow(10, decimals));
-        if (sellRaw <= 0) continue;
         log.warn(
           { positionId: pos.id, gainPct: gainPct.toFixed(2) },
           "stop-loss triggered — selling all",
         );
-        await executeExitSell(
+        await executeClaimedPercentageExit(
           pos.id,
           pos.token_mint,
-          sellRaw,
           remaining,
+          decimals,
+          100,
+          "stop_loss",
+          undefined,
           `stop-loss ${gainPct.toFixed(1)}%`,
+          periodicSellIdentity(pos.id, "stop_loss"),
         );
         continue;
       }
 
       if (cfg.take_profit_enabled && !pos.tp_taken && gainPct >= Math.abs(cfg.take_profit_pct)) {
-        const sellFraction = Math.min(1, Math.max(0, Number(cfg.take_profit_sell_pct) / 100));
-        const sellUi = remaining * sellFraction;
         const decimals = Number(pos.decimals ?? 0);
-        const sellRaw = Math.floor(sellUi * Math.pow(10, decimals));
-        if (sellRaw <= 0) continue;
         log.info(
-          { positionId: pos.id, gainPct: gainPct.toFixed(2), sellFraction },
+          {
+            positionId: pos.id,
+            gainPct: gainPct.toFixed(2),
+            sellPct: cfg.take_profit_sell_pct,
+          },
           "take-profit triggered",
         );
-        await executeExitSell(
+        await executeClaimedPercentageExit(
           pos.id,
           pos.token_mint,
-          sellRaw,
-          sellUi,
+          remaining,
+          decimals,
+          Number(cfg.take_profit_sell_pct),
+          "take_profit",
+          undefined,
           `take-profit ${gainPct.toFixed(1)}%`,
-          true,
+          {
+            ...periodicSellIdentity(pos.id, "take_profit"),
+            markTpTaken: true,
+          },
         );
       }
     }
@@ -694,7 +1087,8 @@ async function main() {
       )
       .eq("user_id", cfg.user_id)
       .is("closed_at", null);
-    if (error) throw new Error(`configured position exit query failed: ${error.message}`);
+    if (error)
+      throw new Error(`configured position exit query failed: ${safeDiagnostic(error.message)}`);
     const nowMs = Date.now();
     for (const pos of positions ?? []) {
       if (exitsInFlight.has(pos.id) || Number(pos.amount_remaining) <= 0) continue;
@@ -714,19 +1108,31 @@ async function main() {
           .from("follower_wallets")
           .select("id", { count: "exact", head: true })
           .eq("position_id", pos.id)
-          .not("first_sell_at", "is", null);
+          .eq("trigger_eligible", true)
+          .is("released_at", null)
+          .not("first_fresh_sell_at", "is", null);
         if (sellerCountError) {
-          throw new Error(`seller-count query failed: ${sellerCountError.message}`);
+          throw new Error(`seller-count query failed: ${safeDiagnostic(sellerCountError.message)}`);
         }
         if (shouldTriggerDistinctSellerExit(Number(count ?? 0), requiredSellers, false)) {
-          await executePercentageExit(
+          await executeClaimedPercentageExit(
             pos.id,
             pos.token_mint,
             Number(pos.amount_remaining),
             Number(pos.decimals ?? 0),
             sellerExitPct,
+            "distinct_follower",
+            undefined,
             `${coordinated ? "coordinated" : "main"} ${count ?? 0} distinct follower seller(s) (retry check)`,
-            coordinated ? "coordinated" : "main-follower",
+            {
+              ...periodicSellIdentity(
+                pos.id,
+                "distinct_follower",
+                coordinated ? "coordinated" : "regular",
+              ),
+              markCoordinatedExit: coordinated,
+              markFollowerSellerExit: !coordinated,
+            },
           );
           continue;
         }
@@ -738,14 +1144,23 @@ async function main() {
         : Number(cfg.target_inactivity_hours);
       const deadline = inactivityDeadlineMs(pos.last_root_buy_at ?? pos.opened_at, inactivityHours);
       if (deadline === undefined || nowMs < deadline) continue;
-      await executePercentageExit(
+      await executeClaimedPercentageExit(
         pos.id,
         pos.token_mint,
         Number(pos.amount_remaining),
         Number(pos.decimals ?? 0),
         100,
+        "target_inactivity",
+        undefined,
         `${coordinated ? "coordinated" : "main"} target inactivity ${inactivityHours}h`,
-        coordinated ? "coordinated" : "none",
+        {
+          ...periodicSellIdentity(
+            pos.id,
+            "target_inactivity",
+            coordinated ? "coordinated" : "regular",
+          ),
+          markCoordinatedExit: coordinated,
+        },
       );
     }
   }
@@ -759,10 +1174,12 @@ async function main() {
     markTpTaken = false,
     markCoordinatedExit = false,
     markFollowerSellerExit = false,
-    strategyEvent?: SwapEvent,
+    strategyEvent?: FeedEvent,
+    mirroredSoldFraction?: number,
   ): Promise<ExecuteResult | null> {
     if (exitsInFlight.has(positionId)) return null;
     exitsInFlight.add(positionId);
+    let landedResult: ExecuteResult | undefined;
     try {
       const secret = await loadSigner(cfg.user_id);
       if (!secret) {
@@ -788,8 +1205,9 @@ async function main() {
         route: cfg.execution_route,
         jitoTipSol: cfg.jito_tip_sol,
       });
+      landedResult = result;
       if (strategyEvent) {
-        recordStrategyDecision(strategyEvent, "mirrored", "follower-triggered exit landed", {
+        recordStrategyDecision(strategyEvent, "mirrored", "event-triggered exit landed", {
           position_id: positionId,
           bot_tx_sig: result.txSig,
           reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
@@ -810,6 +1228,7 @@ async function main() {
         tp_taken?: boolean;
         coordinated_exit_triggered?: boolean;
         follower_seller_exit_triggered?: boolean;
+        mirrored_sold_fraction?: number;
       } = {
         amount_remaining: newRemaining,
         closed_at: closed ? new Date().toISOString() : null,
@@ -817,6 +1236,9 @@ async function main() {
       if (markTpTaken) update.tp_taken = true;
       if (markCoordinatedExit) update.coordinated_exit_triggered = true;
       if (markFollowerSellerExit) update.follower_seller_exit_triggered = true;
+      if (mirroredSoldFraction !== undefined) {
+        update.mirrored_sold_fraction = Math.min(1, Math.max(0, Number(mirroredSoldFraction) || 0));
+      }
       await retryDb("save position after exit", () =>
         db.from("positions").update(update).eq("id", positionId),
       );
@@ -836,55 +1258,215 @@ async function main() {
       log.info({ sig: result.txSig, reason, closed }, "exit sell landed");
       if (closed) await releaseMonitoredPosition(positionId);
       if (strategyEvent) {
-        recordStrategyDecision(
-          strategyEvent,
-          "mirrored",
-          "follower-triggered exit landed and saved",
-          {
-            position_id: positionId,
-            bot_tx_sig: result.txSig,
-            reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
-            execution_ms: result.latencyMs,
-            metadata: { persistencePending: false, closed },
-          },
-        );
+        recordStrategyDecision(strategyEvent, "mirrored", "event-triggered exit landed and saved", {
+          position_id: positionId,
+          bot_tx_sig: result.txSig,
+          reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
+          execution_ms: result.latencyMs,
+          metadata: { persistencePending: false, closed },
+        });
       }
       return result;
+    } catch (err) {
+      // Once executeSwap returns, the chain action is already landed. Any
+      // later persistence failure must remain non-retryable until reconciled;
+      // otherwise a periodic pass could submit the same sell again.
+      if (landedResult && !isPostSubmissionError(err)) {
+        throw new SubmissionUncertainError({
+          route: landedResult.route,
+          txSig: landedResult.txSig,
+          detail: err,
+        });
+      }
+      throw err;
     } finally {
       exitsInFlight.delete(positionId);
     }
   }
 
-  async function executePercentageExit(
+  async function executeClaimedPercentageExit(
     positionId: string,
     mint: string,
-    remaining: number,
+    _remaining: number,
     decimals: number,
     sellPct: number,
+    triggerKind: SellTriggerKind,
+    event: FeedEvent | undefined,
     reason: string,
-    trigger: "coordinated" | "main-follower" | "none",
-    strategyEvent?: SwapEvent,
+    options: {
+      sourceTxSig?: string;
+      sourceWallet?: string;
+      exactSellUi?: number;
+      markTpTaken?: boolean;
+      markCoordinatedExit?: boolean;
+      markFollowerSellerExit?: boolean;
+      mirroredSoldFraction?: number;
+    } = {},
   ): Promise<ExecuteResult | null> {
-    if (exitsInFlight.has(positionId)) return null;
-    const sellFraction = Math.min(1, Math.max(0, Number(sellPct) / 100));
-    const sellUi = remaining * sellFraction;
-    const sellRaw = Math.floor(sellUi * Math.pow(10, decimals));
-    if (sellRaw <= 0 || sellUi <= 0) return null;
-    log.warn({ positionId, mint, sellPct, reason }, "configured exit triggered");
-    return executeExitSell(
-      positionId,
-      mint,
-      sellRaw,
-      sellUi,
-      reason,
-      false,
-      trigger === "coordinated",
-      trigger === "main-follower",
-      strategyEvent,
-    );
+    return exitExecutionQueue.run(positionId, async () => {
+      const normalizedPct = Math.min(100, Math.max(0, Number(sellPct)));
+      if (normalizedPct <= 0 || exitsInFlight.has(positionId)) return null;
+      const sourceWallet =
+        options.sourceWallet ??
+        (event ? (event.kind === "swap" ? event.wallet : event.from) : "helix-worker");
+      const sourceTxSig =
+        options.sourceTxSig ??
+        (event ? event.txSig || `slot-${event.slot}` : `periodic:${positionId}:${triggerKind}`);
+      const requestedSellAmount =
+        options.exactSellUi !== undefined ? Math.max(0, Number(options.exactSellUi) || 0) : null;
+      const { data: insertedClaim, error: claimError } = await db
+        .from("sell_signal_claims")
+        .insert({
+          user_id: cfg.user_id,
+          position_id: positionId,
+          source_tx_sig: sourceTxSig,
+          source_wallet: sourceWallet,
+          trigger_kind: triggerKind,
+          status: "claimed",
+          requested_sell_pct: normalizedPct,
+          requested_sell_amount: requestedSellAmount,
+        })
+        .select("id")
+        .maybeSingle();
+      let claim = insertedClaim as { id: string } | null;
+      if (claimError?.code === "23505") {
+        const { data: existingClaim, error: existingClaimError } = await db
+          .from("sell_signal_claims")
+          .select("id,status")
+          .eq("position_id", positionId)
+          .eq("source_tx_sig", sourceTxSig)
+          .eq("source_wallet", sourceWallet)
+          .eq("trigger_kind", triggerKind)
+          .maybeSingle();
+        if (existingClaimError) {
+          throw new Error(
+            `sell signal claim recovery failed: ${safeDiagnostic(existingClaimError)}`,
+          );
+        }
+        if (!existingClaim || !canReclaimSellClaim(existingClaim.status)) {
+          if (event) {
+            recordStrategyDecision(event, "tracked", "duplicate durable sell signal ignored", {
+              position_id: positionId,
+            });
+          }
+          return null;
+        }
+        const { data: reclaimed, error: reclaimError } = await db
+          .from("sell_signal_claims")
+          .update({
+            status: "claimed",
+            error_code: null,
+            requested_sell_pct: normalizedPct,
+            requested_sell_amount: requestedSellAmount,
+            submission_started_at: null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", existingClaim.id)
+          .eq("status", "failed_pre_submit")
+          .select("id")
+          .maybeSingle();
+        if (reclaimError || !reclaimed) {
+          throw new Error(
+            `sell signal reclaim failed: ${safeDiagnostic(reclaimError ?? "claim changed")}`,
+          );
+        }
+        claim = reclaimed;
+      }
+      if ((claimError && claimError.code !== "23505") || !claim) {
+        throw new Error(
+          `sell signal claim failed: ${safeDiagnostic(claimError ?? "missing claim")}`,
+        );
+      }
+
+      const updateClaim = async (values: Record<string, unknown>, required = false) => {
+        const { error } = await db
+          .from("sell_signal_claims")
+          .update({ ...values, updated_at: new Date().toISOString() })
+          .eq("id", claim.id);
+        if (error) {
+          log.error(
+            { err: safeDiagnostic(error), triggerKind, positionId },
+            "sell signal status update failed",
+          );
+          if (required) {
+            throw new Error(`sell signal status update failed: ${safeDiagnostic(error)}`);
+          }
+        }
+      };
+
+      const { data: currentPosition, error: currentPositionError } = await db
+        .from("positions")
+        .select("amount_remaining,decimals")
+        .eq("id", positionId)
+        .is("closed_at", null)
+        .maybeSingle();
+      if (currentPositionError || !currentPosition) {
+        await updateClaim({
+          status: "failed_pre_submit",
+          error_code: currentPositionError ? "position-load-failed" : "position-not-open",
+        });
+        if (currentPositionError) {
+          throw new Error(`sell position refresh failed: ${safeDiagnostic(currentPositionError)}`);
+        }
+        return null;
+      }
+
+      const currentRemaining = Math.max(0, Number(currentPosition.amount_remaining) || 0);
+      const sellUi = Math.min(
+        currentRemaining,
+        requestedSellAmount !== null
+          ? requestedSellAmount
+          : currentRemaining * (normalizedPct / 100),
+      );
+      const currentDecimals = Number(currentPosition.decimals ?? decimals);
+      const sellRaw = Math.floor(sellUi * Math.pow(10, currentDecimals));
+      if (sellRaw <= 0 || sellUi <= 0) {
+        await updateClaim({ status: "failed_pre_submit", error_code: "no-executable-amount" });
+        return null;
+      }
+
+      await updateClaim(
+        { status: "submitted", submission_started_at: new Date().toISOString() },
+        true,
+      );
+      try {
+        log.warn({ positionId, mint, sellPct: normalizedPct, reason }, "claimed exit triggered");
+        const result = await executeExitSell(
+          positionId,
+          mint,
+          sellRaw,
+          sellUi,
+          reason,
+          Boolean(options.markTpTaken),
+          Boolean(options.markCoordinatedExit),
+          Boolean(options.markFollowerSellerExit),
+          event,
+          options.mirroredSoldFraction,
+        );
+        if (!result) {
+          await updateClaim({ status: "failed_pre_submit", error_code: "no-executable-amount" });
+          return null;
+        }
+        await updateClaim({
+          status: "landed",
+          bot_tx_sig: result.txSig,
+          error_code: null,
+          landed_at: new Date().toISOString(),
+        });
+        return result;
+      } catch (err) {
+        const disposition = sellClaimFailureDisposition(err);
+        await updateClaim({
+          status: disposition.status,
+          bot_tx_sig: disposition.botTxSig,
+          error_code: safeDiagnostic(err),
+        });
+        throw err;
+      }
+    });
   }
 
-  async function handle(event: FeedEvent) {
+  async function handle(event: FeedEvent): Promise<void> {
     // This is bounded in-memory work. Supabase persistence happens on the
     // recorder timer and cannot delay the serial Geyser hot path.
     recordStrategyEvent(event);
@@ -910,7 +1492,12 @@ async function main() {
       }
     } catch (err) {
       recordStrategyDecision(event, "failed", safeDiagnostic(err));
-      log.error({ err }, "handler failed");
+      log.error({ err: safeDiagnostic(err) }, "handler failed");
+      // The RPC fallback advances its durable cursor only after this promise
+      // resolves. Re-throw so transient database/quote/handler failures remain
+      // replayable instead of being silently skipped forever. Geyser contains
+      // the rejection per message and continues draining the live stream.
+      throw err;
     }
   }
 
@@ -921,36 +1508,163 @@ async function main() {
       .eq("target_wallet", targetWallet)
       .eq("token_mint", tokenMint)
       .maybeSingle();
-    if (error) throw new Error(`target first-buy lookup failed: ${error.message}`);
+    if (error) throw new Error(`target first-buy lookup failed: ${safeDiagnostic(error.message)}`);
     if (prior) return false;
     const { error: insertError } = await db
       .from("target_traded_tokens")
       .upsert({ target_wallet: targetWallet, token_mint: tokenMint });
-    if (insertError) throw new Error(`target first-buy record failed: ${insertError.message}`);
+    if (insertError)
+      throw new Error(`target first-buy record failed: ${safeDiagnostic(insertError.message)}`);
     return true;
+  }
+
+  async function linkTargetToPosition(
+    positionId: string,
+    wallet: string,
+    linkReason: "entry" | "coordinated" | "additional_buy" | "recovered",
+    observedAt = new Date().toISOString(),
+  ) {
+    if (!targetWallets.has(wallet)) return;
+    const { error } = await db.from("position_target_wallets").upsert(
+      {
+        user_id: cfg.user_id,
+        position_id: positionId,
+        wallet,
+        link_reason: linkReason,
+        last_buy_at: observedAt,
+      },
+      { onConflict: "position_id,wallet" },
+    );
+    if (error) throw new Error(`position target link failed: ${safeDiagnostic(error.message)}`);
+  }
+
+  async function backfillCoordinatedTargetLinks(position: {
+    id: string;
+    token_mint: string;
+    entry_mode: string | null;
+    root_buy_count: number | null;
+    opened_at: string | null;
+    last_root_buy_at: string | null;
+    last_root_buy_wallet: string | null;
+  }) {
+    const anchorAt = position.last_root_buy_at ?? position.opened_at;
+    if (
+      position.entry_mode !== "coordinated" ||
+      Number(position.root_buy_count ?? 0) < 2 ||
+      !anchorAt
+    ) {
+      return;
+    }
+    const anchorMs = Date.parse(anchorAt);
+    if (!Number.isFinite(anchorMs)) return;
+    const windowMs = Math.max(1, Number(cfg.coordinated_window_seconds) || 0) * 1_000;
+    const { data, error } = await db
+      .from("strategy_observations")
+      .select("actor_wallet,event_at,metadata")
+      .eq("user_id", cfg.user_id)
+      .eq("token_mint", position.token_mint)
+      .eq("relationship", "target")
+      .eq("event_kind", "swap")
+      .eq("side", "buy")
+      .gte("event_at", new Date(anchorMs - windowMs).toISOString())
+      .lte("event_at", new Date(anchorMs + 5_000).toISOString())
+      .contains("metadata", { entryMode: "coordinated" })
+      .limit(100);
+    if (error) {
+      log.warn(
+        { positionId: position.id, err: safeDiagnostic(error) },
+        "coordinated target-link evidence unavailable — no links guessed",
+      );
+      return;
+    }
+    const wallets = authoritativeCoordinatedTargetLinks({
+      position: {
+        positionId: position.id,
+        tokenMint: position.token_mint,
+        entryMode: position.entry_mode,
+        rootBuyCount: Number(position.root_buy_count ?? 0),
+        anchorAt,
+        lastRootBuyWallet: position.last_root_buy_wallet,
+      },
+      observations: (data ?? []) as Array<{
+        actor_wallet: string;
+        event_at: string;
+        metadata?: Record<string, unknown> | null;
+      }>,
+      configuredTargets: targetWallets,
+      windowSeconds: Number(cfg.coordinated_window_seconds),
+    });
+    if (wallets.length === 0) {
+      log.warn(
+        { positionId: position.id, required: Number(position.root_buy_count ?? 0) },
+        "coordinated target-link evidence incomplete — no links guessed",
+      );
+      return;
+    }
+    for (const wallet of wallets) {
+      await linkTargetToPosition(position.id, wallet, "coordinated", anchorAt);
+    }
+    log.info(
+      { positionId: position.id, linkedTargetCount: wallets.length },
+      "coordinated target links restored from authoritative Strategy Lab evidence",
+    );
   }
 
   async function recordOpenPositionTargetBuy(event: SwapEvent) {
     const { data: pos, error } = await db
       .from("positions")
-      .select("id,root_buy_count")
+      .select("id,root_buy_count,last_root_buy_at,last_root_buy_wallet")
       .eq("user_id", cfg.user_id)
       .eq("token_mint", event.tokenMint)
       .is("closed_at", null)
       .order("opened_at", { ascending: false })
       .limit(1)
       .maybeSingle();
-    if (error) throw new Error(`open-position target-buy lookup failed: ${error.message}`);
+    if (error)
+      throw new Error(`open-position target-buy lookup failed: ${safeDiagnostic(error.message)}`);
     if (!pos) return;
+    const observedAt = new Date(event.timestampMs);
+    const priorAt = pos.last_root_buy_at ? new Date(pos.last_root_buy_at) : null;
+    const preservesNewerObservation =
+      priorAt && Number.isFinite(priorAt.getTime()) && priorAt > observedAt;
+    const lastRootBuyAt = preservesNewerObservation ? priorAt : observedAt;
     const { error: updateError } = await db
       .from("positions")
       .update({
         root_buy_count: Number(pos.root_buy_count ?? 0) + 1,
-        last_root_buy_at: new Date(event.timestampMs).toISOString(),
-        last_root_buy_wallet: event.wallet,
+        last_root_buy_at: lastRootBuyAt.toISOString(),
+        last_root_buy_wallet: preservesNewerObservation ? pos.last_root_buy_wallet : event.wallet,
       })
       .eq("id", pos.id);
-    if (updateError) throw new Error(`target-buy activity update failed: ${updateError.message}`);
+    if (updateError)
+      throw new Error(`target-buy activity update failed: ${safeDiagnostic(updateError.message)}`);
+    await linkTargetToPosition(pos.id, event.wallet, "additional_buy", observedAt.toISOString());
+  }
+
+  function isFreshAutomaticAction(event: FeedEvent, maxAgeMs: number): boolean {
+    const authoritativeEventMs =
+      event.delivery === "catchup" ? event.blockTimeMs : (event.blockTimeMs ?? event.timestampMs);
+    if (!authoritativeEventMs || !Number.isFinite(authoritativeEventMs)) return false;
+    const ageMs = Date.now() - authoritativeEventMs;
+    return ageMs >= -5_000 && ageMs <= maxAgeMs;
+  }
+
+  async function classifyTransferRecipients(
+    event: TransferEvent,
+  ): Promise<ClassifiedTransferRecipient[]> {
+    return Promise.all(
+      transferRecipients(event).map(async (recipient) => {
+        const classification = await classifyFollowerRecipient(recipient.wallet);
+        const eligible = classification === "eligible";
+        return {
+          ...recipient,
+          track: eligible,
+          triggerEligible:
+            eligible && Math.max(0, Number(recipient.recipientPreAmount ?? 0)) <= 1e-9,
+          destinationClass: eligible ? "follower" : classification,
+        };
+      }),
+    );
   }
 
   async function handleTargetBuy(event: SwapEvent) {
@@ -960,6 +1674,26 @@ async function main() {
     }
     const transactionId = event.txSig || `slot-${event.slot}`;
     const dedupeKey = `${event.wallet}:${transactionId}:${event.tokenMint}`;
+
+    // Recovered buys must still reset target inactivity and repair target
+    // linkage/history. Only the entry action is freshness-gated.
+    await targetBuyActivityAccounting.getOrCreate(dedupeKey, () =>
+      recordOpenPositionTargetBuy(event),
+    );
+    const firstBuy = await targetFirstBuyAccounting.getOrCreate(dedupeKey, () =>
+      observeTargetFirstBuy(event.wallet, event.tokenMint),
+    );
+    if (!isFreshAutomaticAction(event, 15_000)) {
+      recordStrategyDecision(event, "tracked", "historical target buy recovered without entry", {
+        metadata: {
+          delivery: event.delivery ?? "live",
+          stale: true,
+          firstBuy,
+        },
+      });
+      return;
+    }
+
     if (event.inferredRecipients?.length) {
       const recipientChecks = await Promise.all(
         event.inferredRecipients.map((recipient) => isEligibleFollowerRecipient(recipient)),
@@ -982,15 +1716,6 @@ async function main() {
         return;
       }
     }
-
-    // Preserve first-buy and inactivity accounting even when valuation is
-    // temporarily unavailable, but share it across Geyser/RPC copies.
-    await targetBuyActivityAccounting.getOrCreate(dedupeKey, () =>
-      recordOpenPositionTargetBuy(event),
-    );
-    const firstBuy = await targetFirstBuyAccounting.getOrCreate(dedupeKey, () =>
-      observeTargetFirstBuy(event.wallet, event.tokenMint),
-    );
 
     const valuation = await resolveTargetBuyValue(event, {
       quoteTokenSpendUsd,
@@ -1121,92 +1846,430 @@ async function main() {
   }
 
   async function handleTransfer(ev: TransferEvent) {
-    if (!(await isEligibleFollowerRecipient(ev.to))) {
-      log.info(
-        { from: ev.from, to: ev.to, mint: ev.tokenMint, txSig: ev.txSig },
-        "program-controlled or off-curve transfer recipient excluded from follower monitoring",
-      );
-      recordStrategyDecision(ev, "skipped", "transfer recipient is not an eligible wallet");
-      return;
-    }
     const ctx = monitor.activeForMint(ev.tokenMint);
-    if (!targetWallets.has(ev.from)) {
-      if (ctx) {
-        const tracked = await monitor.recordChainedTransfer(
-          ev.tokenMint,
-          ev.from,
-          ev.to,
-          ev.amountTokens,
-          {
-            txSig: ev.txSig,
-            slot: ev.slot,
-          },
-        );
+    const recipients = transferRecipients(ev);
+    if (ctx?.entrySlot && ev.slot > 0 && ev.slot < ctx.entrySlot) {
+      for (const recipient of recipients) {
         recordStrategyDecision(
-          ev,
-          tracked ? "tracked" : "skipped",
-          tracked ? "follower transfer retained" : "follower transfer not attributable",
-          { position_id: ctx.positionId },
+          transferEventForRecipient(ev, recipient),
+          "tracked",
+          "historical transfer predates the copied position",
+          { position_id: ctx.positionId, metadata: { stale: true } },
         );
-      } else {
-        recordStrategyDecision(ev, "skipped", "no active copied position for transfer");
       }
       return;
     }
+    const classified = await classifyTransferRecipients(ev);
+    if (classified.length === 0) return;
+
+    if (!targetWallets.has(ev.from)) {
+      if (ctx) {
+        const state = await monitor.recordChainedTransferBatch(ev.tokenMint, ev.from, classified, {
+          txSig: ev.txSig,
+          slot: ev.slot,
+        });
+        const trackedWallets = new Set(state.trackedWallets);
+        const terminalWallets = new Set(state.terminalWallets);
+        for (const recipient of classified) {
+          const child = transferEventForRecipient(ev, recipient);
+          if (trackedWallets.has(recipient.wallet)) {
+            recordStrategyDecision(
+              child,
+              state.duplicate ? "skipped" : "tracked",
+              state.duplicate
+                ? "duplicate follower transfer batch ignored"
+                : "follower transfer retained atomically",
+              { position_id: ctx.positionId, metadata: { hopDepth: state.hopDepth } },
+            );
+          } else if (terminalWallets.has(recipient.wallet)) {
+            recordStrategyDecision(child, "tracked", "untrackable follower outflow retained", {
+              position_id: ctx.positionId,
+              metadata: {
+                hopDepth: state.hopDepth,
+                destinationClass:
+                  (state.hopDepth ?? 0) > 5 ? "hop_limit" : recipient.destinationClass,
+              },
+            });
+          } else {
+            recordStrategyDecision(
+              child,
+              "skipped",
+              state.reason ?? "follower transfer batch was not attributable",
+              { position_id: ctx.positionId },
+            );
+          }
+        }
+        if ((state.applied || state.duplicate) && state.terminalAmount > 0) {
+          await maybeExecuteTerminalBatchExit(ev, ctx, state);
+        }
+      } else {
+        for (const recipient of classified) {
+          recordStrategyDecision(
+            transferEventForRecipient(ev, recipient),
+            "skipped",
+            "no active copied position for transfer",
+          );
+        }
+      }
+      return;
+    }
+
     if (ctx) {
-      const tracked = await monitor.recordTransfer(ctx.positionId, ev.to, ev.amountTokens, {
-        hopDepth: 1,
-        parentWallet: ev.from,
-        txSig: ev.txSig,
-        slot: ev.slot,
-      });
+      for (const recipient of classified) {
+        const child = transferEventForRecipient(ev, recipient);
+        if (!recipient.track) {
+          log.info(
+            { from: ev.from, to: recipient.wallet, mint: ev.tokenMint, txSig: ev.txSig },
+            "program-controlled or off-curve target recipient excluded from follower monitoring",
+          );
+          recordStrategyDecision(child, "tracked", "terminal target transfer observed", {
+            position_id: ctx.positionId,
+          });
+          continue;
+        }
+        const tracked = await monitor.recordTransfer(
+          ctx.positionId,
+          recipient.wallet,
+          recipient.amountTokens,
+          {
+            hopDepth: 1,
+            parentWallet: ev.from,
+            txSig: ev.txSig,
+            slot: ev.slot,
+            triggerEligible: recipient.triggerEligible,
+          },
+        );
+        recordStrategyDecision(
+          child,
+          tracked ? "tracked" : "skipped",
+          tracked ? "target transfer wallet retained" : "duplicate target transfer ignored",
+          { position_id: ctx.positionId },
+        );
+      }
+      await handleTargetTerminalOutflows(ev, ctx, classified);
+      return;
+    }
+
+    // Preserve the complete target batch, including terminal-only recipients.
+    // If the matching copied entry lands, every custody observation is written;
+    // any optional action is still independently linked/fresh/health gated.
+    const buffered = pendingTransfers.add(ev);
+    log.info(
+      { from: ev.from, recipientCount: classified.length, mint: ev.tokenMint, buffered },
+      "target transfer held pending a possible landed copy entry",
+    );
+    for (const recipient of classified) {
+      recordStrategyDecision(
+        transferEventForRecipient(ev, recipient),
+        "tracked",
+        !recipient.track
+          ? buffered
+            ? "terminal target transfer buffered pending an entry"
+            : "duplicate pending terminal target transfer ignored"
+          : buffered
+            ? "target transfer buffered pending an entry"
+            : "duplicate pending target transfer ignored",
+      );
+    }
+  }
+
+  async function handleTargetTerminalOutflows(
+    ev: TransferEvent,
+    ctx: { positionId: string; tokenMint: string; targetWallet: string; entrySlot?: number },
+    recipients: ClassifiedTransferRecipient[],
+  ) {
+    const terminalRecipients = recipients.filter((recipient) => !recipient.track);
+    if (terminalRecipients.length === 0) return;
+
+    const { data: linked, error: linkError } = await db
+      .from("position_target_wallets")
+      .select("wallet")
+      .eq("position_id", ctx.positionId)
+      .eq("wallet", ev.from)
+      .maybeSingle();
+    if (linkError) {
+      throw new Error(`target custody link lookup failed: ${safeDiagnostic(linkError)}`);
+    }
+    const sourceLinked = Boolean(linked);
+    for (const recipient of terminalRecipients) {
+      const { error } = await db.from("target_outflow_observations").upsert(
+        {
+          user_id: cfg.user_id,
+          position_id: ctx.positionId,
+          source_wallet: ev.from,
+          destination_wallet: recipient.wallet,
+          token_mint: ev.tokenMint,
+          amount_tokens: recipient.amountTokens,
+          destination_class: recipient.destinationClass,
+          source_linked: sourceLinked,
+          tx_sig: ev.txSig || `slot-${ev.slot}`,
+          slot: ev.slot,
+        },
+        { onConflict: "position_id,tx_sig,source_wallet,destination_wallet,token_mint" },
+      );
+      if (error) {
+        throw new Error(`target custody observation failed: ${safeDiagnostic(error)}`);
+      }
+    }
+
+    const confirmedTerminalAmount = terminalRecipients
+      .filter((recipient) => recipient.destinationClass === "program_or_off_curve")
+      .reduce((sum, recipient) => sum + recipient.amountTokens, 0);
+    const exitPct = targetTerminalOutflowExitPct({
+      enabled: Boolean(cfg.target_terminal_outflow_exit_enabled),
+      configuredPct: Number(cfg.target_terminal_outflow_exit_pct),
+      sourceLinked,
+      fresh: isFreshAutomaticAction(ev, 120_000),
+      classificationSucceeded: confirmedTerminalAmount > 0,
+      terminalAmount: confirmedTerminalAmount,
+    });
+    log.warn(
+      {
+        positionId: ctx.positionId,
+        sourceLinked,
+        terminalRecipientCount: terminalRecipients.length,
+        confirmedTerminalAmount,
+        automaticExitEnabled: cfg.target_terminal_outflow_exit_enabled,
+      },
+      "linked target custody transfer observed — deposit is not proof of a sale",
+    );
+    if (exitPct <= 0) return;
+    const monitoringGate = currentEntryMonitoringGate();
+    if (monitoringGate.blocked) {
+      log.warn(
+        { positionId: ctx.positionId, reasons: monitoringGate.reasons },
+        "target custody auto-exit blocked by monitoring safety gate",
+      );
       recordStrategyDecision(
         ev,
-        tracked ? "tracked" : "skipped",
-        tracked ? "target transfer wallet retained" : "duplicate target transfer ignored",
+        "tracked",
+        `target custody auto-exit blocked: ${monitoringGate.reasons.join("; ")}`,
         { position_id: ctx.positionId },
       );
       return;
     }
 
-    if (cfg.coordinated_mode_enabled) {
-      const windowMs = Math.max(1, Number(cfg.coordinated_window_seconds)) * 1000;
-      const recent = (pendingTransfers.get(ev.tokenMint) ?? []).filter(
-        (row) => ev.timestampMs - row.timestampMs <= windowMs,
+    const { data: pos, error: positionError } = await db
+      .from("positions")
+      .select("id,token_mint,amount_remaining,decimals,entry_slot")
+      .eq("id", ctx.positionId)
+      .is("closed_at", null)
+      .maybeSingle();
+    if (positionError) {
+      throw new Error(`target custody position lookup failed: ${safeDiagnostic(positionError)}`);
+    }
+    if (
+      !pos ||
+      (Number(pos.entry_slot ?? 0) > 0 && ev.slot > 0 && ev.slot < Number(pos.entry_slot))
+    ) {
+      return;
+    }
+    await executeClaimedPercentageExit(
+      pos.id,
+      pos.token_mint,
+      Number(pos.amount_remaining),
+      Number(pos.decimals ?? 0),
+      exitPct,
+      "target_terminal_outflow",
+      ev,
+      "high-risk linked target custody-transfer response (deposit is not proof of sale)",
+    );
+  }
+
+  async function maybeExecuteTerminalBatchExit(
+    ev: TransferEvent,
+    ctx: { positionId: string; tokenMint: string; targetWallet: string },
+    state: ChainedTransferBatchState,
+  ) {
+    if (
+      !cfg.terminal_outflow_exit_enabled ||
+      !state.sourceTriggerEligible ||
+      !isFreshAutomaticAction(ev, 120_000)
+    ) {
+      return;
+    }
+    const monitoringGate = currentEntryMonitoringGate();
+    if (monitoringGate.blocked) {
+      log.warn(
+        { positionId: ctx.positionId, reasons: monitoringGate.reasons },
+        "follower custody auto-exit blocked by monitoring safety gate",
       );
-      recent.push(ev);
-      pendingTransfers.set(ev.tokenMint, recent);
-      log.info(
-        { from: ev.from, to: ev.to, mint: ev.tokenMint },
-        "coordinated transfer held pending an entry",
+      recordStrategyDecision(
+        ev,
+        "tracked",
+        `follower custody auto-exit blocked: ${monitoringGate.reasons.join("; ")}`,
+        { position_id: ctx.positionId },
       );
-      recordStrategyDecision(ev, "tracked", "coordinated transfer held pending an entry");
       return;
     }
 
-    log.info(
-      { from: ev.from, to: ev.to, mint: ev.tokenMint, txSig: ev.txSig },
-      "target transfer observed without a verified swap — not treated as an entry",
+    const { data: pos, error } = await db
+      .from("positions")
+      .select("id,token_mint,amount_remaining,decimals,entry_slot")
+      .eq("id", ctx.positionId)
+      .is("closed_at", null)
+      .maybeSingle();
+    if (error) throw new Error(`terminal outflow position lookup failed: ${safeDiagnostic(error)}`);
+    if (
+      !pos ||
+      (Number(pos.entry_slot ?? 0) > 0 && ev.slot > 0 && ev.slot < Number(pos.entry_slot))
+    ) {
+      return;
+    }
+    await executeClaimedPercentageExit(
+      pos.id,
+      pos.token_mint,
+      Number(pos.amount_remaining),
+      Number(pos.decimals ?? 0),
+      Number(cfg.terminal_outflow_exit_pct),
+      "terminal_outflow",
+      ev,
+      `defensive custody outflow from tracked follower`,
     );
-    recordStrategyDecision(ev, "tracked", "target transfer observed without an open position");
   }
 
-  async function handleFollowerSell(ev: SwapEvent) {
+  async function handleDirectTargetSell(
+    ev: SwapEvent,
+    ctx: { positionId: string; tokenMint: string; targetWallet: string },
+  ) {
+    if (cfg.direct_target_sell_exit_mode === "off") {
+      recordStrategyDecision(ev, "tracked", "direct target sell observed; response is off", {
+        position_id: ctx.positionId,
+      });
+      return;
+    }
+    if (!ev.verifiedSwap || !ev.sellAttribution?.verified) {
+      recordStrategyDecision(
+        ev,
+        "tracked",
+        "ambiguous target outflow observed without verified sale",
+        {
+          position_id: ctx.positionId,
+        },
+      );
+      return;
+    }
+    if (!isFreshAutomaticAction(ev, 120_000)) {
+      recordStrategyDecision(ev, "tracked", "historical target sale recovered without execution", {
+        position_id: ctx.positionId,
+        metadata: { stale: true },
+      });
+      return;
+    }
+
+    const [{ data: linked, error: linkError }, { data: pos, error: positionError }] =
+      await Promise.all([
+        db
+          .from("position_target_wallets")
+          .select("wallet")
+          .eq("position_id", ctx.positionId)
+          .eq("wallet", ev.wallet)
+          .maybeSingle(),
+        db
+          .from("positions")
+          .select("id,token_mint,amount_remaining,decimals,entry_slot")
+          .eq("id", ctx.positionId)
+          .is("closed_at", null)
+          .maybeSingle(),
+      ]);
+    if (linkError)
+      throw new Error(`target-position link lookup failed: ${safeDiagnostic(linkError)}`);
+    if (positionError) {
+      throw new Error(
+        `direct target sell position lookup failed: ${safeDiagnostic(positionError)}`,
+      );
+    }
+    if (
+      !pos ||
+      (Number(pos.entry_slot ?? 0) > 0 && ev.slot > 0 && ev.slot < Number(pos.entry_slot))
+    ) {
+      recordStrategyDecision(ev, "skipped", "target sell predates or has no open linked position");
+      return;
+    }
+
+    const sellAmount = computeTargetSellAmount({
+      mode: cfg.direct_target_sell_exit_mode,
+      verifiedSell: true,
+      linkedToPosition: Boolean(linked),
+      amountRemaining: Number(pos.amount_remaining),
+      targetPreAmount: Number(ev.sellAttribution.tokenBalanceBefore),
+      targetPostAmount: Number(ev.sellAttribution.tokenBalanceAfter),
+      configuredPct: Number(cfg.direct_target_sell_exit_pct),
+    });
+    if (sellAmount <= 0) {
+      recordStrategyDecision(
+        ev,
+        "tracked",
+        linked
+          ? "verified target sale required no exit"
+          : "selling target is not linked to position",
+        { position_id: pos.id },
+      );
+      return;
+    }
+    const sellPct = Math.min(100, (sellAmount / Number(pos.amount_remaining)) * 100);
+    await executeClaimedPercentageExit(
+      pos.id,
+      pos.token_mint,
+      Number(pos.amount_remaining),
+      Number(pos.decimals ?? 0),
+      sellPct,
+      "direct_target_sell",
+      ev,
+      `verified linked target sell (${cfg.direct_target_sell_exit_mode})`,
+    );
+  }
+
+  async function handleFollowerSell(ev: SwapEvent): Promise<void> {
     const ctx = monitor.activeForMint(ev.tokenMint);
     if (!ctx) {
       recordStrategyDecision(ev, "skipped", "no active copied position for this token");
       return;
     }
     if (targetWallets.has(ev.wallet)) {
-      recordStrategyDecision(ev, "tracked", "direct target sell observed", {
-        position_id: ctx.positionId,
-      });
-      return; // Only follower wallets drive the mirror
+      return handleDirectTargetSell(ev, ctx);
     }
 
+    if (!ev.verifiedSwap || !ev.sellAttribution?.verified) {
+      recordStrategyDecision(
+        ev,
+        "tracked",
+        "ambiguous follower outflow observed without verified sale",
+        {
+          position_id: ctx.positionId,
+        },
+      );
+      return;
+    }
+
+    const { data: positionTiming, error: positionTimingError } = await db
+      .from("positions")
+      .select("entry_slot")
+      .eq("id", ctx.positionId)
+      .is("closed_at", null)
+      .maybeSingle();
+    if (positionTimingError) {
+      throw new Error(
+        `follower sell entry-slot lookup failed: ${safeDiagnostic(positionTimingError)}`,
+      );
+    }
+    if (
+      !positionTiming ||
+      (Number(positionTiming.entry_slot ?? 0) > 0 &&
+        ev.slot > 0 &&
+        ev.slot < Number(positionTiming.entry_slot))
+    ) {
+      recordStrategyDecision(ev, "skipped", "follower sale predates the copied position", {
+        position_id: ctx.positionId,
+      });
+      return;
+    }
+
+    const freshForAutomaticExit = isFreshAutomaticAction(ev, 120_000);
     const sellState = await monitor.recordFollowerSell(ctx.positionId, ev.wallet, ev.amountTokens, {
       txSig: ev.txSig,
       slot: ev.slot,
+      countAsDistinctSeller: freshForAutomaticExit,
     });
     if (sellState === null) {
       recordStrategyDecision(ev, "skipped", "sell wallet is not retained or event is duplicate", {
@@ -1214,18 +2277,51 @@ async function main() {
       });
       return;
     }
+    if (!sellState.triggerEligible) {
+      recordStrategyDecision(ev, "tracked", "observation-only follower sold beyond exit depth", {
+        position_id: ctx.positionId,
+      });
+      return;
+    }
 
-    const { data: pos } = await db
+    const { data: pos, error: posError } = await db
       .from("positions")
       .select(
-        "id,token_mint,amount_tokens,amount_remaining,decimals,mirrored_sold_fraction,entry_mode,coordinated_exit_triggered,follower_seller_exit_triggered",
+        "id,token_mint,amount_tokens,amount_remaining,decimals,mirrored_sold_fraction,entry_mode,entry_slot,coordinated_exit_triggered,follower_seller_exit_triggered",
       )
       .eq("id", ctx.positionId)
       .maybeSingle();
+    if (posError) {
+      // Accounting is already durably committed. Throw so RPC catch-up does not
+      // advance its cursor; the replay returns the stored sell snapshot and can
+      // safely resume the downstream exit claim without debiting twice.
+      throw new Error(`post-accounting position lookup failed: ${safeDiagnostic(posError)}`);
+    }
     if (!pos) {
       recordStrategyDecision(ev, "failed", "active position could not be loaded", {
         position_id: ctx.positionId,
       });
+      return;
+    }
+    if (Number(pos.entry_slot ?? 0) > 0 && ev.slot > 0 && ev.slot < Number(pos.entry_slot)) {
+      recordStrategyDecision(ev, "skipped", "follower sale predates the copied position", {
+        position_id: pos.id,
+      });
+      return;
+    }
+    // On a duplicate Geyser/RPC replay, use the freshness decision stored by
+    // the atomic accounting event. Never upgrade a historical catch-up sell to
+    // a live automatic exit merely because its duplicate arrived later.
+    if (!sellState.freshForAction) {
+      recordStrategyDecision(
+        ev,
+        "tracked",
+        "historical follower sale recovered without execution",
+        {
+          position_id: pos.id,
+          metadata: { stale: true, soldFraction: sellState.soldFraction },
+        },
+      );
       return;
     }
 
@@ -1258,15 +2354,19 @@ async function main() {
         return;
       }
       const exitReason = `coordinated ${sellState.distinctSellerCount} distinct follower seller(s)`;
-      await executePercentageExit(
+      await executeClaimedPercentageExit(
         pos.id,
         pos.token_mint,
         Number(pos.amount_remaining),
         Number(pos.decimals ?? 0),
         Number(cfg.coordinated_follower_sell_pct),
-        exitReason,
-        "coordinated",
+        "distinct_follower",
         ev,
+        exitReason,
+        {
+          ...periodicSellIdentity(pos.id, "distinct_follower", "coordinated"),
+          markCoordinatedExit: true,
+        },
       );
       return;
     }
@@ -1292,15 +2392,19 @@ async function main() {
         });
       } else {
         const exitReason = `main ${sellState.distinctSellerCount} distinct follower seller(s)`;
-        await executePercentageExit(
+        await executeClaimedPercentageExit(
           pos.id,
           pos.token_mint,
           Number(pos.amount_remaining),
           Number(pos.decimals ?? 0),
           Number(cfg.follower_seller_exit_pct),
-          exitReason,
-          "main-follower",
+          "distinct_follower",
           ev,
+          exitReason,
+          {
+            ...periodicSellIdentity(pos.id, "distinct_follower", "regular"),
+            markFollowerSellerExit: true,
+          },
         );
         return;
       }
@@ -1343,116 +2447,20 @@ async function main() {
       { positionId: pos.id, soldFraction: sellState.soldFraction, sellUi, sellRaw },
       "mirroring follower sell",
     );
-    await executeMirrorSell(
+    await executeClaimedPercentageExit(
       pos.id,
       pos.token_mint,
-      sellRaw,
-      sellUi,
-      sellState.soldFraction,
-      ctx,
+      Number(pos.amount_remaining),
+      decimals,
+      Math.min(100, (sellUi / Math.max(Number(pos.amount_remaining), 1e-12)) * 100),
+      "proportional_follower",
       ev,
+      `mirror ${Math.round(sellState.soldFraction * 100)}% followers`,
+      {
+        exactSellUi: sellUi,
+        mirroredSoldFraction: sellState.soldFraction,
+      },
     );
-  }
-
-  async function executeMirrorSell(
-    positionId: string,
-    mint: string,
-    sellRaw: number,
-    sellUi: number,
-    soldFraction: number,
-    ctx: { positionId: string; tokenMint: string; targetWallet: string },
-    strategyEvent: SwapEvent,
-  ): Promise<ExecuteResult | null> {
-    if (exitsInFlight.has(positionId)) return null;
-    exitsInFlight.add(positionId);
-    try {
-      const secret = await loadSigner(cfg.user_id);
-      if (!secret) {
-        log.error("no funding key for sell");
-        recordStrategyDecision(strategyEvent, "failed", "funding key is not available for sell", {
-          position_id: positionId,
-        });
-        return null;
-      }
-
-      recordStrategyDecision(
-        strategyEvent,
-        "mirror_submitted",
-        "proportional follower sell submitted",
-        {
-          position_id: positionId,
-          metadata: { soldFraction },
-        },
-      );
-      const result = await executeSwap({
-        signerSecret: secret,
-        inputMint: mint,
-        outputMint: WSOL,
-        amountLamports: sellRaw,
-        slippageBps: 500,
-        route: cfg.execution_route,
-        jitoTipSol: cfg.jito_tip_sol,
-      });
-      recordStrategyDecision(strategyEvent, "mirrored", "proportional follower sell landed", {
-        position_id: positionId,
-        bot_tx_sig: result.txSig,
-        reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
-        execution_ms: result.latencyMs,
-        metadata: { soldFraction, persistencePending: true },
-      });
-
-      const currentPosition = await retryDb<{ amount_remaining: number } | null>(
-        "load position after mirror sell",
-        () => db.from("positions").select("amount_remaining").eq("id", positionId).maybeSingle(),
-      );
-      if (!currentPosition) {
-        throw new Error(`position ${positionId} disappeared after mirror sell landed`);
-      }
-      const newRemaining = Math.max(0, Number(currentPosition.amount_remaining) - sellUi);
-      const closed = isFlatPosition(newRemaining);
-      await retryDb("save position after mirror sell", () =>
-        db
-          .from("positions")
-          .update({
-            amount_remaining: newRemaining,
-            mirrored_sold_fraction: soldFraction,
-            closed_at: closed ? new Date().toISOString() : null,
-          })
-          .eq("id", positionId),
-      );
-
-      await retryDb("save mirror-sell trade", () =>
-        db.from("trades").insert({
-          user_id: cfg.user_id,
-          position_id: positionId,
-          side: "sell",
-          token_mint: mint,
-          amount_tokens: sellUi,
-          tx_sig: result.txSig,
-          reason: `mirror ${Math.round(soldFraction * 100)}% followers`,
-          latency_ms: result.latencyMs,
-          route: result.route,
-        }),
-      );
-
-      log.info({ sig: result.txSig, ms: result.latencyMs, closed }, "mirror sell landed");
-      if (closed) await releaseMonitoredPosition(positionId);
-      recordStrategyDecision(
-        strategyEvent,
-        "mirrored",
-        "proportional follower sell landed and saved",
-        {
-          position_id: positionId,
-          bot_tx_sig: result.txSig,
-          reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
-          execution_ms: result.latencyMs,
-          metadata: { soldFraction, persistencePending: false, closed },
-        },
-      );
-      return result;
-    } finally {
-      exitsInFlight.delete(positionId);
-    }
   }
 
   async function tryCopyBuy(
@@ -1462,6 +2470,19 @@ async function main() {
   ): Promise<string | null> {
     if (!cfg.enabled) {
       recordStrategyDecision(event, "skipped", "new entries disabled");
+      return null;
+    }
+    const monitoringGate = currentEntryMonitoringGate();
+    if (monitoringGate.blocked) {
+      log.warn(
+        { reasons: monitoringGate.reasons, mint: event.tokenMint },
+        "new entry blocked by monitoring circuit breaker — exits remain active",
+      );
+      recordStrategyDecision(
+        event,
+        "skipped",
+        `entry monitoring circuit breaker: ${monitoringGate.reasons.join("; ")}`,
+      );
       return null;
     }
     return entryExecutionQueue.run(event.tokenMint, () => tryCopyBuyLocked(event, reason, options));
@@ -1478,6 +2499,19 @@ async function main() {
         "entry cancelled after queue wait — Entries is OFF",
       );
       recordStrategyDecision(event, "skipped", "Entries turned off while entry was queued");
+      return null;
+    }
+    const queuedMonitoringGate = currentEntryMonitoringGate();
+    if (queuedMonitoringGate.blocked) {
+      log.warn(
+        { reasons: queuedMonitoringGate.reasons, mint: event.tokenMint },
+        "entry cancelled after queue wait by monitoring circuit breaker — exits remain active",
+      );
+      recordStrategyDecision(
+        event,
+        "skipped",
+        `entry monitoring circuit breaker after queue wait: ${queuedMonitoringGate.reasons.join("; ")}`,
+      );
       return null;
     }
     if (uncertainEntryMints.has(event.tokenMint)) {
@@ -1520,7 +2554,9 @@ async function main() {
       .limit(1)
       .maybeSingle();
     if (openPositionError)
-      throw new Error(`open-position entry check failed: ${openPositionError.message}`);
+      throw new Error(
+        `open-position entry check failed: ${safeDiagnostic(openPositionError.message)}`,
+      );
     if (openPosition) {
       log.info(
         { mint: event.tokenMint, positionId: openPosition.id },
@@ -1551,7 +2587,8 @@ async function main() {
       .eq("user_id", cfg.user_id)
       .eq("token_mint", event.tokenMint)
       .maybeSingle();
-    if (priorError) throw new Error(`traded-token lookup failed: ${priorError.message}`);
+    if (priorError)
+      throw new Error(`traded-token lookup failed: ${safeDiagnostic(priorError.message)}`);
 
     const decision =
       options.entryMode === "coordinated"
@@ -1585,12 +2622,12 @@ async function main() {
       try {
         secret = await loadSigner(cfg.user_id);
       } catch (err) {
-        log.error({ err, user_id: cfg.user_id }, "funding key decrypt failed for copy buy");
+        log.error({ err: safeDiagnostic(err) }, "funding key decrypt failed for copy buy");
         recordStrategyDecision(event, "failed", "funding key could not be loaded", metaPatch);
         return null;
       }
       if (!secret) {
-        log.error({ user_id: cfg.user_id }, "no funding key saved for this config user");
+        log.error("no funding key saved for this config user");
         recordStrategyDecision(event, "failed", "funding key is not available", metaPatch);
         return null;
       }
@@ -1616,6 +2653,60 @@ async function main() {
           "skipped",
           "Entries turned off immediately before submission",
           metaPatch,
+        );
+        return null;
+      }
+      const submissionMonitoringGate = currentEntryMonitoringGate();
+      if (submissionMonitoringGate.blocked) {
+        log.warn(
+          { reasons: submissionMonitoringGate.reasons, mint: event.tokenMint },
+          "entry cancelled before submission by monitoring circuit breaker — exits remain active",
+        );
+        recordStrategyDecision(
+          event,
+          "skipped",
+          `entry monitoring circuit breaker before submission: ${submissionMonitoringGate.reasons.join("; ")}`,
+          metaPatch,
+        );
+        return null;
+      }
+
+      const entryClaim = await claimEntrySubmission(event, options.entryMode, amountLamports);
+      if (!entryClaim) {
+        recordStrategyDecision(
+          event,
+          "skipped",
+          "an existing durable entry claim blocks another buy for this token",
+          metaPatch,
+        );
+        return null;
+      }
+      uncertainEntryMints.add(event.tokenMint);
+      await updateEntryClaim(entryClaim.id, {
+        status: "submitted",
+        submission_started_at: new Date().toISOString(),
+        error_code: null,
+      });
+
+      // The durable claim/update calls above yield to the event loop. Config or
+      // monitoring health may have changed during those awaits, so re-check at
+      // the final boundary with no intervening await before executeSwap starts.
+      const finalSubmissionGate = currentEntryMonitoringGate();
+      if (!cfg.enabled || finalSubmissionGate.blocked) {
+        const gateReason = !cfg.enabled
+          ? "Entries turned off after the durable claim"
+          : `monitoring became unsafe after the durable claim: ${finalSubmissionGate.reasons.join("; ")}`;
+        await updateEntryClaim(entryClaim.id, {
+          status: "failed_pre_submit",
+          error_code: !cfg.enabled
+            ? "entries-disabled-after-claim"
+            : "monitoring-degraded-after-claim",
+        });
+        uncertainEntryMints.delete(event.tokenMint);
+        recordStrategyDecision(event, "skipped", gateReason, metaPatch);
+        log.warn(
+          { mint: event.tokenMint, reasons: finalSubmissionGate.reasons },
+          "copy buy cancelled at the final submission safety gate",
         );
         return null;
       }
@@ -1653,11 +2744,20 @@ async function main() {
           outputDecimals: event.decimals,
         });
       } catch (err) {
-        uncertainEntryMints.add(event.tokenMint);
+        const disposition = entryClaimFailureDisposition(err);
+        await updateEntryClaim(entryClaim.id, {
+          status: disposition.status,
+          bot_tx_sig: disposition.botTxSig,
+          error_code: safeDiagnostic(err),
+        });
+        const quarantined = disposition.status === "uncertain";
+        if (!quarantined) uncertainEntryMints.delete(event.tokenMint);
         recordStrategyDecision(
           event,
           "failed",
-          "copy submission failed or landing is uncertain; coin quarantined",
+          quarantined
+            ? "copy landing is uncertain; coin quarantined"
+            : "copy failed before submission; durable claim is retryable",
           {
             ...metaPatch,
             amount_usd: options.targetBuyUsd,
@@ -1665,17 +2765,29 @@ async function main() {
             metadata: {
               ...metaPatch.metadata,
               diagnostic: safeDiagnostic(err),
-              quarantined: true,
+              quarantined,
             },
           },
         );
         log.error(
-          { err, mint: event.tokenMint, amountLamports, route: cfg.execution_route },
-          "copy buy failed or landing is uncertain — coin quarantined",
+          {
+            err: safeDiagnostic(err),
+            mint: event.tokenMint,
+            amountLamports,
+            route: cfg.execution_route,
+          },
+          quarantined
+            ? "copy buy landing is uncertain — coin quarantined"
+            : "copy buy failed before submission — durable claim released for retry",
         );
-        return null;
+        throw err;
       }
-      uncertainEntryMints.add(event.tokenMint);
+      await updateEntryClaim(entryClaim.id, {
+        status: "landed",
+        bot_tx_sig: result.txSig,
+        error_code: null,
+        landed_at: new Date().toISOString(),
+      });
       recordStrategyDecision(event, "copied", "copy buy landed; saving position", {
         ...metaPatch,
         amount_usd: options.targetBuyUsd,
@@ -1696,7 +2808,7 @@ async function main() {
         receivedUi > 0 ? buyUsd / receivedUi : ((await priceUsd(event.tokenMint)) ?? 0);
       const targetBuyAt = new Date(event.timestampMs).toISOString();
 
-      const positionId = randomUUID();
+      const positionId = entryClaim.planned_position_id;
       const pos = await retryDb<{ id: string } | null>("save landed copy-buy position", () =>
         db
           .from("positions")
@@ -1730,6 +2842,26 @@ async function main() {
           `copy buy ${result.txSig} landed but position ${positionId} could not be read back`,
         );
       }
+      await monitor.onCopyBuy({
+        positionId: pos.id,
+        tokenMint: event.tokenMint,
+        targetWallet: event.wallet,
+        entrySlot: event.slot > 0 ? event.slot : undefined,
+      });
+      const linkedTargets = new Set([event.wallet, ...(options.coordinatedWallets ?? [])]);
+      for (const wallet of linkedTargets) {
+        await linkTargetToPosition(
+          pos.id,
+          wallet,
+          options.entryMode === "coordinated" ? "coordinated" : "entry",
+          targetBuyAt,
+        );
+      }
+      await updateEntryClaim(entryClaim.id, {
+        status: "persisted",
+        error_code: null,
+        persisted_at: new Date().toISOString(),
+      });
       uncertainEntryMints.delete(event.tokenMint);
 
       const { error: tradeError } = await db.from("trades").insert({
@@ -1746,7 +2878,7 @@ async function main() {
       });
       if (tradeError)
         log.error(
-          { err: tradeError, positionId: pos.id },
+          { err: safeDiagnostic(tradeError), positionId: pos.id },
           "copy buy landed but trade log save failed",
         );
       const { error: tradedTokenError } = await db
@@ -1754,27 +2886,32 @@ async function main() {
         .upsert({ user_id: cfg.user_id, token_mint: event.tokenMint });
       if (tradedTokenError)
         log.error(
-          { err: tradedTokenError, mint: event.tokenMint },
+          { err: safeDiagnostic(tradedTokenError), mint: event.tokenMint },
           "could not save traded-token history",
         );
 
-      await monitor.onCopyBuy({
-        positionId: pos.id,
-        tokenMint: event.tokenMint,
-        targetWallet: event.wallet,
-      });
-      if (options.entryMode === "coordinated") {
-        for (const transfer of pendingTransfers.get(event.tokenMint) ?? []) {
-          const windowMs = Math.max(1, Number(cfg.coordinated_window_seconds)) * 1000;
-          if (event.timestampMs - transfer.timestampMs > windowMs) continue;
-          await monitor.recordTransfer(pos.id, transfer.to, transfer.amountTokens, {
+      for (const transfer of pendingTransfers.drainForLandedBuy(event.tokenMint, event.slot)) {
+        const classifiedPending = await classifyTransferRecipients(transfer);
+        for (const recipient of classifiedPending) {
+          if (!recipient.track) continue;
+          await monitor.recordTransfer(pos.id, recipient.wallet, recipient.amountTokens, {
             hopDepth: 1,
             parentWallet: transfer.from,
             txSig: transfer.txSig,
             slot: transfer.slot,
+            triggerEligible: Math.max(0, Number(recipient.recipientPreAmount ?? 0)) <= 1e-9,
           });
         }
-        pendingTransfers.delete(event.tokenMint);
+        await handleTargetTerminalOutflows(
+          transfer,
+          {
+            positionId: pos.id,
+            tokenMint: event.tokenMint,
+            targetWallet: event.wallet,
+            entrySlot: event.slot > 0 ? event.slot : undefined,
+          },
+          classifiedPending,
+        );
       }
       log.info(
         {
@@ -1807,10 +2944,14 @@ async function main() {
   }
 }
 
-process.on("unhandledRejection", (err) => log.error({ err }, "unhandled rejection"));
-process.on("uncaughtException", (err) => log.error({ err }, "uncaught exception"));
+process.on("unhandledRejection", (err) =>
+  log.error({ err: safeDiagnostic(err) }, "unhandled rejection"),
+);
+process.on("uncaughtException", (err) =>
+  log.error({ err: safeDiagnostic(err) }, "uncaught exception"),
+);
 
 main().catch((e) => {
-  log.error(e, "worker crashed before startup completed");
+  log.error({ err: safeDiagnostic(e) }, "worker crashed before startup completed");
   process.exit(1);
 });

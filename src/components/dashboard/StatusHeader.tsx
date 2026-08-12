@@ -8,6 +8,7 @@ type Props = {
   readinessPending?: boolean;
   readinessMessage: string;
   workerConnected?: boolean;
+  workerDegraded?: boolean;
   workerStatusMessage?: string;
   activePositions: number;
   monitoredWallets: number;
@@ -22,6 +23,7 @@ export function StatusHeader({
   readinessPending,
   readinessMessage,
   workerConnected,
+  workerDegraded,
   workerStatusMessage,
   activePositions,
   monitoredWallets,
@@ -70,10 +72,16 @@ export function StatusHeader({
           <Stat
             label="Worker"
             value={
-              workerConnected === undefined ? "Checking" : workerConnected ? "Online" : "Offline"
+              workerConnected === undefined
+                ? "Checking"
+                : workerConnected && workerDegraded
+                  ? "Degraded"
+                  : workerConnected
+                    ? "Online"
+                    : "Offline"
             }
-            accent={workerConnected ? "success" : "muted"}
-            pulse={workerConnected}
+            accent={workerConnected && !workerDegraded ? "success" : "muted"}
+            pulse={workerConnected && !workerDegraded}
           />
         </div>
         <Stat label="Open positions" value={String(activePositions)} />

@@ -5,6 +5,7 @@ import { env } from "./env.js";
 import type { FeedEvent } from "./geyser.js";
 import {
   attributeVerifiedBuy,
+  attributeVerifiedSell,
   conservativeNativeSolSpend,
   hasWalletSpecificSpend,
   isOnCurveWallet,
@@ -14,48 +15,143 @@ import {
   type WalletTokenDelta,
 } from "./swap-attribution.js";
 import { hasVerifiedSwapSignal } from "./swap-signal.js";
+import {
+  planNextRpcSignaturePage,
+  planRpcSignaturePages,
+  sanitizeRpcCursorError,
+  takeOldestRpcRecoveryChunk,
+  type RpcCursorStore,
+  type RpcWalletCursor,
+} from "./rpc-cursor.js";
 
 const log = pino({ level: env.LOG_LEVEL });
+const RPC_SIGNATURE_PAGE_SIZE = 1_000;
+const RPC_SIGNATURE_MAX_PAGES = 1_000;
+const RPC_RECOVERY_CHUNK_SIZE = 5_000;
 
 export type PollerHandler = (event: FeedEvent) => Promise<void> | void;
 
+export type RpcWatchOptions = {
+  anchorSlot?: number;
+};
+
 export class RpcBackfillPoller {
-  private watched = new Set<string>();
-  private seen = new Set<string>();
-  private initialized = new Set<string>();
+  private watched = new Map<string, RpcWatchOptions>();
   private timer?: NodeJS.Timeout;
   private running = false;
   private lastPollAt?: number;
+  private lastSuccessAt?: number;
+  private backlogWallets = new Set<string>();
+  // A newly watched wallet is fail-closed until its durable cursor has been
+  // loaded. This prevents a persisted backlog from briefly disappearing from
+  // health after a worker restart.
+  private cursorHydrationPending = new Set<string>();
+  private cursorHydrationInFlight = new Set<string>();
+  private failures = 0;
+  private cursorCache = new Map<string, RpcWalletCursor>();
+  private cursorSuccessPersistedAt = new Map<string, number>();
 
-  constructor(private conn: Connection, private onEvent: PollerHandler, private intervalMs = 1200) {}
+  constructor(
+    private conn: Connection,
+    private onEvent: PollerHandler,
+    private cursorStore: RpcCursorStore,
+    private intervalMs = 1200,
+  ) {}
 
   start(initialWallets: string[]) {
     initialWallets.forEach((wallet) => this.watch(wallet));
     if (this.timer) return;
     this.timer = setInterval(() => {
-      this.poll().catch((err) => log.warn({ err }, "rpc fallback poll failed"));
+      this.poll().catch((error) =>
+        log.warn({ error: sanitizeRpcCursorError(error) }, "rpc fallback poll failed"));
     }, this.intervalMs);
-    this.poll().catch((err) => log.warn({ err }, "rpc fallback initial poll failed"));
-    log.info({ watched: Array.from(this.watched), intervalMs: this.intervalMs }, "rpc fallback poller started");
+    this.poll().catch((error) =>
+      log.warn({ error: sanitizeRpcCursorError(error) }, "rpc fallback initial poll failed"));
+    log.info(
+      { watchedCount: this.watched.size, intervalMs: this.intervalMs },
+      "durable RPC fallback poller started",
+    );
   }
 
-  watch(wallet: string) {
+  watch(wallet: string, options: RpcWatchOptions = {}) {
     if (!wallet) return;
-    this.watched.add(wallet);
+    const current = this.watched.get(wallet);
+    const nextAnchor = positiveSlot(options.anchorSlot);
+    const currentAnchor = positiveSlot(current?.anchorSlot);
+    this.watched.set(wallet, {
+      anchorSlot:
+        currentAnchor !== undefined && nextAnchor !== undefined
+          ? Math.min(currentAnchor, nextAnchor)
+          : currentAnchor ?? nextAnchor,
+    });
+    const cached = this.cursorCache.get(wallet);
+    if (cached) {
+      this.applyCursorHealth(wallet, cached);
+      return;
+    }
+    this.cursorHydrationPending.add(wallet);
+    this.hydrateCursorHealth(wallet).catch((error) =>
+      log.warn(
+        { wallet, error: sanitizeRpcCursorError(error) },
+        "RPC fallback cursor health hydration failed",
+      ));
   }
 
   unwatch(wallet: string) {
     this.watched.delete(wallet);
-    this.initialized.delete(wallet);
+    this.backlogWallets.delete(wallet);
+    this.cursorHydrationPending.delete(wallet);
+    // Durable cursor intentionally survives unwatch/re-watch cycles.
   }
 
   health() {
+    const unavailableWallets = new Set([
+      ...this.backlogWallets,
+      ...this.cursorHydrationPending,
+    ]);
     return {
       watchedCount: this.watched.size,
       lastPollAt: this.lastPollAt,
       secondsSinceLastPoll: this.lastPollAt ? Math.round((Date.now() - this.lastPollAt) / 1000) : null,
-      seenCacheSize: this.seen.size,
+      lastSuccessAt: this.lastSuccessAt,
+      secondsSinceLastSuccess: this.lastSuccessAt
+        ? Math.round((Date.now() - this.lastSuccessAt) / 1000)
+        : null,
+      // The entry gate consumes this conservative count. Cursor hydration is
+      // included because coverage is unknown until durable state is loaded.
+      backlogWalletCount: unavailableWallets.size,
+      detectedBacklogWalletCount: this.backlogWallets.size,
+      cursorHydrationPendingCount: this.cursorHydrationPending.size,
+      failures: this.failures,
     };
+  }
+
+  private async hydrateCursorHealth(wallet: string) {
+    if (this.cursorHydrationInFlight.has(wallet)) return;
+    this.cursorHydrationInFlight.add(wallet);
+    try {
+      const cursor = await this.cursorStore.load(wallet);
+      if (!this.watched.has(wallet)) return;
+      if (!cursor) {
+        // Keep the wallet pending until pollWallet creates and successfully
+        // establishes its baseline/anchor cursor.
+        return;
+      }
+      // pollWallet may have loaded or advanced this cursor while the startup
+      // hydration request was in flight. Never overwrite newer in-memory state
+      // with an older response snapshot.
+      if (this.cursorCache.has(wallet)) return;
+      this.cursorCache.set(wallet, cursor);
+      this.applyCursorHealth(wallet, cursor);
+    } finally {
+      this.cursorHydrationInFlight.delete(wallet);
+    }
+  }
+
+  private applyCursorHealth(wallet: string, cursor: RpcWalletCursor) {
+    this.cursorHydrationPending.delete(wallet);
+    if (cursor.backlogDetected) this.backlogWallets.add(wallet);
+    else this.backlogWallets.delete(wallet);
   }
 
   private async poll() {
@@ -63,15 +159,43 @@ export class RpcBackfillPoller {
     this.running = true;
     this.lastPollAt = Date.now();
     try {
-      for (const wallet of Array.from(this.watched)) {
-        await this.pollWallet(wallet);
+      const entries = Array.from(this.watched.entries());
+      for (let offset = 0; offset < entries.length; offset += 8) {
+        const batch = entries.slice(offset, offset + 8);
+        const results = await Promise.allSettled(
+          batch.map(([wallet, options]) => this.pollWallet(wallet, options)),
+        );
+        for (const [index, result] of results.entries()) {
+          if (result.status === "fulfilled") continue;
+          const wallet = batch[index]?.[0];
+          this.failures += 1;
+          if (wallet) {
+            const newlyBacklogged = !this.backlogWallets.has(wallet);
+            this.backlogWallets.add(wallet);
+            if (newlyBacklogged) {
+              try {
+                const cursor = await this.cursorStore.markBacklog(wallet, result.reason);
+                this.cursorCache.set(wallet, cursor);
+              } catch (cursorError) {
+                log.warn(
+                  { wallet, error: sanitizeRpcCursorError(cursorError) },
+                  "RPC fallback could not persist backlog state",
+                );
+              }
+            }
+          }
+          log.warn(
+            { wallet, error: sanitizeRpcCursorError(result.reason) },
+            "RPC fallback wallet poll failed",
+          );
+        }
       }
     } finally {
       this.running = false;
     }
   }
 
-  private async pollWallet(wallet: string) {
+  private async pollWallet(wallet: string, options: RpcWatchOptions) {
     let pubkey: PublicKey;
     try {
       pubkey = new PublicKey(wallet);
@@ -80,33 +204,148 @@ export class RpcBackfillPoller {
       return;
     }
 
-    const signatures = await this.conn.getSignaturesForAddress(pubkey, { limit: 12 }, "confirmed");
-    if (!this.initialized.has(wallet)) {
-      signatures.forEach((sig) => this.seen.add(sig.signature));
-      this.initialized.add(wallet);
-      log.info({ wallet, baselineSignatures: signatures.length }, "rpc fallback wallet baseline ready");
+    let cursor = this.cursorCache.get(wallet) ?? await this.cursorStore.load(wallet);
+    if (cursor) {
+      this.cursorCache.set(wallet, cursor);
+      this.applyCursorHealth(wallet, cursor);
+    }
+    if (!cursor) {
+      const anchorSlot = positiveSlot(options.anchorSlot);
+      if (anchorSlot === undefined) {
+        const head = await this.conn.getSignaturesForAddress(pubkey, { limit: 1 }, "confirmed");
+        cursor = await this.cursorStore.ensure(wallet, head[0]?.slot ?? 0);
+        this.cursorCache.set(wallet, cursor);
+        if (head[0]) {
+          cursor = await this.cursorStore.advance(
+            wallet,
+            head[0].signature,
+            head[0].slot,
+            head[0].blockTime ?? null,
+          );
+          this.cursorCache.set(wallet, cursor);
+        }
+        cursor = await this.cursorStore.markSuccess(wallet);
+        this.cursorCache.set(wallet, cursor);
+        this.applyCursorHealth(wallet, cursor);
+        this.cursorSuccessPersistedAt.set(wallet, Date.now());
+        this.lastSuccessAt = Date.now();
+        this.backlogWallets.delete(wallet);
+        log.info({ wallet, headSlot: head[0]?.slot ?? null }, "RPC target cursor baseline ready");
+        return;
+      }
+      cursor = await this.cursorStore.ensure(wallet, anchorSlot);
+      this.cursorCache.set(wallet, cursor);
+    }
+
+    const pages: Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[] = [];
+    // Find the trusted lower boundary before releasing any work. The previous
+    // 5,000-signature discovery cap could leave a busy wallet permanently
+    // backlogged. Once the boundary is found, transaction handling remains
+    // bounded to a durable 5,000-signature chunk per poll.
+    const paging = {
+      pageSize: RPC_SIGNATURE_PAGE_SIZE,
+      maxPages: RPC_SIGNATURE_MAX_PAGES,
+    };
+    while (true) {
+      const request = planNextRpcSignaturePage(pages, cursor, paging);
+      if (!request) break;
+      const page = await this.conn.getSignaturesForAddress(pubkey, request, "confirmed");
+      pages.push(page);
+      const plan = planRpcSignaturePages(pages, cursor, paging);
+      if (plan.complete || plan.backlogDetected) break;
+    }
+
+    const plan = planRpcSignaturePages(pages, cursor, paging);
+    if (plan.backlogDetected || !plan.complete) {
+      this.backlogWallets.add(wallet);
+      cursor = await this.cursorStore.markBacklog(
+        wallet,
+        plan.error ?? "RPC signature pagination backlog",
+      );
+      this.cursorCache.set(wallet, cursor);
+      this.applyCursorHealth(wallet, cursor);
       return;
     }
 
-    const fresh = signatures.filter((sig) => !this.seen.has(sig.signature)).reverse();
-    for (const sig of fresh) this.seen.add(sig.signature);
-    if (this.seen.size > 2000) this.seen = new Set(Array.from(this.seen).slice(-1000));
-    if (fresh.length === 0) return;
+    const recovery = takeOldestRpcRecoveryChunk(plan, RPC_RECOVERY_CHUNK_SIZE);
 
-    const txs = await this.conn.getParsedTransactions(fresh.map((sig) => sig.signature), {
-      commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
-    });
-
-    for (const tx of txs) {
-      if (!tx) continue;
-      const events = decodeParsedTransaction(wallet, tx as any);
-      for (const event of events) {
-        log.info({ kind: event.kind, wallet: (event as any).wallet ?? (event as any).from, side: (event as any).side, mint: event.tokenMint }, "rpc fallback feed event");
-        await this.onEvent(event);
+    for (let offset = 0; offset < recovery.signatures.length; offset += 50) {
+      const signatureBatch = recovery.signatures.slice(offset, offset + 50);
+      const txs = await this.conn.getParsedTransactions(
+        signatureBatch.map((sig) => sig.signature),
+        { commitment: "confirmed", maxSupportedTransactionVersion: 0 },
+      );
+      for (const [index, sig] of signatureBatch.entries()) {
+        const tx = txs[index];
+        if (!tx) {
+          this.backlogWallets.add(wallet);
+          cursor = await this.cursorStore.markBacklog(
+            wallet,
+            "RPC transaction was temporarily unavailable",
+          );
+          this.cursorCache.set(wallet, cursor);
+          this.applyCursorHealth(wallet, cursor);
+          return;
+        }
+        const events = decodeParsedTransaction(wallet, tx as any);
+        for (const event of events) {
+          event.source = "rpc";
+          event.delivery = "catchup";
+          event.observedAtMs = Date.now();
+          log.info(
+            {
+              kind: event.kind,
+              wallet: event.kind === "swap" ? event.wallet : event.from,
+              side: event.kind === "swap" ? event.side : undefined,
+              mint: event.tokenMint,
+              ageMs: event.blockTimeMs ? Math.max(0, Date.now() - event.blockTimeMs) : null,
+            },
+            "RPC fallback feed event",
+          );
+          await this.onEvent(event);
+        }
+        cursor = await this.cursorStore.advance(
+          wallet,
+          sig.signature,
+          sig.slot,
+          sig.blockTime ?? null,
+        );
+        this.cursorCache.set(wallet, cursor);
       }
     }
+    if (recovery.hasMore) {
+      this.backlogWallets.add(wallet);
+      cursor = await this.cursorStore.markBacklog(
+        wallet,
+        new Error("RPC recovery backlog remains after safe chunk"),
+      );
+      this.cursorCache.set(wallet, cursor);
+      this.applyCursorHealth(wallet, cursor);
+      log.warn(
+        { wallet, processed: recovery.signatures.length, remaining: recovery.remainingCount },
+        "RPC fallback advanced one durable recovery chunk",
+      );
+      return;
+    }
+    const now = Date.now();
+    const shouldPersistSuccess =
+      cursor.backlogDetected ||
+      recovery.signatures.length > 0 ||
+      now - (this.cursorSuccessPersistedAt.get(wallet) ?? 0) >= 5 * 60_000;
+    if (shouldPersistSuccess) {
+      cursor = await this.cursorStore.markSuccess(wallet);
+      this.cursorCache.set(wallet, cursor);
+      this.applyCursorHealth(wallet, cursor);
+      this.cursorSuccessPersistedAt.set(wallet, now);
+    }
+    this.lastSuccessAt = Date.now();
+    this.cursorHydrationPending.delete(wallet);
+    this.backlogWallets.delete(wallet);
   }
+}
+
+function positiveSlot(value: number | undefined): number | undefined {
+  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value : undefined;
 }
 
 export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
@@ -116,6 +355,12 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
 
   const signature = String(tx?.transaction?.signatures?.[0] ?? "");
   const slot = Number(tx?.slot ?? 0);
+  const observedAtMs = Date.now();
+  const parsedBlockTime = Number(tx?.blockTime);
+  const blockTimeMs = Number.isFinite(parsedBlockTime) && parsedBlockTime > 0
+    ? parsedBlockTime * 1000
+    : undefined;
+  const eventTimeMs = blockTimeMs ?? observedAtMs;
   const message = tx?.transaction?.message;
   const accountKeyEntries = message?.accountKeys ?? [];
   const accountKeys = accountKeyEntries.map((key: any) => key?.pubkey?.toBase58?.() ?? String(key?.pubkey ?? key));
@@ -149,6 +394,7 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
   const hasSwapSignal = hasVerifiedSwapSignal(meta?.logMessages ?? []);
   const hasSolMove = Math.abs(solDelta) > 0.0005;
   const positiveOutputRows = rows.filter((row) => tokenDelta(row) > 1e-12);
+  const walletSigned = signerKeys.has(wallet);
   const walletCanAuthorizeSwap = signerKeys.size === 1 && signerKeys.has(wallet);
   const emittedBuyMints = new Set<string>();
   const negativeWalletMints = new Set(
@@ -167,8 +413,21 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
   for (const row of rows) {
     const delta = row.post - row.pre;
     if (Math.abs(delta) < 1e-12) continue;
-    if (walletCanAuthorizeSwap && (hasSolMove || hasSwapSignal)) {
-      const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
+    const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
+    const sellAttribution = side === "sell"
+      ? attributeVerifiedSell(
+          attributionRows,
+          row.mint,
+          nativeSolDelta,
+          hasSwapSignal,
+          walletSigned,
+          signerKeys.size,
+        )
+      : undefined;
+    const verifiedSwapForWallet = side === "buy"
+      ? walletCanAuthorizeSwap && (hasSolMove || hasSwapSignal)
+      : Boolean(sellAttribution?.verified);
+    if (verifiedSwapForWallet) {
       if (side === "buy" && !hasSwapSignal) {
         log.info({ wallet, signature, mint: row.mint }, "positive token delta skipped — no explicit swap instruction");
         continue;
@@ -194,27 +453,44 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
         solDelta,
         slot,
         txSig: signature,
-        timestampMs: Date.now(),
+        timestampMs: eventTimeMs,
         isPumpFun: row.mint.endsWith("pump"),
+        verifiedSwap: hasSwapSignal,
+        sellAttribution,
+        blockTimeMs,
+        observedAtMs,
       });
       if (side === "buy") emittedBuyMints.add(row.mint);
       continue;
     }
 
     if (delta < 0) {
-      const recipient = findTransferRecipient(meta, row.mint, wallet, Math.abs(delta));
-      if (!recipient) continue;
-      out.push({
-        kind: "transfer",
-        from: wallet,
-        to: recipient,
-        tokenMint: row.mint,
-        amountTokens: Math.abs(delta),
-        decimals: row.decimals,
-        slot,
-        txSig: signature,
-        timestampMs: Date.now(),
-      });
+      const recipients = findTransferRecipients(meta, row.mint, wallet, Math.abs(delta), accountKeys);
+      if (recipients.length > 0) {
+        const batchRecipients = recipients
+          .map((recipient) => ({
+            wallet: recipient.owner,
+            amountTokens: recipient.amount,
+            recipientPreAmount: recipient.pre,
+          }))
+          .sort((a, b) => a.wallet.localeCompare(b.wallet));
+        const first = batchRecipients[0]!;
+        out.push({
+          kind: "transfer",
+          from: wallet,
+          to: first.wallet,
+          tokenMint: row.mint,
+          amountTokens: batchRecipients.reduce((sum, recipient) => sum + recipient.amountTokens, 0),
+          decimals: row.decimals,
+          recipientPreAmount: first.recipientPreAmount,
+          recipients: batchRecipients,
+          slot,
+          txSig: signature,
+          timestampMs: eventTimeMs,
+          blockTimeMs,
+          observedAtMs,
+        });
+      }
     }
   }
 
@@ -267,23 +543,36 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
       solDelta,
       slot,
       txSig: signature,
-      timestampMs: Date.now(),
+      timestampMs: eventTimeMs,
       isPumpFun: inferredBuy.tokenMint.endsWith("pump"),
+      verifiedSwap: hasSwapSignal,
+      blockTimeMs,
+      observedAtMs,
     });
 
-    for (const recipient of inferredBuy.recipients) {
-      out.push({
-        kind: "transfer",
-        from: wallet,
-        to: recipient.owner,
-        tokenMint: inferredBuy.tokenMint,
+    const recipients = inferredBuy.recipients
+      .map((recipient) => ({
+        wallet: recipient.owner,
         amountTokens: recipient.amountTokens,
-        decimals: inferredBuy.decimals,
-        slot,
-        txSig: signature,
-        timestampMs: Date.now(),
-      });
-    }
+        recipientPreAmount: recipient.pre,
+      }))
+      .sort((a, b) => a.wallet.localeCompare(b.wallet));
+    const first = recipients[0]!;
+    out.push({
+      kind: "transfer",
+      from: wallet,
+      to: first.wallet,
+      tokenMint: inferredBuy.tokenMint,
+      amountTokens: inferredBuy.amountTokens,
+      decimals: inferredBuy.decimals,
+      recipientPreAmount: first.recipientPreAmount,
+      recipients,
+      slot,
+      txSig: signature,
+      timestampMs: eventTimeMs,
+      blockTimeMs,
+      observedAtMs,
+    });
   }
 
   return out;
@@ -335,7 +624,7 @@ function recipientBalanceRows(
   const ingestRecipientBalances = (balances: any[], field: "pre" | "post") => {
     for (const balance of balances ?? []) {
       const owner = resolveTokenOwner(balance, balance?.mint, accountKeys, wallet);
-      if (!owner || !balance?.mint || balance.mint === WSOL_MINT || owner === wallet || !isOnCurveWallet(owner)) continue;
+      if (!owner || !balance?.mint || balance.mint === WSOL_MINT || owner === wallet) continue;
       const key = `${owner}::${balance.mint}`;
       const row = ownerMintRows.get(key) ?? {
         owner,
@@ -364,11 +653,12 @@ function inferBuyTransferredOut(
   walletCanAuthorizeSwap: boolean,
   emittedBuyMints: Set<string>,
   negativeWalletMints: Set<string>,
-): { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> } | null {
+): { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number; pre: number }> } | null {
   if (!walletCanAuthorizeSwap || !hasSwapSignal || !hasWalletSpecificSpend(walletRows, solSpend)) return null;
 
-  const rows = new Map<string, { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number }> }>();
+  const rows = new Map<string, { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number; pre: number }> }>();
   for (const balance of recipientBalanceRows(meta, wallet, accountKeys)) {
+    if (!isOnCurveWallet(balance.owner)) continue;
     if (emittedBuyMints.has(balance.tokenMint) || negativeWalletMints.has(balance.tokenMint)) continue;
     const delta = balance.post - balance.pre;
     if (delta <= 1e-12) continue;
@@ -376,7 +666,7 @@ function inferBuyTransferredOut(
       tokenMint: string;
       amountTokens: number;
       decimals: number;
-      recipients: Array<{ owner: string; amountTokens: number }>;
+      recipients: Array<{ owner: string; amountTokens: number; pre: number }>;
     } = rows.get(balance.tokenMint) ?? {
       tokenMint: balance.tokenMint,
       amountTokens: 0,
@@ -385,7 +675,7 @@ function inferBuyTransferredOut(
     };
     row.amountTokens += delta;
     row.decimals = balance.decimals;
-    row.recipients.push({ owner: balance.owner, amountTokens: delta });
+    row.recipients.push({ owner: balance.owner, amountTokens: delta, pre: balance.pre });
     rows.set(balance.tokenMint, row);
   }
 
@@ -407,18 +697,32 @@ function resolveTokenOwner(balance: any, mint: string | undefined, accountKeys: 
   return tokenAccount;
 }
 
-function findTransferRecipient(meta: any, mint: string, sender: string, amount: number): string | null {
-  const before = new Map<string, number>();
-  for (const balance of meta?.preTokenBalances ?? []) {
-    if (balance?.mint !== mint || !balance?.owner || balance.owner === sender) continue;
-    before.set(balance.owner, (before.get(balance.owner) ?? 0) + Number(balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0));
+function findTransferRecipients(
+  meta: any,
+  mint: string,
+  sender: string,
+  amount: number,
+  accountKeys: string[],
+): Array<{ owner: string; pre: number; amount: number }> {
+  const senderRows = ownerMintRows(meta, sender, accountKeys).filter(
+    (row) => row.mint === mint && tokenDelta(row) < -1e-12,
+  );
+  if (senderRows.length !== 1) return [];
+  const peerRows = recipientBalanceRows(meta, sender, accountKeys)
+    .filter((row) => row.tokenMint === mint);
+  // Do not attribute transaction-wide recipients to this sender when another
+  // owner also supplied the same mint. Parsed RPC payloads can contain several
+  // independent transfers, so conservation alone is not enough in that case.
+  if (peerRows.some((row) => row.post - row.pre < -1e-12)) return [];
+  const recipients = peerRows
+    .filter((row) => row.tokenMint === mint && row.post - row.pre > 1e-12)
+    .map((row) => ({ owner: row.owner, pre: row.pre, amount: row.post - row.pre }));
+  const received = recipients.reduce((sum, row) => sum + row.amount, 0);
+  if (
+    recipients.length === 0 ||
+    Math.abs(received - amount) / Math.max(amount, 1e-9) >= 0.05
+  ) {
+    return [];
   }
-
-  for (const balance of meta?.postTokenBalances ?? []) {
-    if (balance?.mint !== mint || !balance?.owner || balance.owner === sender) continue;
-    const post = Number(balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0);
-    const delta = post - (before.get(balance.owner) ?? 0);
-    if (delta > 0 && Math.abs(delta - amount) / Math.max(amount, 1e-9) < 0.05) return balance.owner;
-  }
-  return null;
+  return recipients;
 }

@@ -15,6 +15,13 @@ test("follower propagation stops after three hops", () => {
   assert.equal(nextFollowerHop(3), null);
 });
 
+test("observation-only lineage can continue to a hard maximum of five hops", () => {
+  assert.equal(nextFollowerHop(3, 5), 4);
+  assert.equal(nextFollowerHop(4, 5), 5);
+  assert.equal(nextFollowerHop(5, 5), null);
+  assert.equal(nextFollowerHop(5, 500), null);
+});
+
 test("chained transfers move only the sender's available cohort balance", () => {
   assert.equal(chainedTransferAmount(75, 25), 25);
   assert.equal(chainedTransferAmount(10, 25), 10);
@@ -31,6 +38,17 @@ test("net follower selling is based on conserved cohort supply", () => {
   );
   assert.equal(followerSoldFraction([{ initial_amount: 0, current_amount: 0 }]), 0);
   assert.equal(followerSoldFraction([{ initial_amount: 100, current_amount: -5 }]), 1);
+});
+
+test("unresolved custody outflows are not counted again as verified sales", () => {
+  const fraction = followerSoldFraction([
+    {
+      initial_amount: 100,
+      current_amount: 40,
+      unexplained_outflow_amount: 40,
+    },
+  ]);
+  assert.ok(Math.abs(fraction - 0.2) < 1e-12);
 });
 
 test("proportional mirroring is cumulative and never oversells", () => {

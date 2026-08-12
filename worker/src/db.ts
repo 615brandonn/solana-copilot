@@ -87,6 +87,12 @@ export type BotConfigRow = {
   follower_seller_exit_pct: number;
   target_inactivity_exit_enabled: boolean;
   target_inactivity_hours: number;
+  direct_target_sell_exit_mode: "off" | "proportional" | "fixed_pct" | "full";
+  direct_target_sell_exit_pct: number;
+  terminal_outflow_exit_enabled: boolean;
+  terminal_outflow_exit_pct: number;
+  target_terminal_outflow_exit_enabled: boolean;
+  target_terminal_outflow_exit_pct: number;
   additional_target_wallets?: string[];
   network_scaling_enabled?: boolean;
   starter_position_pct?: number;

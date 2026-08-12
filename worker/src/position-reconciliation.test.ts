@@ -4,6 +4,7 @@ import {
   aggregateWalletTokenHoldings,
   groupObservedFollowerTransfers,
   isEligibleFollowerWallet,
+  ReducedBalanceConfirmationTracker,
   ZeroBalanceConfirmationTracker,
 } from "./position-reconciliation.js";
 import { PublicKey } from "@solana/web3.js";
@@ -31,6 +32,26 @@ test("forgets positions that are no longer open", () => {
   tracker.observe(positions, new Set(["mint-held"]));
   tracker.observe([positions[0]], new Set(["mint-held"]));
   assert.deepEqual(tracker.observe(positions, new Set(["mint-held"])), []);
+});
+
+test("confirms a reduced on-chain position balance twice before capping accounting", () => {
+  const tracker = new ReducedBalanceConfirmationTracker();
+  const open = [{ id: "position", token_mint: "mint", amount_remaining: 100, decimals: 6 }];
+  assert.deepEqual(tracker.observe(open, new Map([["mint", 60]])), []);
+  assert.deepEqual(tracker.observe(open, new Map([["mint", 60]])), [
+    { id: "position", amountRemaining: 60 },
+  ]);
+});
+
+test("never increases a position and resets an unconfirmed balance change", () => {
+  const tracker = new ReducedBalanceConfirmationTracker();
+  const open = [{ id: "position", token_mint: "mint", amount_remaining: 100, decimals: 6 }];
+  assert.deepEqual(tracker.observe(open, new Map([["mint", 60]])), []);
+  assert.deepEqual(tracker.observe(open, new Map([["mint", 120]])), []);
+  assert.deepEqual(tracker.observe(open, new Map([["mint", 55]])), []);
+  assert.deepEqual(tracker.observe(open, new Map([["mint", 55]])), [
+    { id: "position", amountRemaining: 55 },
+  ]);
 });
 
 test("aggregates positive wallet token accounts by mint", () => {

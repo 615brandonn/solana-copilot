@@ -9,7 +9,7 @@ export function toIsoTimestamp(value: unknown): string | null {
 }
 
 export function isMissingReadinessColumnError(message: string): boolean {
-  return /funding_key_ready|funding_key_checked_at|funding_wallet_pubkey|last_error|schema cache/i.test(
+  return /funding_key_ready|funding_key_checked_at|funding_wallet_pubkey|last_error|rpc_last_success_at|rpc_backlog_wallet_count|monitoring_degraded|follower_balance_last_checked_at|follower_balance_candidate_count|follower_balance_mismatch_count|follower_balance_reconciliation_degraded|follower_balance_last_error|schema cache/i.test(
     message,
   );
 }

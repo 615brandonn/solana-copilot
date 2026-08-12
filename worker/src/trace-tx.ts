@@ -9,6 +9,7 @@ import { priceUsd } from "./prices.js";
 import { resolveTargetBuyValue } from "./target-buy-valuation.js";
 import { quoteTokenSpendUsd } from "./token-spend-quote.js";
 import { hasVerifiedSwapSignal } from "./swap-signal.js";
+import { safeDiagnostic } from "./diagnostics.js";
 
 const WSOL = "So11111111111111111111111111111111111111112";
 const rpc = new Connection(env.RPC_URL, { commitment: "confirmed" });
@@ -25,7 +26,8 @@ async function loadConfig(): Promise<BotConfigRow | null> {
     .select("*")
     .eq("user_id", env.HELIX_USER_ID)
     .maybeSingle();
-  if (byUser.error) throw new Error(`bot_config query failed: ${byUser.error.message}`);
+  if (byUser.error)
+    throw new Error(`bot_config query failed: ${safeDiagnostic(byUser.error.message)}`);
   if (byUser.data?.target_wallet) return byUser.data as BotConfigRow;
 
   const any = await db
@@ -35,7 +37,8 @@ async function loadConfig(): Promise<BotConfigRow | null> {
     .neq("target_wallet", "")
     .order("updated_at", { ascending: false })
     .limit(1);
-  if (any.error) throw new Error(`bot_config fallback query failed: ${any.error.message}`);
+  if (any.error)
+    throw new Error(`bot_config fallback query failed: ${safeDiagnostic(any.error.message)}`);
   const row = any.data?.[0] as BotConfigRow | undefined;
   if (row) {
     throw new Error(
@@ -183,6 +186,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+  console.error(`❌ ${safeDiagnostic(err)}`);
   process.exit(1);
 });
