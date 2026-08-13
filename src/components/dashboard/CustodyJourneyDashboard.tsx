@@ -918,6 +918,14 @@ export function CustodyJourneyDashboard({ enabled }: { enabled?: boolean }) {
             <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
               {statusLabel}
             </span>
+            {onToggleEnabled ? (
+              <Switch
+                className="ml-2"
+                checked={enabled === true}
+                onCheckedChange={onToggleEnabled}
+                aria-label="Toggle custody observation on or off"
+              />
+            ) : null}
           </div>
         </div>
 
