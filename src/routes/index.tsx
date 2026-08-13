@@ -300,7 +300,10 @@ function Dashboard() {
           tradingMode={cfg.convictionTradingMode}
         />
         <StrategyLab />
-        <CustodyJourneyDashboard enabled={cfg.custodyJourneyEnabled} />
+        <CustodyJourneyDashboard
+          enabled={cfg.custodyJourneyEnabled}
+          onToggleEnabled={(value) => update({ custodyJourneyEnabled: value })}
+        />
 
         <footer className="mt-10 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-6 text-[11px] text-muted-foreground">
           <span className="mono">helix · self-hosted · supabase + cloudflare + jito</span>
