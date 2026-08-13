@@ -156,6 +156,7 @@ const RAW_DIGITS = /^[0-9]+$/;
 function isRawString(value: unknown): value is string {
   return typeof value === "string" && RAW_DIGITS.test(value.trim());
 }
+
 export function createSupabaseCustodyStore(client: SupabaseClient, userId: string): CustodyStore {
   const call = async (
     name: string,
