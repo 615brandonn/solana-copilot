@@ -14,6 +14,44 @@ export const BotConfigSchema = z
     executionRoute: z.enum(["jito", "rpc"]),
     jitoTipSol: z.number().finite().min(0).max(1),
     fixedBuyUsd: z.number().finite().positive().max(1_000_000),
+    convictionModeEnabled: z.boolean(),
+    convictionTradingMode: z.enum(["shadow", "live"]),
+    convictionRapidFollowEnabled: z.boolean(),
+    convictionPrimaryWindowMinutes: z.union([z.literal(5), z.literal(30), z.literal(60)]),
+    convictionScoreThreshold: z.number().finite().min(0).max(100),
+    convictionTopN: z.number().int().min(1).max(10),
+    convictionMinCommitmentUsd: z.number().finite().min(0).max(1_000_000_000),
+    convictionMinRecentNetInflowUsd: z.number().finite().min(0).max(1_000_000_000),
+    convictionMinVelocityUsdPerMinute: z.number().finite().min(0).max(1_000_000_000),
+    convictionMinAccelerationRatio: z.number().finite().min(0).max(1_000),
+    convictionMinConvergedWallets: z.number().int().min(1).max(3),
+    convictionTwoWalletWindowSeconds: z.number().int().min(1).max(21_600),
+    convictionThreeWalletWindowSeconds: z.number().int().min(1).max(21_600),
+    convictionMinIndividualBuyUsd: z.number().finite().min(0).max(1_000_000_000),
+    convictionMarketCapFilterEnabled: z.boolean(),
+    convictionMarketCapMinUsd: z.number().finite().min(0).max(1_000_000_000),
+    convictionMarketCapMaxUsd: z.number().finite().min(0).max(1_000_000_000),
+    convictionLiquidityFilterEnabled: z.boolean(),
+    convictionLiquidityMinUsd: z.number().finite().min(0).max(1_000_000_000),
+    convictionLiquidityMaxUsd: z.number().finite().min(0).max(1_000_000_000),
+    convictionTokenAgeFilterEnabled: z.boolean(),
+    convictionTokenAgeMinMinutes: z.number().finite().min(0).max(525_600),
+    convictionTokenAgeMaxMinutes: z.number().finite().min(0).max(525_600),
+    convictionMaxPositionPerTokenUsd: z.number().finite().positive().max(1_000_000),
+    convictionDistributionSellRatio: z.number().finite().min(0).max(1),
+    convictionDistributionMinSellsUsd: z.number().finite().min(0).max(1_000_000_000),
+    convictionDistributionWalletCount: z.number().int().min(1).max(3),
+    convictionInactivityMinutes: z.number().finite().positive().max(43_200),
+    convictionRankLossGraceSeconds: z.number().int().min(0).max(86_400),
+    convictionWeightNetCommitment: z.number().finite().min(0).max(100),
+    convictionWeightVelocity: z.number().finite().min(0).max(100),
+    convictionWeightAcceleration: z.number().finite().min(0).max(100),
+    convictionWeightConvergence: z.number().finite().min(0).max(100),
+    convictionWeightPersistence: z.number().finite().min(0).max(100),
+    convictionTierCommitmentThresholdsUsd: z
+      .array(z.number().finite().positive().max(1_000_000_000))
+      .length(4),
+    convictionTierBuyAmountsUsd: z.array(z.number().finite().positive().max(1_000_000)).length(4),
     coordinatedModeEnabled: z.boolean(),
     coordinatedFixedBuyUsd: z.number().finite().positive().max(1_000_000),
     coordinatedTargetWalletCount: z.number().int().min(2).max(20),
@@ -99,6 +137,18 @@ export const BotConfigSchema = z
     message: "Starter position cannot exceed the per-coin maximum",
     path: ["maxPositionPct"],
   })
+  .refine((config) => config.convictionMarketCapMinUsd <= config.convictionMarketCapMaxUsd, {
+    message: "Conviction market-cap minimum cannot exceed maximum",
+    path: ["convictionMarketCapMaxUsd"],
+  })
+  .refine((config) => config.convictionLiquidityMinUsd <= config.convictionLiquidityMaxUsd, {
+    message: "Conviction liquidity minimum cannot exceed maximum",
+    path: ["convictionLiquidityMaxUsd"],
+  })
+  .refine((config) => config.convictionTokenAgeMinMinutes <= config.convictionTokenAgeMaxMinutes, {
+    message: "Conviction token-age minimum cannot exceed maximum",
+    path: ["convictionTokenAgeMaxMinutes"],
+  })
   .superRefine((config, ctx) => {
     const normalized = config.additionalTargetWallets.map((wallet) => wallet.trim());
     if (new Set(normalized).size !== normalized.length) {
@@ -116,6 +166,55 @@ export const BotConfigSchema = z
       });
     }
     const configuredTargetCount = (config.targetWallet ? 1 : 0) + normalized.length;
+    if (config.convictionModeEnabled && configuredTargetCount !== 3) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Conviction Mode requires exactly 3 unique market-maker wallets",
+        path: ["convictionModeEnabled"],
+      });
+    }
+    const convictionWeightTotal =
+      config.convictionWeightNetCommitment +
+      config.convictionWeightVelocity +
+      config.convictionWeightAcceleration +
+      config.convictionWeightConvergence +
+      config.convictionWeightPersistence;
+    if (Math.abs(convictionWeightTotal - 100) > 0.000_001) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Conviction score weights must total 100%",
+        path: ["convictionWeightPersistence"],
+      });
+    }
+    if (
+      config.convictionTierCommitmentThresholdsUsd.some(
+        (threshold, index, rows) => index > 0 && threshold <= rows[index - 1],
+      )
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Conviction tier commitment thresholds must increase strictly",
+        path: ["convictionTierCommitmentThresholdsUsd"],
+      });
+    }
+    const configuredTierExposure = config.convictionTierBuyAmountsUsd.reduce(
+      (total, amount) => total + amount,
+      0,
+    );
+    if (configuredTierExposure > config.convictionMaxPositionPerTokenUsd) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Conviction tier buys cannot exceed the per-token exposure cap",
+        path: ["convictionMaxPositionPerTokenUsd"],
+      });
+    }
+    if (config.convictionThreeWalletWindowSeconds < config.convictionTwoWalletWindowSeconds) {
+      ctx.addIssue({
+        code: "custom",
+        message: "The 3-wallet convergence window cannot be shorter than the 2-wallet window",
+        path: ["convictionThreeWalletWindowSeconds"],
+      });
+    }
     if (
       config.coordinatedModeEnabled &&
       configuredTargetCount < config.coordinatedTargetWalletCount

@@ -19,6 +19,7 @@ import { WalletPanel } from "@/components/dashboard/WalletPanel";
 import { SettingsPanel } from "@/components/dashboard/SettingsPanel";
 import { ActivityFeed } from "@/components/dashboard/ActivityFeed";
 import { StrategyLab } from "@/components/dashboard/StrategyLab";
+import { ConvictionDashboard } from "@/components/dashboard/ConvictionDashboard";
 import { PositionFollowers } from "@/components/dashboard/PositionFollowers";
 
 export const Route = createFileRoute("/")({
@@ -132,9 +133,19 @@ function Dashboard() {
     readinessIssues.push("Target wallet missing or invalid.");
   const configuredTargetCount =
     (isSolanaPublicKey(cfg.targetWallet || "") ? 1 : 0) + cfg.additionalTargetWallets.length;
+  const convictionTargetCount = new Set(
+    [cfg.targetWallet, ...cfg.additionalTargetWallets]
+      .map((wallet) => wallet.trim())
+      .filter(isSolanaPublicKey),
+  ).size;
   if (cfg.coordinatedModeEnabled && configuredTargetCount < cfg.coordinatedTargetWalletCount) {
     readinessIssues.push(
       `Coordinated mode needs ${cfg.coordinatedTargetWalletCount} target wallets; ${configuredTargetCount} configured.`,
+    );
+  }
+  if (cfg.convictionModeEnabled && convictionTargetCount !== 3) {
+    readinessIssues.push(
+      `Conviction Mode requires exactly 3 unique valid target wallets; ${convictionTargetCount} configured.`,
     );
   }
   if (fundingKeyQ.isError) {
@@ -260,6 +271,8 @@ function Dashboard() {
           monitoredWallets={monitored}
           syncing={syncing}
           coordinatedModeEnabled={cfg.coordinatedModeEnabled}
+          convictionModeEnabled={cfg.convictionModeEnabled}
+          convictionTradingMode={cfg.convictionTradingMode}
         />
 
         <main className="mt-8 grid gap-6 lg:grid-cols-3">
@@ -281,6 +294,10 @@ function Dashboard() {
           </aside>
         </main>
 
+        <ConvictionDashboard
+          enabled={cfg.convictionModeEnabled}
+          tradingMode={cfg.convictionTradingMode}
+        />
         <StrategyLab />
 
         <footer className="mt-10 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-6 text-[11px] text-muted-foreground">

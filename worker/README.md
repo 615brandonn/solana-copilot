@@ -18,19 +18,19 @@ bun run dev             # or `npm run dev`
 
 ## Required env vars
 
-| Name | What it is |
-|------|-----------|
-| `BOT_SUPABASE_URL` | Your Supabase project URL |
-| `BOT_SUPABASE_SERVICE_ROLE_KEY` | Server-only key (never ship to browser) |
-| `RPC_URL` | Helius / Triton / QuickNode mainnet HTTPS RPC endpoint |
-| `YELLOWSTONE_GRPC_URL` | Helius Laserstream or Yellowstone gRPC endpoint (e.g. `https://laserstream-mainnet-ewr.helius-rpc.com`) |
-| `YELLOWSTONE_TOKEN` | Helius API key (used as the gRPC auth token) |
-| `JUPITER_API_KEY` | Paid Jupiter developer key for Price API v3 and the official Swap endpoint |
-| `PRICE_API_URL` | `https://api.jup.ag/price/v3` |
-| `JITO_BLOCK_ENGINE_URL` | e.g. `https://amsterdam.mainnet.block-engine.jito.wtf` |
-| `JITO_TIP_ACCOUNTS` | CSV of the 8 Jito tip accounts (see Jito docs) |
-| `KEY_ENCRYPTION_KEY` | Optional 32-byte AES key, base64. When set, it must match the dashboard server value |
-| `HELIX_USER_ID` | UUID matching the `bot_config.user_id` row for this deployment |
+| Name                            | What it is                                                                                              |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `BOT_SUPABASE_URL`              | Your Supabase project URL                                                                               |
+| `BOT_SUPABASE_SERVICE_ROLE_KEY` | Server-only key (never ship to browser)                                                                 |
+| `RPC_URL`                       | Helius / Triton / QuickNode mainnet HTTPS RPC endpoint                                                  |
+| `YELLOWSTONE_GRPC_URL`          | Helius Laserstream or Yellowstone gRPC endpoint (e.g. `https://laserstream-mainnet-ewr.helius-rpc.com`) |
+| `YELLOWSTONE_TOKEN`             | Helius API key (used as the gRPC auth token)                                                            |
+| `JUPITER_API_KEY`               | Paid Jupiter developer key for Price API v3 and the official Swap endpoint                              |
+| `PRICE_API_URL`                 | `https://api.jup.ag/price/v3`                                                                           |
+| `JITO_BLOCK_ENGINE_URL`         | e.g. `https://amsterdam.mainnet.block-engine.jito.wtf`                                                  |
+| `JITO_TIP_ACCOUNTS`             | CSV of the 8 Jito tip accounts (see Jito docs)                                                          |
+| `KEY_ENCRYPTION_KEY`            | Optional 32-byte AES key, base64. When set, it must match the dashboard server value                    |
+| `HELIX_USER_ID`                 | UUID matching the `bot_config.user_id` row for this deployment                                          |
 
 ## Architecture
 
@@ -87,6 +87,21 @@ The worker then:
 
 Turning Entries off blocks new buys but deliberately leaves open-position
 follower exits, take-profit/stop-loss, and inactivity exits active.
+
+## Conviction Mode
+
+Run `supabase/conviction-mode-migration.sql` before deploying a worker that
+contains Conviction Mode, then run `npm test`, `npm run build`, and
+`npm run doctor`. The migration is additive and leaves the feature OFF in
+SHADOW mode. Conviction requires exactly three unique configured target
+wallets.
+
+The existing Geyser/RPC decoders feed one persistent Conviction engine. With
+the master switch on, the central strategy router blocks regular and
+coordinated automatic entries; it does not block exits. SHADOW records
+hypothetical tiers only. LIVE still requires global Entries to be on and all
+monitoring, classification, freshness, funding, exposure, and durable-claim
+safety gates to pass immediately before the shared executor is called.
 
 ## Security
 

@@ -4,6 +4,7 @@
 // has no Jupiter route yet.
 
 import {
+  ComputeBudgetProgram,
   Connection,
   Keypair,
   VersionedTransaction,
@@ -14,7 +15,11 @@ import {
   type VersionedTransactionResponse,
 } from "@solana/web3.js";
 import { AnchorProvider, type Wallet } from "@coral-xyz/anchor";
-import { getAccount, getAssociatedTokenAddress } from "@solana/spl-token";
+import {
+  TokenAccountNotFoundError,
+  getAccount,
+  getAssociatedTokenAddress,
+} from "@solana/spl-token";
 import { searcherClient } from "jito-ts/dist/sdk/block-engine/searcher.js";
 import { Bundle } from "jito-ts/dist/sdk/block-engine/types.js";
 import { PumpFunSDK } from "pumpdotfun-sdk";
@@ -23,9 +28,11 @@ import { fetch } from "undici";
 import pino from "pino";
 import { env } from "./env.js";
 import { safeDiagnostic } from "./diagnostics.js";
+import { attributablePositiveBalanceDelta } from "./execution-accounting.js";
 import {
   SubmissionUncertainError,
   SubmittedTransactionFailedError,
+  assertSubmissionAuthorized,
   isPostSubmissionError,
   mayTryAlternateExecution,
   parseUniqueCsvSetting,
@@ -36,6 +43,8 @@ const log = pino({ level: env.LOG_LEVEL });
 const conn = new Connection(env.RPC_URL, { commitment: "processed" });
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const LANDING_TIMEOUT_MS = 15_000;
+const JUPITER_QUOTE_TIMEOUT_MS = 10_000;
+const JUPITER_BUILD_TIMEOUT_MS = 10_000;
 
 const JITO_TIP_ACCOUNTS = parseUniqueCsvSetting(env.JITO_TIP_ACCOUNTS, "JITO_TIP_ACCOUNTS").map(
   (value, index) => {
@@ -56,6 +65,8 @@ export type ExecuteInput = {
   route: "jito" | "rpc";
   jitoTipSol: number;
   outputDecimals?: number; // needed to compute UI amount received (Jupiter v6 doesn't return this)
+  /** Rechecked immediately before the first network submission begins. */
+  beforeSubmit?: () => boolean | Promise<boolean>;
 };
 
 export type ExecuteResult = {
@@ -146,6 +157,7 @@ async function fetchJupiterQuote(input: ExecuteInput) {
             endpoint.requiresKey && env.JUPITER_API_KEY
               ? { "x-api-key": env.JUPITER_API_KEY }
               : undefined,
+          signal: AbortSignal.timeout(JUPITER_QUOTE_TIMEOUT_MS),
         }),
         "Jupiter quote",
       );
@@ -178,6 +190,7 @@ async function fetchJupiterSwap(
         dynamicComputeUnitLimit: true,
         prioritizationFeeLamports: "auto",
       }),
+      signal: AbortSignal.timeout(JUPITER_BUILD_TIMEOUT_MS),
     }),
     "Jupiter swap",
   );
@@ -245,7 +258,7 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   try {
     return await executePumpFunSwap(input, signer, t0);
   } catch (err) {
-    if (isPostSubmissionError(err)) throw err;
+    if (!mayTryAlternateExecution(err)) throw err;
     failures.push(`Pump.fun: ${errorMessage(err)}`);
     log.error(
       {
@@ -298,10 +311,14 @@ async function executeJupiterSwap(
     let jitoAccepted = false;
     let submissionMayHaveOccurred = false;
     try {
-      await sendViaJito(tx, signer, input.jitoTipSol, t0, knownSig);
+      await sendViaJito(tx, signer, input.jitoTipSol, t0, knownSig, input.beforeSubmit);
       jitoAccepted = true;
       submissionMayHaveOccurred = true;
     } catch (err) {
+      // A caller-owned final safety gate is an explicit cancellation, not a
+      // route failure. Never let it fall through to the same-signature backup
+      // (or any later execution path) if authorization was revoked.
+      if (!mayTryAlternateExecution(err) && !isPostSubmissionError(err)) throw err;
       submissionMayHaveOccurred = isPostSubmissionError(err);
       log.warn(
         {
@@ -318,7 +335,13 @@ async function executeJupiterSwap(
     // so it cannot create a second trade. Never build a different transaction
     // once either submission path may have accepted this one.
     try {
-      await sendRawViaRpc(tx, t0, "jito-rpc-backup", knownSig);
+      await sendRawViaRpc(
+        tx,
+        t0,
+        "jito-rpc-backup",
+        knownSig,
+        submissionMayHaveOccurred ? undefined : input.beforeSubmit,
+      );
       submissionMayHaveOccurred = true;
     } catch (err) {
       if (!submissionMayHaveOccurred && !isPostSubmissionError(err)) throw err;
@@ -342,7 +365,7 @@ async function executeJupiterSwap(
   }
 
   try {
-    await sendRawViaRpc(tx, t0, "rpc", knownSig);
+    await sendRawViaRpc(tx, t0, "rpc", knownSig, input.beforeSubmit);
   } catch (err) {
     if (!isPostSubmissionError(err)) throw err;
     log.warn(
@@ -401,6 +424,7 @@ async function executeJupiterManagedV2(
   const knownSig = signedTransactionSignature(tx);
   const signedTransaction = Buffer.from(tx.serialize()).toString("base64");
   let executed: JupiterExecute & Record<string, unknown>;
+  await assertSubmissionAuthorized(input.beforeSubmit);
   try {
     executed = await readJsonOrThrow<JupiterExecute & Record<string, unknown>>(
       await fetch(`${JUPITER_V2_BASE}/execute`, {
@@ -474,57 +498,106 @@ async function executePumpFunSwap(
     preflightCommitment: "processed",
   });
   const sdk = new PumpFunSDK(provider);
-  const curve = await sdk.getBondingCurveAccount(mint, "processed");
-  if (!curve) throw new Error(`Pump.fun bonding curve not found: ${mint.toBase58()}`);
 
-  const priorityFees = { unitLimit: 250_000, unitPrice: 250_000 };
-  const result = await (async () => {
-    try {
-      return isBuy
-        ? await sdk.buy(
-            signer,
-            mint,
-            BigInt(input.amountLamports),
-            BigInt(input.slippageBps),
-            priorityFees,
-            "processed",
-            "confirmed",
-          )
-        : await sdk.sell(
-            signer,
-            mint,
-            BigInt(input.amountLamports),
-            BigInt(input.slippageBps),
-            priorityFees,
-            "processed",
-            "confirmed",
-          );
-    } catch (err) {
-      // The SDK owns transaction construction and submission internally. If its
-      // promise rejects, the caller cannot prove whether a request reached RPC.
-      throw new SubmissionUncertainError({ route: "pump.fun", detail: err });
-    }
-  })();
+  // Snapshot the existing balance before a BUY so the fallback can calculate
+  // only newly received tokens. Returning the full ATA balance would corrupt
+  // scale-ins and positions that coexist with manually held tokens.
+  const preBuyTokenBalanceUi = isBuy
+    ? await tokenBalanceUi(signer.publicKey, mint, input.outputDecimals)
+    : 0;
 
-  if (!result.success || !result.signature) {
-    const detail = `Pump.fun ${isBuy ? "buy" : "sell"} failed: ${safeDiagnostic(result.error ?? "no signature")}`;
-    if (result.signature) {
-      throw new SubmittedTransactionFailedError({
-        route: "pump.fun",
-        txSig: result.signature,
-        detail,
-      });
-    }
-    throw new SubmissionUncertainError({ route: "pump.fun", detail });
+  // Use the SDK only to construct deterministic instructions. We own the
+  // blockhash, signature and RPC call, which puts the caller's final safety
+  // gate immediately before the actual network-send boundary.
+  const pumpInstructions = isBuy
+    ? await sdk.getBuyInstructionsBySolAmount(
+        signer.publicKey,
+        mint,
+        BigInt(input.amountLamports),
+        BigInt(input.slippageBps),
+        "processed",
+      )
+    : await sdk.getSellInstructionsByTokenAmount(
+        signer.publicKey,
+        mint,
+        BigInt(input.amountLamports),
+        BigInt(input.slippageBps),
+        "processed",
+      );
+  const { blockhash } = await conn.getLatestBlockhash("processed");
+  const tx = new VersionedTransaction(
+    new TransactionMessage({
+      payerKey: signer.publicKey,
+      recentBlockhash: blockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 250_000 }),
+        ...pumpInstructions.instructions,
+      ],
+    }).compileToV0Message(),
+  );
+  tx.sign([signer]);
+  const knownSig = signedTransactionSignature(tx);
+
+  try {
+    await sendRawViaRpc(tx, t0, "pump.fun", knownSig, input.beforeSubmit, false, "pump.fun");
+  } catch (err) {
+    if (!isPostSubmissionError(err)) throw err;
+    log.warn(
+      { err: safeDiagnostic(err), txSig: knownSig },
+      "Pump.fun RPC submission was not definitive; reconciling the exact signature",
+    );
+  }
+  await waitForLanding(knownSig, t0, "pump.fun", "pump.fun", "confirmed");
+
+  let landedTx: VersionedTransactionResponse | null = null;
+  try {
+    landedTx = await conn.getTransaction(knownSig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+  } catch (err) {
+    log.warn(
+      { err: safeDiagnostic(err), txSig: knownSig },
+      "Pump.fun transaction details were unavailable; reconciling from wallet balance",
+    );
   }
 
-  const outUiAmount = isBuy
-    ? (tokenDeltaFromTx(result.results, signer.publicKey.toBase58(), mint.toBase58()) ??
-      (await tokenBalanceUi(signer.publicKey, mint, input.outputDecimals)))
-    : undefined;
+  let outUiAmount: number | undefined;
+  if (isBuy) {
+    outUiAmount = tokenDeltaFromTx(
+      landedTx ?? undefined,
+      signer.publicKey.toBase58(),
+      mint.toBase58(),
+    );
+    if (outUiAmount === undefined) {
+      let postBuyTokenBalanceUi: number;
+      try {
+        postBuyTokenBalanceUi = await tokenBalanceUi(signer.publicKey, mint, input.outputDecimals);
+      } catch (err) {
+        throw new SubmissionUncertainError({
+          route: "pump.fun",
+          txSig: knownSig,
+          detail: `landed buy balance reconciliation failed: ${safeDiagnostic(err)}`,
+        });
+      }
+      const balanceDelta = attributablePositiveBalanceDelta(
+        preBuyTokenBalanceUi,
+        postBuyTokenBalanceUi,
+      );
+      if (balanceDelta === undefined) {
+        throw new SubmissionUncertainError({
+          route: "pump.fun",
+          txSig: knownSig,
+          detail: "landed buy did not produce a positive attributable token balance delta",
+        });
+      }
+      outUiAmount = balanceDelta;
+    }
+  }
   log.info(
     {
-      sig: result.signature,
+      sig: knownSig,
       ms: Date.now() - t0,
       side: isBuy ? "buy" : "sell",
       mint: mint.toBase58(),
@@ -532,7 +605,7 @@ async function executePumpFunSwap(
     },
     "Pump.fun direct transaction landed",
   );
-  return { txSig: result.signature, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
+  return { txSig: knownSig, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
 }
 
 function tokenDeltaFromTx(
@@ -556,17 +629,17 @@ function tokenDeltaFromTx(
   return delta > 0 ? delta : undefined;
 }
 
-async function tokenBalanceUi(
-  owner: PublicKey,
-  mint: PublicKey,
-  decimals = 6,
-): Promise<number | undefined> {
+async function tokenBalanceUi(owner: PublicKey, mint: PublicKey, decimals = 6): Promise<number> {
+  const ata = await getAssociatedTokenAddress(mint, owner, false);
   try {
-    const ata = await getAssociatedTokenAddress(mint, owner, false);
     const account = await getAccount(conn, ata, "processed");
     return Number(account.amount) / Math.pow(10, decimals);
-  } catch {
-    return undefined;
+  } catch (err) {
+    // A missing ATA before the first buy is an authoritative zero balance.
+    // RPC and malformed-account failures remain errors so execution does not
+    // fabricate a received amount.
+    if (err instanceof TokenAccountNotFoundError) return 0;
+    throw err;
   }
 }
 
@@ -583,21 +656,25 @@ async function sendRawViaRpc(
   t0: number,
   label: string,
   knownSig: string,
+  beforeSubmit?: () => boolean | Promise<boolean>,
+  skipPreflight = true,
+  submissionRoute: SubmissionRoute = "rpc",
 ) {
   // Serialization is local and therefore a proven pre-submission operation.
   const serialized = tx.serialize();
+  await assertSubmissionAuthorized(beforeSubmit);
   let returnedSig: string;
   try {
     returnedSig = await conn.sendRawTransaction(serialized, {
-      skipPreflight: true,
+      skipPreflight,
       maxRetries: 2,
     });
   } catch (err) {
-    throw new SubmissionUncertainError({ route: "rpc", txSig: knownSig, detail: err });
+    throw new SubmissionUncertainError({ route: submissionRoute, txSig: knownSig, detail: err });
   }
   if (returnedSig !== knownSig) {
     throw new SubmissionUncertainError({
-      route: "rpc",
+      route: submissionRoute,
       txSig: knownSig,
       detail: "RPC returned a different transaction signature",
     });
@@ -606,7 +683,13 @@ async function sendRawViaRpc(
   return knownSig;
 }
 
-async function waitForLanding(sig: string, t0: number, label: string, route: SubmissionRoute) {
+async function waitForLanding(
+  sig: string,
+  t0: number,
+  label: string,
+  route: SubmissionRoute,
+  minimumConfirmation: "processed" | "confirmed" = "processed",
+) {
   const deadline = Date.now() + LANDING_TIMEOUT_MS;
   let lastStatus: string | null = null;
   let lastRpcError: string | null = null;
@@ -632,6 +715,10 @@ async function waitForLanding(sig: string, t0: number, label: string, route: Sub
     if (status) {
       lastStatus =
         status.confirmationStatus ?? (status.confirmations === null ? "finalized" : "processed");
+      if (minimumConfirmation === "confirmed" && lastStatus === "processed") {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
       log.info(
         { sig, status: lastStatus, ms: Date.now() - t0, label },
         "transaction landed on-chain",
@@ -654,6 +741,7 @@ async function sendViaJito(
   tipSol: number,
   t0: number,
   knownSig: string,
+  beforeSubmit?: () => boolean | Promise<boolean>,
 ): Promise<ExecuteResult> {
   const client = searcherClient(new URL(env.JITO_BLOCK_ENGINE_URL).host);
   const tipAcct = JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)];
@@ -674,6 +762,7 @@ async function sendViaJito(
   tipTx.sign([signer]);
 
   const bundle = new Bundle([tx, tipTx], 5);
+  await assertSubmissionAuthorized(beforeSubmit);
   let bundleId: string;
   try {
     const result = await client.sendBundle(bundle);

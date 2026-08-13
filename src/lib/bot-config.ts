@@ -1,4 +1,45 @@
-export type BotConfig = {
+export type ConvictionTradingMode = "shadow" | "live";
+
+export type ConvictionConfig = {
+  convictionModeEnabled: boolean;
+  convictionTradingMode: ConvictionTradingMode;
+  convictionRapidFollowEnabled: boolean;
+  convictionPrimaryWindowMinutes: 5 | 30 | 60;
+  convictionScoreThreshold: number;
+  convictionTopN: number;
+  convictionMinCommitmentUsd: number;
+  convictionMinRecentNetInflowUsd: number;
+  convictionMinVelocityUsdPerMinute: number;
+  convictionMinAccelerationRatio: number;
+  convictionMinConvergedWallets: number;
+  convictionTwoWalletWindowSeconds: number;
+  convictionThreeWalletWindowSeconds: number;
+  convictionMinIndividualBuyUsd: number;
+  convictionMarketCapFilterEnabled: boolean;
+  convictionMarketCapMinUsd: number;
+  convictionMarketCapMaxUsd: number;
+  convictionLiquidityFilterEnabled: boolean;
+  convictionLiquidityMinUsd: number;
+  convictionLiquidityMaxUsd: number;
+  convictionTokenAgeFilterEnabled: boolean;
+  convictionTokenAgeMinMinutes: number;
+  convictionTokenAgeMaxMinutes: number;
+  convictionMaxPositionPerTokenUsd: number;
+  convictionDistributionSellRatio: number;
+  convictionDistributionMinSellsUsd: number;
+  convictionDistributionWalletCount: number;
+  convictionInactivityMinutes: number;
+  convictionRankLossGraceSeconds: number;
+  convictionWeightNetCommitment: number;
+  convictionWeightVelocity: number;
+  convictionWeightAcceleration: number;
+  convictionWeightConvergence: number;
+  convictionWeightPersistence: number;
+  convictionTierCommitmentThresholdsUsd: number[];
+  convictionTierBuyAmountsUsd: number[];
+};
+
+export type BotConfig = ConvictionConfig & {
   enabled: boolean;
   targetWallet: string;
   additionalTargetWallets: string[];
@@ -64,7 +105,48 @@ export type BotConfig = {
   targetTerminalOutflowExitPct: number;
 };
 
+/** Safe installation defaults: Conviction is disabled and cannot submit live buys. */
+export const DEFAULT_CONVICTION_CONFIG: ConvictionConfig = {
+  convictionModeEnabled: false,
+  convictionTradingMode: "shadow",
+  convictionRapidFollowEnabled: false,
+  convictionPrimaryWindowMinutes: 30,
+  convictionScoreThreshold: 70,
+  convictionTopN: 3,
+  convictionMinCommitmentUsd: 1_000,
+  convictionMinRecentNetInflowUsd: 0.01,
+  convictionMinVelocityUsdPerMinute: 250,
+  convictionMinAccelerationRatio: 1.25,
+  convictionMinConvergedWallets: 1,
+  convictionTwoWalletWindowSeconds: 120,
+  convictionThreeWalletWindowSeconds: 300,
+  convictionMinIndividualBuyUsd: 0,
+  convictionMarketCapFilterEnabled: false,
+  convictionMarketCapMinUsd: 0,
+  convictionMarketCapMaxUsd: 1_000_000_000,
+  convictionLiquidityFilterEnabled: false,
+  convictionLiquidityMinUsd: 0,
+  convictionLiquidityMaxUsd: 1_000_000_000,
+  convictionTokenAgeFilterEnabled: false,
+  convictionTokenAgeMinMinutes: 0,
+  convictionTokenAgeMaxMinutes: 525_600,
+  convictionMaxPositionPerTokenUsd: 25,
+  convictionDistributionSellRatio: 0.2,
+  convictionDistributionMinSellsUsd: 100,
+  convictionDistributionWalletCount: 2,
+  convictionInactivityMinutes: 15,
+  convictionRankLossGraceSeconds: 120,
+  convictionWeightNetCommitment: 30,
+  convictionWeightVelocity: 25,
+  convictionWeightAcceleration: 20,
+  convictionWeightConvergence: 15,
+  convictionWeightPersistence: 10,
+  convictionTierCommitmentThresholdsUsd: [1_000, 2_500, 5_000, 10_000],
+  convictionTierBuyAmountsUsd: [5, 5, 5, 10],
+};
+
 export const DEFAULT_CONFIG: BotConfig = {
+  ...DEFAULT_CONVICTION_CONFIG,
   enabled: false,
   targetWallet: "",
   additionalTargetWallets: [],

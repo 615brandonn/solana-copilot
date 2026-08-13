@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  SubmissionCancelledBeforeSendError,
   SubmissionUncertainError,
   SubmittedTransactionFailedError,
+  assertSubmissionAuthorized,
   isPostSubmissionError,
   mayTryAlternateExecution,
   parseUniqueCsvSetting,
@@ -25,6 +27,24 @@ test("post-submission errors block alternate transaction execution", () => {
   assert.equal(mayTryAlternateExecution(uncertain), false);
   assert.equal(mayTryAlternateExecution(failed), false);
   assert.equal(mayTryAlternateExecution(new Error("quote failed before submission")), true);
+  assert.equal(mayTryAlternateExecution(new SubmissionCancelledBeforeSendError()), false);
+});
+
+test("the final caller gate cancels before submission without authorizing a fallback", async () => {
+  await assert.doesNotReject(() => assertSubmissionAuthorized(() => true));
+  await assert.rejects(
+    () => assertSubmissionAuthorized(async () => false),
+    SubmissionCancelledBeforeSendError,
+  );
+  await assert.rejects(
+    () => assertSubmissionAuthorized(async () => Promise.reject(new Error("gate lookup failed"))),
+    (error: unknown) => {
+      assert.ok(error instanceof SubmissionCancelledBeforeSendError);
+      assert.equal(mayTryAlternateExecution(error), false);
+      assert.match(error.message, /gate lookup failed/);
+      return true;
+    },
+  );
 });
 
 test("submission errors sanitize diagnostics before an outer logger can preserve them", () => {

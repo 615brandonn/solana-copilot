@@ -50,12 +50,40 @@ export class SubmittedTransactionFailedError extends PostSubmissionError {
   }
 }
 
+/**
+ * Raised by a caller-controlled final gate before any network submission is
+ * attempted. This is safely retryable and must not fall through to another
+ * route, because the caller deliberately revoked authorization to trade.
+ */
+export class SubmissionCancelledBeforeSendError extends Error {
+  readonly code = "TRANSACTION_CANCELLED_BEFORE_SEND" as const;
+
+  constructor(detail = "the final submission safety gate is closed") {
+    super(`Transaction cancelled before network submission: ${safeDiagnostic(detail)}`);
+    this.name = "SubmissionCancelledBeforeSendError";
+  }
+}
+
 export function isPostSubmissionError(error: unknown): error is PostSubmissionError {
   return error instanceof PostSubmissionError;
 }
 
 export function mayTryAlternateExecution(error: unknown): boolean {
-  return !isPostSubmissionError(error);
+  return !isPostSubmissionError(error) && !(error instanceof SubmissionCancelledBeforeSendError);
+}
+
+export async function assertSubmissionAuthorized(
+  beforeSubmit: (() => boolean | Promise<boolean>) | undefined,
+): Promise<void> {
+  if (!beforeSubmit) return;
+  try {
+    if (!(await beforeSubmit())) throw new SubmissionCancelledBeforeSendError();
+  } catch (error) {
+    if (error instanceof SubmissionCancelledBeforeSendError) throw error;
+    throw new SubmissionCancelledBeforeSendError(
+      error instanceof Error ? error.message : undefined,
+    );
+  }
 }
 
 /** Parse a comma-separated secret-backed setting without echoing its values in errors. */

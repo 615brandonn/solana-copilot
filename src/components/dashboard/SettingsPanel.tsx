@@ -6,6 +6,7 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Label } from "@/components/ui/label";
 import type { BotConfig } from "@/lib/bot-config";
 import { SectionCard, SettingRow } from "./SettingRow";
+import { ConvictionSettingsCard } from "./ConvictionSettingsCard";
 
 type Props = {
   cfg: BotConfig;
@@ -105,189 +106,199 @@ export function SettingsPanel({ cfg, onChange }: Props) {
         </SettingRow>
       </SectionCard>
 
-      <SectionCard
-        title="Coordinated-wallet mode"
-        description="Exclusive strategy: wait for several target wallets to confirm the same coin"
-        icon={<Users className="h-4 w-4" />}
-      >
-        <SettingRow
-          label="Enable exclusive coordinated mode"
-          hint="When on, the normal position-sizing, entry-filter, and exit-strategy rules below are preserved but ignored. Execution routing and the global Entries switch remain active."
-        >
-          <Switch
-            checked={cfg.coordinatedModeEnabled}
-            onCheckedChange={(v) => onChange({ coordinatedModeEnabled: v })}
-          />
-        </SettingRow>
-        {cfg.coordinatedModeEnabled && (
-          <>
-            <div className="rounded-xl border border-primary/30 bg-primary/5 px-4 py-3 text-xs text-muted-foreground">
-              Normal strategy settings are paused. Only the coordinated rules in this card can open
-              new positions.
-            </div>
-            <SettingRow
-              label="Copy-buy amount"
-              hint="Independent USD amount used for each coordinated entry."
-            >
-              <NumInput
-                value={cfg.coordinatedFixedBuyUsd}
-                onChange={(n) => onChange({ coordinatedFixedBuyUsd: n })}
-                prefix="$"
-                min={0.01}
-              />
-            </SettingRow>
-            <SettingRow
-              label="Target-wallet confirmation"
-              hint="Require this many distinct configured target wallets to buy the same coin inside the rolling time window."
-            >
-              <div className="flex items-center gap-2 mono text-xs">
-                <NumInput
-                  value={cfg.coordinatedTargetWalletCount}
-                  onChange={(n) =>
-                    onChange({ coordinatedTargetWalletCount: Math.max(2, Math.round(n)) })
-                  }
-                  suffix="wallets"
-                  min={2}
-                  max={20}
-                />
-                <span className="text-muted-foreground">within</span>
-                <NumInput
-                  value={cfg.coordinatedWindowSeconds}
-                  onChange={(n) =>
-                    onChange({ coordinatedWindowSeconds: Math.max(1, Math.round(n)) })
-                  }
-                  suffix="sec"
-                  min={1}
-                  max={21_600}
-                />
-              </div>
-            </SettingRow>
-            <SettingRow
-              label="Market-cap range"
-              hint="Independent strict market-cap range. Missing market-cap data blocks the buy."
-            >
-              <div className="flex items-center gap-2 mono text-xs">
-                <NumInput
-                  value={cfg.coordinatedMcMinUsd}
-                  onChange={(n) => onChange({ coordinatedMcMinUsd: n })}
-                  prefix="$"
-                  min={0}
-                />
-                <span className="text-muted-foreground">→</span>
-                <NumInput
-                  value={cfg.coordinatedMcMaxUsd}
-                  onChange={(n) => onChange({ coordinatedMcMaxUsd: n })}
-                  prefix="$"
-                  min={0}
-                />
-              </div>
-            </SettingRow>
-            <SettingRow
-              label="Coin-age range"
-              hint="Only coins whose earliest known trading pair is inside this age range qualify. Missing age data blocks the buy."
-            >
-              <div className="flex items-center gap-2 mono text-xs">
-                <NumInput
-                  value={cfg.coordinatedCoinAgeMinMinutes}
-                  onChange={(n) => onChange({ coordinatedCoinAgeMinMinutes: n })}
-                  suffix="min"
-                  min={0}
-                />
-                <span className="text-muted-foreground">→</span>
-                <NumInput
-                  value={cfg.coordinatedCoinAgeMaxMinutes}
-                  onChange={(n) => onChange({ coordinatedCoinAgeMaxMinutes: n })}
-                  suffix="min"
-                  min={0}
-                />
-              </div>
-            </SettingRow>
-            <SettingRow
-              label="Each target buy-size range"
-              hint="Every target-wallet buy counted toward confirmation must be inside this USD range."
-            >
-              <div className="flex items-center gap-2 mono text-xs">
-                <NumInput
-                  value={cfg.coordinatedTargetBuyMinUsd}
-                  onChange={(n) => onChange({ coordinatedTargetBuyMinUsd: n })}
-                  prefix="$"
-                  min={0}
-                />
-                <span className="text-muted-foreground">→</span>
-                <NumInput
-                  value={cfg.coordinatedTargetBuyMaxUsd}
-                  onChange={(n) => onChange({ coordinatedTargetBuyMaxUsd: n })}
-                  prefix="$"
-                  min={0}
-                />
-              </div>
-            </SettingRow>
-            <SettingRow
-              label="Targets' first buys only"
-              hint="Every wallet counted toward confirmation must be making its first observed buy of that coin."
-            >
-              <Switch
-                checked={cfg.coordinatedFirstBuyOnly}
-                onCheckedChange={(v) => onChange({ coordinatedFirstBuyOnly: v })}
-              />
-            </SettingRow>
-            <SettingRow
-              label="Copy each coin once"
-              hint="Never open another coordinated entry for a coin the bot has already traded."
-            >
-              <Switch
-                checked={cfg.coordinatedOncePerToken}
-                onCheckedChange={(v) => onChange({ coordinatedOncePerToken: v })}
-              />
-            </SettingRow>
-            <SettingRow
-              label="Distinct follower-seller exit"
-              hint="After this many different tracked recipient wallets sell, sell the selected percentage of your remaining position. Repeated sells by one wallet count once."
-            >
-              <div className="flex items-center gap-2 mono text-xs">
-                <NumInput
-                  value={cfg.coordinatedFollowerSellCount}
-                  onChange={(n) =>
-                    onChange({ coordinatedFollowerSellCount: Math.max(1, Math.round(n)) })
-                  }
-                  suffix="wallets"
-                  min={1}
-                />
-                <span className="text-muted-foreground">sell</span>
-                <NumInput
-                  value={cfg.coordinatedFollowerSellPct}
-                  onChange={(n) => onChange({ coordinatedFollowerSellPct: n })}
-                  suffix="%"
-                  min={0.01}
-                  max={100}
-                />
-              </div>
-            </SettingRow>
-            <SettingRow
-              label="Target inactivity exit"
-              hint="Sell 100% if none of the configured target wallets buys this coin again for this many hours after the latest target buy."
-            >
-              <div className="flex items-center gap-2">
-                <Clock3 className="h-4 w-4 text-muted-foreground" />
-                <NumInput
-                  value={cfg.coordinatedInactivityHours}
-                  onChange={(n) => onChange({ coordinatedInactivityHours: n })}
-                  suffix="hr"
-                  step={0.25}
-                  min={0.05}
-                />
-              </div>
-            </SettingRow>
-          </>
-        )}
-      </SectionCard>
+      <ConvictionSettingsCard cfg={cfg} onChange={onChange} />
 
       <fieldset
-        disabled={cfg.coordinatedModeEnabled}
+        disabled={cfg.convictionModeEnabled}
+        className={cfg.convictionModeEnabled ? "pointer-events-none opacity-45" : undefined}
+        aria-disabled={cfg.convictionModeEnabled}
+      >
+        <SectionCard
+          title="Coordinated-wallet mode"
+          description="Exclusive strategy: wait for several target wallets to confirm the same coin"
+          icon={<Users className="h-4 w-4" />}
+        >
+          <SettingRow
+            label="Enable exclusive coordinated mode"
+            hint="When on, the normal position-sizing and entry-filter rules below are preserved but ignored. Existing exit, execution-routing, and global Entries controls remain active."
+          >
+            <Switch
+              checked={cfg.coordinatedModeEnabled}
+              onCheckedChange={(v) => onChange({ coordinatedModeEnabled: v })}
+            />
+          </SettingRow>
+          {cfg.coordinatedModeEnabled && (
+            <>
+              <div className="rounded-xl border border-primary/30 bg-primary/5 px-4 py-3 text-xs text-muted-foreground">
+                Normal strategy settings are paused. Only the coordinated rules in this card can
+                open new positions.
+              </div>
+              <SettingRow
+                label="Copy-buy amount"
+                hint="Independent USD amount used for each coordinated entry."
+              >
+                <NumInput
+                  value={cfg.coordinatedFixedBuyUsd}
+                  onChange={(n) => onChange({ coordinatedFixedBuyUsd: n })}
+                  prefix="$"
+                  min={0.01}
+                />
+              </SettingRow>
+              <SettingRow
+                label="Target-wallet confirmation"
+                hint="Require this many distinct configured target wallets to buy the same coin inside the rolling time window."
+              >
+                <div className="flex items-center gap-2 mono text-xs">
+                  <NumInput
+                    value={cfg.coordinatedTargetWalletCount}
+                    onChange={(n) =>
+                      onChange({ coordinatedTargetWalletCount: Math.max(2, Math.round(n)) })
+                    }
+                    suffix="wallets"
+                    min={2}
+                    max={20}
+                  />
+                  <span className="text-muted-foreground">within</span>
+                  <NumInput
+                    value={cfg.coordinatedWindowSeconds}
+                    onChange={(n) =>
+                      onChange({ coordinatedWindowSeconds: Math.max(1, Math.round(n)) })
+                    }
+                    suffix="sec"
+                    min={1}
+                    max={21_600}
+                  />
+                </div>
+              </SettingRow>
+              <SettingRow
+                label="Market-cap range"
+                hint="Independent strict market-cap range. Missing market-cap data blocks the buy."
+              >
+                <div className="flex items-center gap-2 mono text-xs">
+                  <NumInput
+                    value={cfg.coordinatedMcMinUsd}
+                    onChange={(n) => onChange({ coordinatedMcMinUsd: n })}
+                    prefix="$"
+                    min={0}
+                  />
+                  <span className="text-muted-foreground">→</span>
+                  <NumInput
+                    value={cfg.coordinatedMcMaxUsd}
+                    onChange={(n) => onChange({ coordinatedMcMaxUsd: n })}
+                    prefix="$"
+                    min={0}
+                  />
+                </div>
+              </SettingRow>
+              <SettingRow
+                label="Coin-age range"
+                hint="Only coins whose earliest known trading pair is inside this age range qualify. Missing age data blocks the buy."
+              >
+                <div className="flex items-center gap-2 mono text-xs">
+                  <NumInput
+                    value={cfg.coordinatedCoinAgeMinMinutes}
+                    onChange={(n) => onChange({ coordinatedCoinAgeMinMinutes: n })}
+                    suffix="min"
+                    min={0}
+                  />
+                  <span className="text-muted-foreground">→</span>
+                  <NumInput
+                    value={cfg.coordinatedCoinAgeMaxMinutes}
+                    onChange={(n) => onChange({ coordinatedCoinAgeMaxMinutes: n })}
+                    suffix="min"
+                    min={0}
+                  />
+                </div>
+              </SettingRow>
+              <SettingRow
+                label="Each target buy-size range"
+                hint="Every target-wallet buy counted toward confirmation must be inside this USD range."
+              >
+                <div className="flex items-center gap-2 mono text-xs">
+                  <NumInput
+                    value={cfg.coordinatedTargetBuyMinUsd}
+                    onChange={(n) => onChange({ coordinatedTargetBuyMinUsd: n })}
+                    prefix="$"
+                    min={0}
+                  />
+                  <span className="text-muted-foreground">→</span>
+                  <NumInput
+                    value={cfg.coordinatedTargetBuyMaxUsd}
+                    onChange={(n) => onChange({ coordinatedTargetBuyMaxUsd: n })}
+                    prefix="$"
+                    min={0}
+                  />
+                </div>
+              </SettingRow>
+              <SettingRow
+                label="Targets' first buys only"
+                hint="Every wallet counted toward confirmation must be making its first observed buy of that coin."
+              >
+                <Switch
+                  checked={cfg.coordinatedFirstBuyOnly}
+                  onCheckedChange={(v) => onChange({ coordinatedFirstBuyOnly: v })}
+                />
+              </SettingRow>
+              <SettingRow
+                label="Copy each coin once"
+                hint="Never open another coordinated entry for a coin the bot has already traded."
+              >
+                <Switch
+                  checked={cfg.coordinatedOncePerToken}
+                  onCheckedChange={(v) => onChange({ coordinatedOncePerToken: v })}
+                />
+              </SettingRow>
+              <SettingRow
+                label="Distinct follower-seller exit"
+                hint="After this many different tracked recipient wallets sell, sell the selected percentage of your remaining position. Repeated sells by one wallet count once."
+              >
+                <div className="flex items-center gap-2 mono text-xs">
+                  <NumInput
+                    value={cfg.coordinatedFollowerSellCount}
+                    onChange={(n) =>
+                      onChange({ coordinatedFollowerSellCount: Math.max(1, Math.round(n)) })
+                    }
+                    suffix="wallets"
+                    min={1}
+                  />
+                  <span className="text-muted-foreground">sell</span>
+                  <NumInput
+                    value={cfg.coordinatedFollowerSellPct}
+                    onChange={(n) => onChange({ coordinatedFollowerSellPct: n })}
+                    suffix="%"
+                    min={0.01}
+                    max={100}
+                  />
+                </div>
+              </SettingRow>
+              <SettingRow
+                label="Target inactivity exit"
+                hint="Sell 100% if none of the configured target wallets buys this coin again for this many hours after the latest target buy."
+              >
+                <div className="flex items-center gap-2">
+                  <Clock3 className="h-4 w-4 text-muted-foreground" />
+                  <NumInput
+                    value={cfg.coordinatedInactivityHours}
+                    onChange={(n) => onChange({ coordinatedInactivityHours: n })}
+                    suffix="hr"
+                    step={0.25}
+                    min={0.05}
+                  />
+                </div>
+              </SettingRow>
+            </>
+          )}
+        </SectionCard>
+      </fieldset>
+
+      <fieldset
+        disabled={cfg.coordinatedModeEnabled || cfg.convictionModeEnabled}
         className={
-          cfg.coordinatedModeEnabled ? "pointer-events-none space-y-6 opacity-45" : "space-y-6"
+          cfg.coordinatedModeEnabled || cfg.convictionModeEnabled
+            ? "pointer-events-none space-y-6 opacity-45"
+            : "space-y-6"
         }
-        aria-disabled={cfg.coordinatedModeEnabled}
+        aria-disabled={cfg.coordinatedModeEnabled || cfg.convictionModeEnabled}
       >
         {/* Position sizing */}
         <SectionCard
@@ -572,8 +583,20 @@ export function SettingsPanel({ cfg, onChange }: Props) {
             />
           </SettingRow>
         </SectionCard>
+      </fieldset>
 
-        {/* Exit */}
+      {/* Coordinated mode owns a separate mandatory exit policy. Preserve that
+          legacy UI behavior while keeping the normal exit controls available
+          to Conviction positions. */}
+      <fieldset
+        disabled={cfg.coordinatedModeEnabled && !cfg.convictionModeEnabled}
+        className={
+          cfg.coordinatedModeEnabled && !cfg.convictionModeEnabled
+            ? "pointer-events-none opacity-45"
+            : undefined
+        }
+        aria-disabled={cfg.coordinatedModeEnabled && !cfg.convictionModeEnabled}
+      >
         <SectionCard
           title="Exit strategy"
           description="Take profit, stop loss, and follower propagation"
@@ -629,7 +652,7 @@ export function SettingsPanel({ cfg, onChange }: Props) {
           </SettingRow>
           <SettingRow
             label="Distinct follower-seller exit"
-            hint="For main-mode positions, trigger one exit after this many different tracked follower wallets sell. Repeated sells by one wallet count once."
+            hint="For regular and Conviction positions, trigger one exit after this many different tracked follower wallets sell. Repeated sells by one wallet count once."
           >
             <Switch
               checked={cfg.followerSellerExitEnabled}
@@ -663,7 +686,7 @@ export function SettingsPanel({ cfg, onChange }: Props) {
           )}
           <SettingRow
             label="Inactivity window"
-            hint="When on, sell 100% if no configured target wallet buys the coin again during this window. The timer resets after every target-wallet buy and also applies to existing main-mode positions."
+            hint="When on, sell 100% if no configured target wallet buys the coin again during this window. The timer resets after every target-wallet buy and also applies to existing regular and Conviction positions."
           >
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-2">
@@ -695,7 +718,7 @@ export function SettingsPanel({ cfg, onChange }: Props) {
 
       <SectionCard
         title="Sell coverage"
-        description="Global target-sale and custody-transfer responses for regular and coordinated positions"
+        description="Global target-sale and custody-transfer responses for every open position"
         icon={<TrendingUp className="h-4 w-4" />}
       >
         <SettingRow
