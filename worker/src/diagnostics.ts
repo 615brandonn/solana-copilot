@@ -31,7 +31,14 @@ function looksOpaque(value: string): boolean {
 }
 
 export function safeDiagnostic(value: unknown): string {
-  const raw = value instanceof Error ? value.message : String(value ?? "unknown error");
+  const raw =
+    value instanceof Error
+      ? value.message
+      : typeof value === "object" &&
+          value !== null &&
+          typeof (value as { message?: unknown }).message === "string"
+        ? (value as { message: string }).message
+        : String(value ?? "unknown error");
   const withoutHtml = raw.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
   const redacted = withoutHtml
     .replace(URL_PATTERN, redactUrl)

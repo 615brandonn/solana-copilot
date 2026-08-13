@@ -256,6 +256,11 @@ export class CustodyRuntime {
         }
       },
     );
+    // A transfer whose recipients all filter out (self-transfers, zero
+    // amounts) has nothing to record. Returning null lets the RPC cursor
+    // advance; calling the database with an empty recipient list makes it
+    // raise 'invalid custody transfer' and retry the same event forever.
+    if (recipients.length === 0) return null;
     return this.store.recordTransfer(event, recipients);
   }
 
