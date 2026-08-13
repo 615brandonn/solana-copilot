@@ -47,12 +47,64 @@ export function transferRecipients(event: TransferEvent): TransferRecipient[] {
         Number(existing.recipientPreAmount ?? 0),
         Number(recipient.recipientPreAmount ?? 0),
       );
+      if (recipient.recipientPostAmount !== undefined) {
+        existing.recipientPostAmount = Math.max(
+          Number(existing.recipientPostAmount ?? 0),
+          Number(recipient.recipientPostAmount),
+        );
+      }
+      if (existing.amountRaw !== undefined && recipient.amountRaw !== undefined) {
+        try {
+          existing.amountRaw = (
+            BigInt(existing.amountRaw) + BigInt(recipient.amountRaw)
+          ).toString();
+        } catch {
+          existing.amountRaw = undefined;
+        }
+      } else {
+        delete existing.amountRaw;
+      }
+      // Multiple token accounts owned by the same wallet are aggregated by
+      // the decoders. Preserve exact owner-level raw balances only when every
+      // contributing row provides exact evidence.
+      if (
+        existing.recipientPreRaw !== undefined &&
+        existing.recipientPostRaw !== undefined &&
+        recipient.recipientPreRaw !== undefined &&
+        recipient.recipientPostRaw !== undefined
+      ) {
+        try {
+          existing.recipientPreRaw = (
+            BigInt(existing.recipientPreRaw) + BigInt(recipient.recipientPreRaw)
+          ).toString();
+          existing.recipientPostRaw = (
+            BigInt(existing.recipientPostRaw) + BigInt(recipient.recipientPostRaw)
+          ).toString();
+        } catch {
+          delete existing.recipientPreRaw;
+          delete existing.recipientPostRaw;
+        }
+      } else {
+        delete existing.recipientPreRaw;
+        delete existing.recipientPostRaw;
+      }
     } else {
-      byWallet.set(wallet, {
+      const normalized: TransferRecipient = {
         wallet,
         amountTokens,
         recipientPreAmount: Math.max(0, Number(recipient.recipientPreAmount ?? 0)),
-      });
+      };
+      if (recipient.amountRaw !== undefined) normalized.amountRaw = recipient.amountRaw;
+      if (recipient.recipientPostAmount !== undefined) {
+        normalized.recipientPostAmount = Math.max(0, Number(recipient.recipientPostAmount));
+      }
+      if (recipient.recipientPreRaw !== undefined) {
+        normalized.recipientPreRaw = recipient.recipientPreRaw;
+      }
+      if (recipient.recipientPostRaw !== undefined) {
+        normalized.recipientPostRaw = recipient.recipientPostRaw;
+      }
+      byWallet.set(wallet, normalized);
     }
   }
   return Array.from(byWallet.values()).sort((a, b) => a.wallet.localeCompare(b.wallet));
@@ -70,6 +122,7 @@ export function transferEventForRecipient(
     to: recipient.wallet,
     amountTokens,
     recipientPreAmount: recipient.recipientPreAmount,
+    recipientPostAmount: recipient.recipientPostAmount,
   };
 }
 

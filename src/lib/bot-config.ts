@@ -47,6 +47,8 @@ export type BotConfig = ConvictionConfig & {
   executionRoute: "jito" | "rpc";
   jitoTipSol: number;
   fixedBuyUsd: number;
+  /** Observation-only custody tracing. Never enables Entries or trading. */
+  custodyJourneyEnabled: boolean;
   coordinatedModeEnabled: boolean;
   coordinatedFixedBuyUsd: number;
   coordinatedTargetWalletCount: number;
@@ -154,6 +156,7 @@ export const DEFAULT_CONFIG: BotConfig = {
   executionRoute: "jito",
   jitoTipSol: 0.001,
   fixedBuyUsd: 25,
+  custodyJourneyEnabled: false,
   coordinatedModeEnabled: false,
   coordinatedFixedBuyUsd: 25,
   coordinatedTargetWalletCount: 2,

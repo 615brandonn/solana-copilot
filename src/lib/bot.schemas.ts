@@ -14,6 +14,7 @@ export const BotConfigSchema = z
     executionRoute: z.enum(["jito", "rpc"]),
     jitoTipSol: z.number().finite().min(0).max(1),
     fixedBuyUsd: z.number().finite().positive().max(1_000_000),
+    custodyJourneyEnabled: z.boolean(),
     convictionModeEnabled: z.boolean(),
     convictionTradingMode: z.enum(["shadow", "live"]),
     convictionRapidFollowEnabled: z.boolean(),

@@ -80,6 +80,7 @@ export function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row
     executionRoute: row.execution_route as "jito" | "rpc",
     jitoTipSol: row.jito_tip_sol,
     fixedBuyUsd: row.fixed_buy_usd,
+    custodyJourneyEnabled: row.custody_journey_enabled ?? false,
     convictionModeEnabled:
       row.conviction_mode_enabled ?? DEFAULT_CONVICTION_CONFIG.convictionModeEnabled,
     convictionTradingMode:
@@ -251,6 +252,7 @@ export function configToRow(
     execution_route: cfg.executionRoute,
     jito_tip_sol: cfg.jitoTipSol,
     fixed_buy_usd: cfg.fixedBuyUsd,
+    custody_journey_enabled: cfg.custodyJourneyEnabled,
     conviction_mode_enabled: cfg.convictionModeEnabled,
     conviction_trading_mode: cfg.convictionTradingMode,
     conviction_rapid_follow_enabled: cfg.convictionRapidFollowEnabled,

@@ -106,6 +106,27 @@ export function SettingsPanel({ cfg, onChange }: Props) {
         </SettingRow>
       </SectionCard>
 
+      <SectionCard
+        title="Custody Journey"
+        description="Observation-only tracing for where target-acquired tokens move"
+        icon={<Target className="h-4 w-4" />}
+      >
+        <SettingRow
+          label="Enable custody observation"
+          hint="Monitors verified target buys, downstream custody transfers, and verified sells. This does not enable Entries, place trades, or change any exit strategy."
+        >
+          <Switch
+            checked={cfg.custodyJourneyEnabled}
+            onCheckedChange={(value) => onChange({ custodyJourneyEnabled: value })}
+            aria-label="Enable observation-only Custody Journey monitoring"
+          />
+        </SettingRow>
+        <div className="rounded-xl border border-border/70 bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
+          Observation only · maximum 8 transfer hops · maximum 250 actively watched wallets per
+          journey. Entries and trading controls are independent.
+        </div>
+      </SectionCard>
+
       <ConvictionSettingsCard cfg={cfg} onChange={onChange} />
 
       <fieldset

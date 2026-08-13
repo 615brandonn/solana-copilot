@@ -32,6 +32,12 @@ export interface RpcWalletCursor {
 export interface RpcCursorStore {
   load(wallet: string): Promise<RpcWalletCursor | null>;
   ensure(wallet: string, anchorSlot?: number): Promise<RpcWalletCursor>;
+  /**
+   * Moves only the recovery floor backward. Used by the custody observer when
+   * a newly discovered mint proves that this already-watched wallet may have
+   * relevant activity before its current wallet-wide cursor.
+   */
+  rewind?(wallet: string, anchorSlot: number): Promise<RpcWalletCursor>;
   advance(
     wallet: string,
     signature: string,
@@ -182,13 +188,15 @@ function throwQueryError(operation: string, result: QueryResult | null | undefin
 export function createSupabaseRpcCursorStore(
   client: SupabaseCursorClientLike,
   userId: string,
+  table = RPC_CURSOR_TABLE,
 ): RpcCursorStore {
   const normalizedUserId = normalizeRequiredText(userId, "user id");
+  const cursorTable = normalizeRequiredText(table, "table");
 
   const load = async (walletInput: string): Promise<RpcWalletCursor | null> => {
     const wallet = normalizeRequiredText(walletInput, "wallet");
     const result = (await client
-      .from(RPC_CURSOR_TABLE)
+      .from(cursorTable)
       .select(
         "user_id,wallet,start_slot,last_processed_signature,last_processed_slot,last_block_time,backlog_detected,last_success_at,last_error,created_at,updated_at",
       )
@@ -205,7 +213,7 @@ export function createSupabaseRpcCursorStore(
     operation: string,
   ): Promise<RpcWalletCursor> => {
     const result = (await client
-      .from(RPC_CURSOR_TABLE)
+      .from(cursorTable)
       .update(values)
       .eq("user_id", normalizedUserId)
       .eq("wallet", wallet)
@@ -232,7 +240,7 @@ export function createSupabaseRpcCursorStore(
       };
       if (anchorSlot !== undefined) insert.start_slot = normalizeSlot(anchorSlot, "anchor slot");
 
-      const result = (await client.from(RPC_CURSOR_TABLE).upsert(insert, {
+      const result = (await client.from(cursorTable).upsert(insert, {
         onConflict: "user_id,wallet",
         ignoreDuplicates: true,
       })) as QueryResult;
@@ -241,6 +249,28 @@ export function createSupabaseRpcCursorStore(
       const ensured = await load(wallet);
       if (!ensured) throw new Error("RPC cursor initialization failed: cursor was not persisted");
       return ensured;
+    },
+
+    async rewind(walletInput: string, anchorSlotInput: number): Promise<RpcWalletCursor> {
+      const wallet = normalizeRequiredText(walletInput, "wallet");
+      const anchorSlot = normalizeSlot(anchorSlotInput, "rewind anchor slot");
+      const current = await load(wallet);
+      if (!current) throw new Error("RPC cursor rewind failed: cursor was not initialized");
+      const currentBoundary = current.lastProcessedSlot ?? current.startSlot;
+      if (anchorSlot >= currentBoundary) return current;
+      return updateAndLoad(
+        wallet,
+        {
+          start_slot: Math.min(current.startSlot, anchorSlot),
+          last_processed_signature: null,
+          last_processed_slot: anchorSlot,
+          last_block_time: null,
+          backlog_detected: true,
+          last_error: "RPC signature pagination incomplete",
+          updated_at: new Date().toISOString(),
+        },
+        "RPC cursor rewind failed",
+      );
     },
 
     async advance(
@@ -444,9 +474,13 @@ export function planRpcSignaturePages(
   const exhausted = lastPage !== undefined && lastPage.length < pageSize;
   if (boundary === "pending" && exhausted) {
     const oldestCandidate = candidatesNewestFirst.at(-1);
-    if (cursorSignature && (oldestCandidate === undefined || oldestCandidate.slot > cursorSlot)) {
-      // A known prior signature disappearing before its fallback slot is a
-      // provider-history gap, not a successful end-of-history condition.
+    if (
+      (cursorSignature || cursorSlot > 0) &&
+      (oldestCandidate === undefined || oldestCandidate.slot > cursorSlot)
+    ) {
+      // Exhaustion is not proof that an anchored boundary was reached. A
+      // provider may have pruned everything at/before that slot, so releasing
+      // newer work would cross an unseen history gap.
       boundary = "history-gap";
     } else if (oldestCandidate && oldestCandidate.slot <= cursorSlot) {
       boundary = "slot";

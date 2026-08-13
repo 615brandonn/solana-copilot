@@ -146,6 +146,23 @@ test("stores independent durable cursors and ensure never resets an existing wal
   assert.equal("unwatch" in store, false);
 });
 
+test("custody can durably rewind an existing wallet cursor to an earlier attribution anchor", async () => {
+  const client = new MemorySupabase();
+  const store = createSupabaseRpcCursorStore(client, "user-1");
+  await store.ensure("wallet-a", 100);
+  await store.advance("wallet-a", "sig-200", 200, 2_000);
+
+  const rewound = await store.rewind!("wallet-a", 150);
+  assert.equal(rewound.startSlot, 100);
+  assert.equal(rewound.lastProcessedSignature, null);
+  assert.equal(rewound.lastProcessedSlot, 150);
+  assert.equal(rewound.lastBlockTime, null);
+  assert.equal(rewound.backlogDetected, true);
+
+  const unchanged = await store.rewind!("wallet-a", 175);
+  assert.equal(unchanged.lastProcessedSlot, 150);
+});
+
 test("backlog diagnostics are sanitized and success never advances the cursor", async () => {
   const client = new MemorySupabase();
   const store = createSupabaseRpcCursorStore(client, "user-1");
@@ -323,6 +340,19 @@ test("a provider history gap before a known cursor fails closed", () => {
   assert.equal(plan.backlogDetected, true);
   assert.equal(plan.boundary, "history-gap");
   assert.equal(plan.error, "RPC signature pagination incomplete");
+  assert.deepEqual(plan.signatures, []);
+});
+
+test("a provider history gap before a slot-only activation anchor fails closed", () => {
+  const plan = planRpcSignaturePages(
+    [[signature("sig-309", 309), signature("sig-308", 308)]],
+    cursor({ startSlot: 300, lastProcessedSignature: null, lastProcessedSlot: 300 }),
+    { pageSize: 3 },
+  );
+
+  assert.equal(plan.complete, false);
+  assert.equal(plan.backlogDetected, true);
+  assert.equal(plan.boundary, "history-gap");
   assert.deepEqual(plan.signatures, []);
 });
 

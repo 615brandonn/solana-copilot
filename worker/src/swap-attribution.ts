@@ -40,9 +40,14 @@ export type VerifiedSellAttribution = {
   verified: boolean;
   tokenBalanceBefore?: number;
   tokenBalanceAfter?: number;
+  tokenBalanceBeforeRaw?: string;
+  tokenBalanceAfterRaw?: string;
+  soldAmountRaw?: string;
   soldFraction?: number;
   proceedsMint?: string;
   proceedsAmount?: number;
+  proceedsAmountRaw?: string;
+  proceedsDecimals?: number;
   signerCount: number;
 };
 
@@ -62,17 +67,46 @@ export function parseRawTokenAmount(value: unknown): bigint | undefined {
   }
 }
 
-export function tokenDelta(row: Pick<WalletTokenDelta, "pre" | "post">): number {
+type TokenDeltaInput = Pick<WalletTokenDelta, "pre" | "post"> &
+  Partial<Pick<WalletTokenDelta, "preRaw" | "postRaw" | "rawExact" | "decimals">>;
+
+/** Returns an exact delta only when both raw balance sides were available. */
+export function rawTokenDelta(row: TokenDeltaInput): bigint | undefined {
+  return row.rawExact === true && typeof row.preRaw === "bigint" && typeof row.postRaw === "bigint"
+    ? row.postRaw - row.preRaw
+    : undefined;
+}
+
+/**
+ * UI token balances are IEEE-754 numbers and can collapse distinct raw balances
+ * to the same value. Use the raw delta for the economic amount when possible.
+ */
+export function tokenDelta(row: TokenDeltaInput): number {
+  const raw = rawTokenDelta(row);
+  const decimals = row.decimals;
+  if (raw !== undefined && Number.isSafeInteger(decimals) && decimals! >= 0) {
+    const amount = Number(raw) / 10 ** decimals!;
+    if (Number.isFinite(amount)) return amount;
+  }
   return row.post - row.pre;
 }
 
+/** Exact raw balances decide direction; epsilon is only a legacy fallback. */
+export function tokenDeltaSign(row: TokenDeltaInput): -1 | 0 | 1 {
+  const raw = rawTokenDelta(row);
+  if (raw !== undefined) return raw > 0n ? 1 : raw < 0n ? -1 : 0;
+  const delta = row.post - row.pre;
+  if (!Number.isFinite(delta) || Math.abs(delta) <= TOKEN_EPSILON) return 0;
+  return delta > 0 ? 1 : -1;
+}
+
 export function hasWalletSpecificSpend(
-  rows: Array<Pick<WalletTokenDelta, "pre" | "post">>,
+  rows: TokenDeltaInput[],
   solSpend: number | undefined,
 ): boolean {
   return (
     (solSpend !== undefined && solSpend > MATERIAL_SOL_DELTA) ||
-    rows.some((row) => tokenDelta(row) < -TOKEN_EPSILON)
+    rows.some((row) => tokenDeltaSign(row) < 0)
   );
 }
 
@@ -108,7 +142,7 @@ export function verifiedSpendForOutput(
 ): VerifiedSpend {
   if (outputCandidateCount !== 1) return {};
 
-  const inputs = rows.filter((row) => row.mint !== outputMint && tokenDelta(row) < -TOKEN_EPSILON);
+  const inputs = rows.filter((row) => row.mint !== outputMint && tokenDeltaSign(row) < 0);
   if (inputs.length !== 1) return {};
 
   const input = inputs[0];
@@ -156,7 +190,7 @@ export function attributeVerifiedBuy(
     return { ...spend, verified: true };
   }
   const competingTokenInputs = rows.some(
-    (row) => row.mint !== outputMint && tokenDelta(row) < -TOKEN_EPSILON,
+    (row) => row.mint !== outputMint && tokenDeltaSign(row) < 0,
   );
   if (competingTokenInputs) return { verified: false };
   if (outputCandidateCount === 1 && solSpend !== undefined && solSpend > MATERIAL_SOL_DELTA) {
@@ -186,24 +220,27 @@ export function attributeVerifiedSell(
   }
 
   const sold = rows.find((row) => row.mint === soldMint);
-  if (!sold || !Number.isFinite(sold.pre) || !Number.isFinite(sold.post) || sold.pre <= 0) {
+  const soldPrePositive = sold
+    ? sold.rawExact
+      ? sold.preRaw > 0n
+      : Number.isFinite(sold.pre) && sold.pre > 0
+    : false;
+  if (!sold || !soldPrePositive || tokenDeltaSign(sold) >= 0) {
     return rejected;
   }
-  const soldAmount = sold.pre - sold.post;
-  if (!Number.isFinite(soldAmount) || soldAmount <= TOKEN_EPSILON) return rejected;
+  const soldAmount = -tokenDelta(sold);
+  if (!Number.isFinite(soldAmount) || soldAmount <= 0) return rejected;
 
-  const debits = rows.filter((row) => tokenDelta(row) < -TOKEN_EPSILON);
+  const debits = rows.filter((row) => tokenDeltaSign(row) < 0);
   if (debits.length !== 1 || debits[0]?.mint !== soldMint) return rejected;
 
   const positiveTokens = rows.filter(
-    (row) => row.mint !== soldMint && row.mint !== WSOL_MINT && tokenDelta(row) > TOKEN_EPSILON,
+    (row) => row.mint !== soldMint && row.mint !== WSOL_MINT && tokenDeltaSign(row) > 0,
   );
   const wsolProceeds = rows
     .filter((row) => row.mint === WSOL_MINT)
-    .reduce((sum, row) => sum + Math.max(0, tokenDelta(row)), 0);
-  const nativeProceeds = Number.isFinite(nativeSolDelta)
-    ? Math.max(0, nativeSolDelta)
-    : 0;
+    .reduce((sum, row) => sum + (tokenDeltaSign(row) > 0 ? tokenDelta(row) : 0), 0);
+  const nativeProceeds = Number.isFinite(nativeSolDelta) ? Math.max(0, nativeSolDelta) : 0;
   const solProceeds = wsolProceeds + nativeProceeds;
   const proceedsCount = positiveTokens.length + (solProceeds > MATERIAL_SOL_DELTA ? 1 : 0);
   if (proceedsCount !== 1) return rejected;
@@ -213,13 +250,27 @@ export function attributeVerifiedSell(
   const proceedsAmount = tokenProceeds ? tokenDelta(tokenProceeds) : solProceeds;
   if (!Number.isFinite(proceedsAmount) || proceedsAmount <= 0) return rejected;
 
+  const soldRaw = rawTokenDelta(sold);
+  const proceedsRaw = tokenProceeds ? rawTokenDelta(tokenProceeds) : undefined;
+  const soldFraction =
+    soldRaw !== undefined && sold.preRaw > 0n
+      ? Number(-soldRaw) / Number(sold.preRaw)
+      : soldAmount / sold.pre;
+
   return {
     verified: true,
     tokenBalanceBefore: sold.pre,
     tokenBalanceAfter: Math.max(0, sold.post),
-    soldFraction: Math.min(1, Math.max(0, soldAmount / sold.pre)),
+    tokenBalanceBeforeRaw: sold.rawExact ? sold.preRaw.toString() : undefined,
+    tokenBalanceAfterRaw: sold.rawExact ? sold.postRaw.toString() : undefined,
+    soldAmountRaw: soldRaw !== undefined ? (-soldRaw).toString() : undefined,
+    soldFraction: Number.isFinite(soldFraction)
+      ? Math.min(1, Math.max(0, soldFraction))
+      : undefined,
     proceedsMint,
     proceedsAmount,
+    proceedsAmountRaw: proceedsRaw !== undefined ? proceedsRaw.toString() : undefined,
+    proceedsDecimals: tokenProceeds?.decimals,
     signerCount,
   };
 }

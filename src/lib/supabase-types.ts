@@ -1,6 +1,15 @@
 // Placeholder types for your own Supabase project.
 // Replace with generated types from `supabase gen types typescript` when you have them.
 
+import type {
+  CustodyJourneyEventRow,
+  CustodyJourneyRow,
+  CustodyJourneyWalletRow,
+  CustodyPendingEventRow,
+  CustodyWorkerHeartbeatRow,
+  CustodyWalletProfileRow,
+} from "./custody";
+
 export type BotConfigRow = {
   id: string;
   user_id: string;
@@ -10,6 +19,7 @@ export type BotConfigRow = {
   execution_route: string;
   jito_tip_sol: number;
   fixed_buy_usd: number;
+  custody_journey_enabled: boolean;
   conviction_mode_enabled: boolean;
   conviction_trading_mode: "shadow" | "live";
   conviction_rapid_follow_enabled: boolean;
@@ -464,62 +474,112 @@ export type Database = {
         Row: BotConfigRow;
         Insert: Omit<BotConfigRow, "id" | "updated_at">;
         Update: Partial<BotConfigRow>;
+        Relationships: [];
       };
       funding_keys: {
         Row: FundingKeyRow;
         Insert: Omit<FundingKeyRow, "id" | "created_at">;
         Update: Partial<FundingKeyRow>;
+        Relationships: [];
       };
       positions: {
         Row: PositionRow;
         Insert: Omit<PositionRow, "id" | "opened_at">;
         Update: Partial<PositionRow>;
+        Relationships: [];
       };
       trades: {
         Row: TradeRow;
         Insert: Omit<TradeRow, "id" | "created_at">;
         Update: Partial<TradeRow>;
+        Relationships: [];
       };
       worker_heartbeat: {
         Row: WorkerHeartbeatRow;
         Insert: WorkerHeartbeatRow;
         Update: Partial<WorkerHeartbeatRow>;
+        Relationships: [];
       };
       follower_balance_alerts: {
         Row: FollowerBalanceAlertRow;
         Insert: Omit<FollowerBalanceAlertRow, "id" | "first_detected_at" | "last_detected_at">;
         Update: Partial<FollowerBalanceAlertRow>;
+        Relationships: [];
       };
       strategy_observations: {
         Row: StrategyObservationRow;
         Insert: Omit<StrategyObservationRow, "id" | "updated_at">;
         Update: Partial<StrategyObservationRow>;
+        Relationships: [];
+      };
+      custody_journeys: {
+        Row: CustodyJourneyRow;
+        Insert: Partial<CustodyJourneyRow>;
+        Update: Partial<CustodyJourneyRow>;
+        Relationships: [];
+      };
+      custody_journey_wallets: {
+        Row: CustodyJourneyWalletRow;
+        Insert: Partial<CustodyJourneyWalletRow>;
+        Update: Partial<CustodyJourneyWalletRow>;
+        Relationships: [];
+      };
+      custody_journey_events: {
+        Row: CustodyJourneyEventRow;
+        Insert: Partial<CustodyJourneyEventRow>;
+        Update: Partial<CustodyJourneyEventRow>;
+        Relationships: [];
+      };
+      custody_wallet_profiles: {
+        Row: CustodyWalletProfileRow;
+        Insert: Omit<CustodyWalletProfileRow, "created_at" | "updated_at">;
+        Update: Partial<CustodyWalletProfileRow>;
+        Relationships: [];
+      };
+      custody_worker_heartbeat: {
+        Row: CustodyWorkerHeartbeatRow;
+        Insert: CustodyWorkerHeartbeatRow;
+        Update: Partial<CustodyWorkerHeartbeatRow>;
+        Relationships: [];
+      };
+      custody_pending_events: {
+        Row: CustodyPendingEventRow;
+        Insert: CustodyPendingEventRow;
+        Update: Partial<CustodyPendingEventRow>;
+        Relationships: [];
       };
       conviction_events: {
         Row: ConvictionEventRow;
         Insert: Omit<ConvictionEventRow, "id" | "recorded_at">;
         Update: Partial<ConvictionEventRow>;
+        Relationships: [];
       };
       conviction_token_state: {
         Row: ConvictionTokenStateRow;
         Insert: Omit<ConvictionTokenStateRow, "updated_at">;
         Update: Partial<ConvictionTokenStateRow>;
+        Relationships: [];
       };
       conviction_rank_history: {
         Row: ConvictionRankHistoryRow;
         Insert: Omit<ConvictionRankHistoryRow, "id">;
         Update: Partial<ConvictionRankHistoryRow>;
+        Relationships: [];
       };
       conviction_transitions: {
         Row: ConvictionTransitionRow;
         Insert: Omit<ConvictionTransitionRow, "id" | "recorded_at">;
         Update: Partial<ConvictionTransitionRow>;
+        Relationships: [];
       };
       conviction_tiers: {
         Row: ConvictionTierRow;
         Insert: Omit<ConvictionTierRow, "id" | "created_at" | "updated_at">;
         Update: Partial<ConvictionTierRow>;
+        Relationships: [];
       };
     };
+    Views: Record<string, never>;
+    Functions: Record<string, never>;
   };
 };
