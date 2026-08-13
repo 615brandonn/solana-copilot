@@ -45,6 +45,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table,
@@ -854,7 +855,13 @@ function JourneyDetailDialog({
   );
 }
 
-export function CustodyJourneyDashboard({ enabled }: { enabled?: boolean }) {
+export function CustodyJourneyDashboard({
+  enabled,
+  onToggleEnabled,
+}: {
+  enabled?: boolean;
+  onToggleEnabled?: (value: boolean) => void;
+}) {
   const [window, setWindow] = useState<CustodyWindow>("7d");
   const [tab, setTab] = useState<CustodyTab>("journeys");
   const [selectedJourneyId, setSelectedJourneyId] = useState<string | null>(null);
