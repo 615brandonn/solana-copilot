@@ -64,6 +64,28 @@ Existing deployments must run
 `supabase/coordinated-mode-migration.sql` before deploying the updated
 dashboard or worker.
 
+### Optional Conviction Mode
+
+Conviction Mode reuses the same three target-wallet feeds and shared trade
+executor, but ranks every token by verified cluster commitment, velocity,
+acceleration, convergence, persistence, and distribution. When its master
+switch is on, it is the only automatic entry strategy; the regular and
+coordinated buy paths remain saved but cannot submit. Existing position exits,
+follower monitoring, emergency protections, and manual controls remain active.
+
+Conviction Mode installs **OFF**, with its trading mode set to **SHADOW** and
+Rapid Follow set to **OFF**. Shadow mode records hypothetical tiers without
+submitting transactions. Live buys require all three conditions: the master
+switch on, trading mode explicitly set to Live, and the global Entries switch
+on. A hard per-token exposure cap and durable per-mode tier claims prevent
+duplicate scale-ins after replay or restart.
+
+Existing deployments must run the additive, repeatable
+`supabase/conviction-mode-migration.sql` and pass `cd worker && npm run doctor`
+before restarting the worker. Fresh installations can run `supabase/schema.sql`,
+which already contains the same schema. Applying the migration does not enable
+Conviction Mode or Entries.
+
 ## Security notes
 
 - Your funding private key is sent over HTTPS to the dashboard's server

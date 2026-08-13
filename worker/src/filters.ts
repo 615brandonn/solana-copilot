@@ -5,6 +5,7 @@ import type { BotConfigRow } from "./db.js";
 import type { SwapEvent } from "./geyser.js";
 
 export type TokenMeta = {
+  symbol?: string;
   marketCapUsd?: number;
   liquidityUsd?: number;
   pairCreatedAtMs?: number;
@@ -37,7 +38,17 @@ export async function loadTokenMeta(mint: string): Promise<TokenMeta> {
     const pairCreatedAtValues = pairs
       .map((candidate: any) => normalizedTimestampMs(candidate?.pairCreatedAt))
       .filter((timestamp: number | undefined): timestamp is number => timestamp !== undefined);
+    const requestedToken =
+      pair?.baseToken?.address === mint
+        ? pair.baseToken
+        : pair?.quoteToken?.address === mint
+          ? pair.quoteToken
+          : pair?.baseToken;
     return {
+      symbol:
+        typeof requestedToken?.symbol === "string" && requestedToken.symbol.trim()
+          ? requestedToken.symbol.trim().slice(0, 32)
+          : undefined,
       marketCapUsd: finiteNumber(pair?.marketCap ?? pair?.fdv),
       liquidityUsd: finiteNumber(pair?.liquidity?.usd),
       pairCreatedAtMs:

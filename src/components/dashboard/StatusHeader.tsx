@@ -14,6 +14,8 @@ type Props = {
   monitoredWallets: number;
   syncing?: boolean;
   coordinatedModeEnabled?: boolean;
+  convictionModeEnabled?: boolean;
+  convictionTradingMode?: "shadow" | "live";
 };
 
 export function StatusHeader({
@@ -29,7 +31,10 @@ export function StatusHeader({
   monitoredWallets,
   syncing,
   coordinatedModeEnabled,
+  convictionModeEnabled,
+  convictionTradingMode,
 }: Props) {
+  const convictionShadow = convictionModeEnabled && convictionTradingMode !== "live";
   return (
     <header className="glass-card rounded-2xl px-6 py-5 flex flex-wrap items-center justify-between gap-6">
       <div className="flex items-center gap-4">
@@ -93,14 +98,20 @@ export function StatusHeader({
             className="text-xs font-medium uppercase tracking-wider"
             title={
               enabled
-                ? "New entries and open-position exits are active."
+                ? convictionShadow
+                  ? "Conviction Mode is recording hypothetical entries. SHADOW mode cannot submit buys."
+                  : "New entries and open-position exits are active."
                 : "New entries are off. Follower-network exits for existing positions remain active while the VPS worker is online."
             }
           >
             {enabled
-              ? coordinatedModeEnabled
-                ? "Entries on · coordinated"
-                : "Entries on · regular"
+              ? convictionShadow
+                ? "Conviction shadow · no buys"
+                : convictionModeEnabled
+                  ? "Entries on · conviction"
+                  : coordinatedModeEnabled
+                    ? "Entries on · coordinated"
+                    : "Entries on · regular"
               : "Entries off · exits active"}
           </span>
           {syncing && <span className="text-[10px] text-muted-foreground">syncing…</span>}

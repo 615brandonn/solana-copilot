@@ -10,6 +10,42 @@ export type BotConfigRow = {
   execution_route: string;
   jito_tip_sol: number;
   fixed_buy_usd: number;
+  conviction_mode_enabled: boolean;
+  conviction_trading_mode: "shadow" | "live";
+  conviction_rapid_follow_enabled: boolean;
+  conviction_primary_window_minutes: 5 | 30 | 60;
+  conviction_score_threshold: number;
+  conviction_top_n: number;
+  conviction_min_commitment_usd: number;
+  conviction_min_recent_net_inflow_usd: number;
+  conviction_min_velocity_usd_per_minute: number;
+  conviction_min_acceleration_ratio: number;
+  conviction_min_converged_wallets: number;
+  conviction_two_wallet_window_seconds: number;
+  conviction_three_wallet_window_seconds: number;
+  conviction_min_individual_buy_usd: number;
+  conviction_market_cap_filter_enabled: boolean;
+  conviction_market_cap_min_usd: number;
+  conviction_market_cap_max_usd: number;
+  conviction_liquidity_filter_enabled: boolean;
+  conviction_liquidity_min_usd: number;
+  conviction_liquidity_max_usd: number;
+  conviction_token_age_filter_enabled: boolean;
+  conviction_token_age_min_minutes: number;
+  conviction_token_age_max_minutes: number;
+  conviction_max_position_per_token_usd: number;
+  conviction_distribution_sell_ratio: number;
+  conviction_distribution_min_sells_usd: number;
+  conviction_distribution_wallet_count: number;
+  conviction_inactivity_minutes: number;
+  conviction_rank_loss_grace_seconds: number;
+  conviction_weight_net_commitment: number;
+  conviction_weight_velocity: number;
+  conviction_weight_acceleration: number;
+  conviction_weight_convergence: number;
+  conviction_weight_persistence: number;
+  conviction_tier_commitment_thresholds_usd: number[];
+  conviction_tier_buy_amounts_usd: number[];
   coordinated_mode_enabled: boolean;
   coordinated_fixed_buy_usd: number;
   coordinated_target_wallet_count: number;
@@ -263,6 +299,163 @@ export type StrategyInsights = {
   recent: StrategyRecentObservation[];
 };
 
+export type ConvictionEventRow = {
+  id: string;
+  user_id: string;
+  event_key: string;
+  tx_sig: string;
+  slot: number | null;
+  source: "geyser" | "rpc" | "unknown";
+  event_at: string;
+  recorded_at: string;
+  wallet: string;
+  from_wallet: string | null;
+  to_wallet: string | null;
+  token_mint: string;
+  classification:
+    | "DEX_BUY"
+    | "DEX_SELL"
+    | "INTERNAL_CLUSTER_TRANSFER"
+    | "EXTERNAL_TRANSFER_IN"
+    | "EXTERNAL_TRANSFER_OUT"
+    | "UNKNOWN";
+  classification_reliable: boolean;
+  amount_tokens: number;
+  amount_usd: number | null;
+  market_cap_usd: number | null;
+  liquidity_usd: number | null;
+  metadata: Record<string, unknown>;
+};
+
+export type ConvictionTokenStateRow = {
+  user_id: string;
+  token_mint: string;
+  symbol: string | null;
+  first_seen_at: string;
+  last_activity_at: string;
+  gross_cluster_buys_usd: number;
+  gross_cluster_sells_usd: number;
+  net_cluster_investment_usd: number;
+  wallet_net_usd: Record<string, number>;
+  buy_count: number;
+  sell_count: number;
+  largest_buy_usd: number;
+  last_buy_usd: number;
+  average_buy_usd: number;
+  median_buy_usd: number;
+  wallets_that_bought: string[];
+  wallets_currently_accumulating: string[];
+  wallet_convergence_count: number;
+  market_cap_usd: number | null;
+  market_cap_at_first_cluster_buy_usd: number | null;
+  liquidity_usd: number | null;
+  our_current_position_usd: number;
+  net_flow_1m_usd: number;
+  net_flow_5m_usd: number;
+  net_flow_30m_usd: number;
+  net_flow_60m_usd: number;
+  capital_velocity_usd_per_minute: number;
+  capital_acceleration_ratio: number;
+  buy_size_acceleration_ratio: number;
+  conviction_score: number;
+  conviction_state:
+    | "TESTING"
+    | "WATCHING"
+    | "ACCUMULATING"
+    | "BETTING"
+    | "HIGH_CONVICTION"
+    | "DISTRIBUTING";
+  score_reasons: unknown[];
+  current_rank: number | null;
+  previous_rank: number | null;
+  rank_direction: "up" | "down" | "flat" | "new" | "unranked";
+  time_in_top_10_seconds: number;
+  time_in_top_3_seconds: number;
+  time_at_rank_one_seconds: number;
+  rapid_follow_status: "inactive" | "active" | "stopped";
+  data_reliable: boolean;
+  rolling_metrics: Record<string, unknown>;
+  last_ranked_at: string | null;
+  updated_at: string;
+};
+
+export type ConvictionRankHistoryRow = {
+  id: string;
+  user_id: string;
+  token_mint: string;
+  window_minutes: 5 | 30 | 60;
+  rank: number;
+  previous_rank: number | null;
+  rank_direction: "up" | "down" | "flat" | "new";
+  conviction_score: number;
+  net_cluster_investment_usd: number;
+  net_flow_usd: number;
+  capital_velocity_usd_per_minute: number;
+  capital_acceleration_ratio: number;
+  buy_size_acceleration_ratio: number;
+  wallet_convergence_count: number;
+  continuing_accumulation: boolean;
+  distribution_penalty: number;
+  ranking_at: string;
+  metadata: Record<string, unknown>;
+};
+
+export type ConvictionTransitionRow = {
+  id: string;
+  user_id: string;
+  transition_key: string;
+  token_mint: string | null;
+  event_type: string;
+  previous_state: ConvictionTokenStateRow["conviction_state"] | null;
+  new_state: ConvictionTokenStateRow["conviction_state"] | null;
+  previous_score: number | null;
+  new_score: number | null;
+  net_cluster_investment_usd: number | null;
+  capital_velocity_usd_per_minute: number | null;
+  wallet_convergence_count: number | null;
+  market_cap_usd: number | null;
+  liquidity_usd: number | null;
+  reasons: unknown[];
+  metadata: Record<string, unknown>;
+  occurred_at: string;
+  recorded_at: string;
+};
+
+export type ConvictionTierRow = {
+  id: string;
+  user_id: string;
+  token_mint: string;
+  tier_number: number;
+  trading_mode: "shadow" | "live";
+  status:
+    | "eligible"
+    | "shadowed"
+    | "claimed"
+    | "submitted"
+    | "landed"
+    | "persisted"
+    | "failed_pre_submit"
+    | "uncertain"
+    | "skipped";
+  planned_position_id: string | null;
+  position_id: string | null;
+  source_event_key: string;
+  commitment_threshold_usd: number;
+  buy_usd: number;
+  score: number;
+  received_tokens: number | null;
+  bot_tx_sig: string | null;
+  reason: string | null;
+  error_code: string | null;
+  claimed_at: string | null;
+  submission_started_at: string | null;
+  landed_at: string | null;
+  persisted_at: string | null;
+  created_at: string;
+  updated_at: string;
+  metadata: Record<string, unknown>;
+};
+
 // Minimal Database shape for createClient<Database>
 export type Database = {
   public: {
@@ -301,6 +494,31 @@ export type Database = {
         Row: StrategyObservationRow;
         Insert: Omit<StrategyObservationRow, "id" | "updated_at">;
         Update: Partial<StrategyObservationRow>;
+      };
+      conviction_events: {
+        Row: ConvictionEventRow;
+        Insert: Omit<ConvictionEventRow, "id" | "recorded_at">;
+        Update: Partial<ConvictionEventRow>;
+      };
+      conviction_token_state: {
+        Row: ConvictionTokenStateRow;
+        Insert: Omit<ConvictionTokenStateRow, "updated_at">;
+        Update: Partial<ConvictionTokenStateRow>;
+      };
+      conviction_rank_history: {
+        Row: ConvictionRankHistoryRow;
+        Insert: Omit<ConvictionRankHistoryRow, "id">;
+        Update: Partial<ConvictionRankHistoryRow>;
+      };
+      conviction_transitions: {
+        Row: ConvictionTransitionRow;
+        Insert: Omit<ConvictionTransitionRow, "id" | "recorded_at">;
+        Update: Partial<ConvictionTransitionRow>;
+      };
+      conviction_tiers: {
+        Row: ConvictionTierRow;
+        Insert: Omit<ConvictionTierRow, "id" | "created_at" | "updated_at">;
+        Update: Partial<ConvictionTierRow>;
       };
     };
   };

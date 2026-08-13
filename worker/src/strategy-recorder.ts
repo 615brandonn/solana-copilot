@@ -141,6 +141,10 @@ export function observationFromEvent(
     base.sol_delta = finite(event.solDelta);
     base.amount_usd = finite(event.amountUsd);
     base.is_pump_fun = event.isPumpFun;
+    base.metadata = {
+      verifiedSwap: event.verifiedSwap === true,
+      sellAttributionVerified: event.sellAttribution?.verified === true,
+    };
   } else {
     base.from_wallet = event.from;
     base.to_wallet = event.to;
@@ -149,8 +153,22 @@ export function observationFromEvent(
   return {
     ...base,
     ...patch,
-    metadata: { ...base.metadata, ...(patch.metadata ?? {}) },
+    metadata: mergeStrategyMetadata(base.metadata, patch.metadata ?? {}),
   };
+}
+
+function mergeStrategyMetadata(
+  existing: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...existing, ...incoming };
+  // These fields represent positive evidence from either feed. A later,
+  // weaker decode must never erase evidence that a trusted swap or exact sell
+  // attribution was already observed.
+  for (const key of ["verifiedSwap", "sellAttributionVerified"] as const) {
+    if (existing[key] === true || incoming[key] === true) merged[key] = true;
+  }
+  return merged;
 }
 
 const relationshipRank: Record<StrategyRelationship, number> = {
@@ -210,7 +228,7 @@ export function mergeStrategyObservations(
     market_cap_usd: incoming.market_cap_usd ?? existing.market_cap_usd,
     liquidity_usd: incoming.liquidity_usd ?? existing.liquidity_usd,
     has_socials: incoming.has_socials ?? existing.has_socials,
-    metadata: { ...existing.metadata, ...incoming.metadata },
+    metadata: mergeStrategyMetadata(existing.metadata, incoming.metadata),
   };
 
   if (keepExistingDecision) {

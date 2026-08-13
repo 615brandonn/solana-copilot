@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import { createClient } from "@supabase/supabase-js";
 
 import type { Database } from "./supabase-types";
-import type { BotConfig } from "./bot-config";
+import { DEFAULT_CONVICTION_CONFIG, type BotConfig } from "./bot-config";
 import { normalizeSupabaseUrl } from "./supabase-url";
 import { decodeBase58, encodeBase58 } from "./base58";
 
@@ -80,6 +80,101 @@ export function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row
     executionRoute: row.execution_route as "jito" | "rpc",
     jitoTipSol: row.jito_tip_sol,
     fixedBuyUsd: row.fixed_buy_usd,
+    convictionModeEnabled:
+      row.conviction_mode_enabled ?? DEFAULT_CONVICTION_CONFIG.convictionModeEnabled,
+    convictionTradingMode:
+      row.conviction_trading_mode === "live"
+        ? "live"
+        : DEFAULT_CONVICTION_CONFIG.convictionTradingMode,
+    convictionRapidFollowEnabled:
+      row.conviction_rapid_follow_enabled ?? DEFAULT_CONVICTION_CONFIG.convictionRapidFollowEnabled,
+    convictionPrimaryWindowMinutes:
+      row.conviction_primary_window_minutes === 5 || row.conviction_primary_window_minutes === 60
+        ? row.conviction_primary_window_minutes
+        : DEFAULT_CONVICTION_CONFIG.convictionPrimaryWindowMinutes,
+    convictionScoreThreshold:
+      row.conviction_score_threshold ?? DEFAULT_CONVICTION_CONFIG.convictionScoreThreshold,
+    convictionTopN: row.conviction_top_n ?? DEFAULT_CONVICTION_CONFIG.convictionTopN,
+    convictionMinCommitmentUsd:
+      row.conviction_min_commitment_usd ?? DEFAULT_CONVICTION_CONFIG.convictionMinCommitmentUsd,
+    convictionMinRecentNetInflowUsd:
+      row.conviction_min_recent_net_inflow_usd ??
+      DEFAULT_CONVICTION_CONFIG.convictionMinRecentNetInflowUsd,
+    convictionMinVelocityUsdPerMinute:
+      row.conviction_min_velocity_usd_per_minute ??
+      DEFAULT_CONVICTION_CONFIG.convictionMinVelocityUsdPerMinute,
+    convictionMinAccelerationRatio:
+      row.conviction_min_acceleration_ratio ??
+      DEFAULT_CONVICTION_CONFIG.convictionMinAccelerationRatio,
+    convictionMinConvergedWallets:
+      row.conviction_min_converged_wallets ??
+      DEFAULT_CONVICTION_CONFIG.convictionMinConvergedWallets,
+    convictionTwoWalletWindowSeconds:
+      row.conviction_two_wallet_window_seconds ??
+      DEFAULT_CONVICTION_CONFIG.convictionTwoWalletWindowSeconds,
+    convictionThreeWalletWindowSeconds:
+      row.conviction_three_wallet_window_seconds ??
+      DEFAULT_CONVICTION_CONFIG.convictionThreeWalletWindowSeconds,
+    convictionMinIndividualBuyUsd:
+      row.conviction_min_individual_buy_usd ??
+      DEFAULT_CONVICTION_CONFIG.convictionMinIndividualBuyUsd,
+    convictionMarketCapFilterEnabled:
+      row.conviction_market_cap_filter_enabled ??
+      DEFAULT_CONVICTION_CONFIG.convictionMarketCapFilterEnabled,
+    convictionMarketCapMinUsd:
+      row.conviction_market_cap_min_usd ?? DEFAULT_CONVICTION_CONFIG.convictionMarketCapMinUsd,
+    convictionMarketCapMaxUsd:
+      row.conviction_market_cap_max_usd ?? DEFAULT_CONVICTION_CONFIG.convictionMarketCapMaxUsd,
+    convictionLiquidityFilterEnabled:
+      row.conviction_liquidity_filter_enabled ??
+      DEFAULT_CONVICTION_CONFIG.convictionLiquidityFilterEnabled,
+    convictionLiquidityMinUsd:
+      row.conviction_liquidity_min_usd ?? DEFAULT_CONVICTION_CONFIG.convictionLiquidityMinUsd,
+    convictionLiquidityMaxUsd:
+      row.conviction_liquidity_max_usd ?? DEFAULT_CONVICTION_CONFIG.convictionLiquidityMaxUsd,
+    convictionTokenAgeFilterEnabled:
+      row.conviction_token_age_filter_enabled ??
+      DEFAULT_CONVICTION_CONFIG.convictionTokenAgeFilterEnabled,
+    convictionTokenAgeMinMinutes:
+      row.conviction_token_age_min_minutes ??
+      DEFAULT_CONVICTION_CONFIG.convictionTokenAgeMinMinutes,
+    convictionTokenAgeMaxMinutes:
+      row.conviction_token_age_max_minutes ??
+      DEFAULT_CONVICTION_CONFIG.convictionTokenAgeMaxMinutes,
+    convictionMaxPositionPerTokenUsd:
+      row.conviction_max_position_per_token_usd ??
+      DEFAULT_CONVICTION_CONFIG.convictionMaxPositionPerTokenUsd,
+    convictionDistributionSellRatio:
+      row.conviction_distribution_sell_ratio ??
+      DEFAULT_CONVICTION_CONFIG.convictionDistributionSellRatio,
+    convictionDistributionMinSellsUsd:
+      row.conviction_distribution_min_sells_usd ??
+      DEFAULT_CONVICTION_CONFIG.convictionDistributionMinSellsUsd,
+    convictionDistributionWalletCount:
+      row.conviction_distribution_wallet_count ??
+      DEFAULT_CONVICTION_CONFIG.convictionDistributionWalletCount,
+    convictionInactivityMinutes:
+      row.conviction_inactivity_minutes ?? DEFAULT_CONVICTION_CONFIG.convictionInactivityMinutes,
+    convictionRankLossGraceSeconds:
+      row.conviction_rank_loss_grace_seconds ??
+      DEFAULT_CONVICTION_CONFIG.convictionRankLossGraceSeconds,
+    convictionWeightNetCommitment:
+      row.conviction_weight_net_commitment ??
+      DEFAULT_CONVICTION_CONFIG.convictionWeightNetCommitment,
+    convictionWeightVelocity:
+      row.conviction_weight_velocity ?? DEFAULT_CONVICTION_CONFIG.convictionWeightVelocity,
+    convictionWeightAcceleration:
+      row.conviction_weight_acceleration ?? DEFAULT_CONVICTION_CONFIG.convictionWeightAcceleration,
+    convictionWeightConvergence:
+      row.conviction_weight_convergence ?? DEFAULT_CONVICTION_CONFIG.convictionWeightConvergence,
+    convictionWeightPersistence:
+      row.conviction_weight_persistence ?? DEFAULT_CONVICTION_CONFIG.convictionWeightPersistence,
+    convictionTierCommitmentThresholdsUsd: row.conviction_tier_commitment_thresholds_usd?.map(
+      Number,
+    ) ?? [...DEFAULT_CONVICTION_CONFIG.convictionTierCommitmentThresholdsUsd],
+    convictionTierBuyAmountsUsd: row.conviction_tier_buy_amounts_usd?.map(Number) ?? [
+      ...DEFAULT_CONVICTION_CONFIG.convictionTierBuyAmountsUsd,
+    ],
     coordinatedModeEnabled: row.coordinated_mode_enabled ?? false,
     coordinatedFixedBuyUsd: row.coordinated_fixed_buy_usd ?? 25,
     coordinatedTargetWalletCount: row.coordinated_target_wallet_count ?? 2,
@@ -156,6 +251,42 @@ export function configToRow(
     execution_route: cfg.executionRoute,
     jito_tip_sol: cfg.jitoTipSol,
     fixed_buy_usd: cfg.fixedBuyUsd,
+    conviction_mode_enabled: cfg.convictionModeEnabled,
+    conviction_trading_mode: cfg.convictionTradingMode,
+    conviction_rapid_follow_enabled: cfg.convictionRapidFollowEnabled,
+    conviction_primary_window_minutes: cfg.convictionPrimaryWindowMinutes,
+    conviction_score_threshold: cfg.convictionScoreThreshold,
+    conviction_top_n: cfg.convictionTopN,
+    conviction_min_commitment_usd: cfg.convictionMinCommitmentUsd,
+    conviction_min_recent_net_inflow_usd: cfg.convictionMinRecentNetInflowUsd,
+    conviction_min_velocity_usd_per_minute: cfg.convictionMinVelocityUsdPerMinute,
+    conviction_min_acceleration_ratio: cfg.convictionMinAccelerationRatio,
+    conviction_min_converged_wallets: cfg.convictionMinConvergedWallets,
+    conviction_two_wallet_window_seconds: cfg.convictionTwoWalletWindowSeconds,
+    conviction_three_wallet_window_seconds: cfg.convictionThreeWalletWindowSeconds,
+    conviction_min_individual_buy_usd: cfg.convictionMinIndividualBuyUsd,
+    conviction_market_cap_filter_enabled: cfg.convictionMarketCapFilterEnabled,
+    conviction_market_cap_min_usd: cfg.convictionMarketCapMinUsd,
+    conviction_market_cap_max_usd: cfg.convictionMarketCapMaxUsd,
+    conviction_liquidity_filter_enabled: cfg.convictionLiquidityFilterEnabled,
+    conviction_liquidity_min_usd: cfg.convictionLiquidityMinUsd,
+    conviction_liquidity_max_usd: cfg.convictionLiquidityMaxUsd,
+    conviction_token_age_filter_enabled: cfg.convictionTokenAgeFilterEnabled,
+    conviction_token_age_min_minutes: cfg.convictionTokenAgeMinMinutes,
+    conviction_token_age_max_minutes: cfg.convictionTokenAgeMaxMinutes,
+    conviction_max_position_per_token_usd: cfg.convictionMaxPositionPerTokenUsd,
+    conviction_distribution_sell_ratio: cfg.convictionDistributionSellRatio,
+    conviction_distribution_min_sells_usd: cfg.convictionDistributionMinSellsUsd,
+    conviction_distribution_wallet_count: cfg.convictionDistributionWalletCount,
+    conviction_inactivity_minutes: cfg.convictionInactivityMinutes,
+    conviction_rank_loss_grace_seconds: cfg.convictionRankLossGraceSeconds,
+    conviction_weight_net_commitment: cfg.convictionWeightNetCommitment,
+    conviction_weight_velocity: cfg.convictionWeightVelocity,
+    conviction_weight_acceleration: cfg.convictionWeightAcceleration,
+    conviction_weight_convergence: cfg.convictionWeightConvergence,
+    conviction_weight_persistence: cfg.convictionWeightPersistence,
+    conviction_tier_commitment_thresholds_usd: cfg.convictionTierCommitmentThresholdsUsd,
+    conviction_tier_buy_amounts_usd: cfg.convictionTierBuyAmountsUsd,
     coordinated_mode_enabled: cfg.coordinatedModeEnabled,
     coordinated_fixed_buy_usd: cfg.coordinatedFixedBuyUsd,
     coordinated_target_wallet_count: cfg.coordinatedTargetWalletCount,

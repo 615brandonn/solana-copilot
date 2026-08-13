@@ -159,6 +159,287 @@ async function checkStrategyLabSchema(userId: string) {
   pass("Strategy Lab schema", "table, read-only insights, and recorder function are available");
 }
 
+async function checkConvictionModeSchema(cfg: BotConfigRow, targetCount: number): Promise<boolean> {
+  const requiredConfigFields: Array<keyof BotConfigRow> = [
+    "conviction_mode_enabled",
+    "conviction_trading_mode",
+    "conviction_rapid_follow_enabled",
+    "conviction_primary_window_minutes",
+    "conviction_score_threshold",
+    "conviction_top_n",
+    "conviction_min_commitment_usd",
+    "conviction_min_recent_net_inflow_usd",
+    "conviction_min_velocity_usd_per_minute",
+    "conviction_min_acceleration_ratio",
+    "conviction_min_converged_wallets",
+    "conviction_two_wallet_window_seconds",
+    "conviction_three_wallet_window_seconds",
+    "conviction_min_individual_buy_usd",
+    "conviction_market_cap_filter_enabled",
+    "conviction_market_cap_min_usd",
+    "conviction_market_cap_max_usd",
+    "conviction_liquidity_filter_enabled",
+    "conviction_liquidity_min_usd",
+    "conviction_liquidity_max_usd",
+    "conviction_token_age_filter_enabled",
+    "conviction_token_age_min_minutes",
+    "conviction_token_age_max_minutes",
+    "conviction_max_position_per_token_usd",
+    "conviction_distribution_sell_ratio",
+    "conviction_distribution_min_sells_usd",
+    "conviction_distribution_wallet_count",
+    "conviction_inactivity_minutes",
+    "conviction_rank_loss_grace_seconds",
+    "conviction_weight_net_commitment",
+    "conviction_weight_velocity",
+    "conviction_weight_acceleration",
+    "conviction_weight_convergence",
+    "conviction_weight_persistence",
+    "conviction_tier_commitment_thresholds_usd",
+    "conviction_tier_buy_amounts_usd",
+  ];
+  const missing = requiredConfigFields.filter(
+    (field) => cfg[field] === undefined || cfg[field] === null,
+  );
+  if (missing.length > 0) {
+    fail(
+      "Conviction Mode migration",
+      `missing ${missing.length} config field(s) — run supabase/conviction-mode-migration.sql before deploying this worker`,
+    );
+    return false;
+  }
+
+  const weights = [
+    cfg.conviction_weight_net_commitment,
+    cfg.conviction_weight_velocity,
+    cfg.conviction_weight_acceleration,
+    cfg.conviction_weight_convergence,
+    cfg.conviction_weight_persistence,
+  ].map(Number);
+  const thresholds = (cfg.conviction_tier_commitment_thresholds_usd ?? []).map(Number);
+  const tierBuys = (cfg.conviction_tier_buy_amounts_usd ?? []).map(Number);
+  const validWindow = new Set([5, 30, 60]).has(Number(cfg.conviction_primary_window_minutes));
+  const numberInRange = (value: unknown, minimum: number, maximum = Number.POSITIVE_INFINITY) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= minimum && number <= maximum;
+  };
+  const integerInRange = (value: unknown, minimum: number, maximum: number) => {
+    const number = Number(value);
+    return Number.isInteger(number) && number >= minimum && number <= maximum;
+  };
+  const validWeights =
+    weights.every((value) => Number.isFinite(value) && value >= 0 && value <= 100) &&
+    Math.abs(weights.reduce((sum, value) => sum + value, 0) - 100) < 0.000_001;
+  const validTiers =
+    thresholds.length === 4 &&
+    tierBuys.length === 4 &&
+    thresholds.every(
+      (value, index) =>
+        Number.isFinite(value) && value > 0 && (index === 0 || value > thresholds[index - 1]),
+    ) &&
+    tierBuys.every((value) => Number.isFinite(value) && value > 0) &&
+    tierBuys.reduce((sum, value) => sum + value, 0) <=
+      Number(cfg.conviction_max_position_per_token_usd);
+  const validConvergence =
+    integerInRange(cfg.conviction_min_converged_wallets, 1, 3) &&
+    integerInRange(cfg.conviction_two_wallet_window_seconds, 1, 21_600) &&
+    integerInRange(cfg.conviction_three_wallet_window_seconds, 1, 21_600) &&
+    Number(cfg.conviction_three_wallet_window_seconds) >=
+      Number(cfg.conviction_two_wallet_window_seconds);
+  const validFilters =
+    numberInRange(cfg.conviction_market_cap_min_usd, 0) &&
+    numberInRange(cfg.conviction_market_cap_max_usd, Number(cfg.conviction_market_cap_min_usd)) &&
+    numberInRange(cfg.conviction_liquidity_min_usd, 0) &&
+    numberInRange(cfg.conviction_liquidity_max_usd, Number(cfg.conviction_liquidity_min_usd)) &&
+    numberInRange(cfg.conviction_token_age_min_minutes, 0) &&
+    numberInRange(
+      cfg.conviction_token_age_max_minutes,
+      Number(cfg.conviction_token_age_min_minutes),
+    );
+  const validEntryGates =
+    numberInRange(cfg.conviction_score_threshold, 0, 100) &&
+    integerInRange(cfg.conviction_top_n, 1, 10) &&
+    numberInRange(cfg.conviction_min_commitment_usd, 0) &&
+    numberInRange(cfg.conviction_min_recent_net_inflow_usd, 0) &&
+    numberInRange(cfg.conviction_min_velocity_usd_per_minute, 0) &&
+    numberInRange(cfg.conviction_min_acceleration_ratio, 0) &&
+    numberInRange(cfg.conviction_min_individual_buy_usd, 0) &&
+    numberInRange(cfg.conviction_max_position_per_token_usd, Number.MIN_VALUE) &&
+    numberInRange(cfg.conviction_distribution_sell_ratio, 0, 1) &&
+    numberInRange(cfg.conviction_distribution_min_sells_usd, 0) &&
+    integerInRange(cfg.conviction_distribution_wallet_count, 1, 3) &&
+    numberInRange(cfg.conviction_inactivity_minutes, Number.MIN_VALUE) &&
+    integerInRange(cfg.conviction_rank_loss_grace_seconds, 0, 86_400);
+  if (
+    !["shadow", "live"].includes(String(cfg.conviction_trading_mode)) ||
+    !validWindow ||
+    !validWeights ||
+    !validTiers ||
+    !validConvergence ||
+    !validFilters ||
+    !validEntryGates
+  ) {
+    fail(
+      "Conviction Mode config",
+      "trading mode, leaderboard, entry gates, filters, convergence, weights, or tier values are invalid",
+    );
+    return false;
+  }
+  if (cfg.conviction_mode_enabled && targetCount !== 3) {
+    fail(
+      "Conviction Mode wallet cluster",
+      `exactly 3 unique market-maker wallets are required; ${targetCount} configured`,
+    );
+    return false;
+  }
+
+  const checks = await Promise.all([
+    db
+      .from("conviction_events")
+      .select(
+        "id,user_id,event_key,tx_sig,slot,source,event_at,recorded_at,wallet,from_wallet,to_wallet,token_mint,classification,classification_reliable,amount_tokens,amount_usd,market_cap_usd,liquidity_usd,metadata",
+      )
+      .limit(1),
+    db
+      .from("conviction_token_state")
+      .select(
+        "user_id,token_mint,symbol,first_seen_at,last_activity_at,gross_cluster_buys_usd,gross_cluster_sells_usd,net_cluster_investment_usd,wallet_net_usd,buy_count,sell_count,largest_buy_usd,last_buy_usd,average_buy_usd,median_buy_usd,wallets_that_bought,wallets_currently_accumulating,wallet_convergence_count,market_cap_usd,market_cap_at_first_cluster_buy_usd,liquidity_usd,our_current_position_usd,net_flow_1m_usd,net_flow_5m_usd,net_flow_30m_usd,net_flow_60m_usd,capital_velocity_usd_per_minute,capital_acceleration_ratio,buy_size_acceleration_ratio,rolling_metrics,conviction_score,conviction_state,score_reasons,current_rank,previous_rank,rank_direction,time_in_top_10_seconds,time_in_top_3_seconds,time_at_rank_one_seconds,rapid_follow_status,data_reliable,last_ranked_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("conviction_rank_history")
+      .select(
+        "id,user_id,token_mint,window_minutes,rank,previous_rank,rank_direction,conviction_score,net_cluster_investment_usd,net_flow_usd,capital_velocity_usd_per_minute,capital_acceleration_ratio,buy_size_acceleration_ratio,wallet_convergence_count,continuing_accumulation,distribution_penalty,ranking_at,metadata",
+      )
+      .limit(1),
+    db
+      .from("conviction_transitions")
+      .select(
+        "id,user_id,transition_key,token_mint,event_type,previous_state,new_state,previous_score,new_score,net_cluster_investment_usd,capital_velocity_usd_per_minute,wallet_convergence_count,market_cap_usd,liquidity_usd,reasons,metadata,occurred_at,recorded_at",
+      )
+      .limit(1),
+    db
+      .from("conviction_tiers")
+      .select(
+        "user_id,token_mint,tier_number,trading_mode,status,planned_position_id,position_id,source_event_key,commitment_threshold_usd,buy_usd,score,received_tokens,bot_tx_sig,reason,error_code,claimed_at,submission_started_at,landed_at,persisted_at,created_at,updated_at,metadata",
+      )
+      .limit(1),
+  ]);
+  const schemaError = checks.find((result) => result.error)?.error;
+  if (schemaError) {
+    fail(
+      "Conviction Mode schema",
+      `${safeDiagnostic(schemaError.message)} — run supabase/conviction-mode-migration.sql before deploying this worker`,
+    );
+    return false;
+  }
+
+  const tierIdentity = await db.rpc("conviction_tier_identity_health");
+  if (tierIdentity.error) {
+    fail(
+      "Conviction tier identity",
+      `${safeDiagnostic(tierIdentity.error.message)} — rerun supabase/conviction-mode-migration.sql`,
+    );
+    return false;
+  }
+  const tierIdentityRow = Array.isArray(tierIdentity.data)
+    ? tierIdentity.data[0]
+    : tierIdentity.data;
+  if (tierIdentityRow?.mode_scoped_unique !== true) {
+    fail(
+      "Conviction tier identity",
+      "mode-scoped uniqueness is missing — SHADOW could block a later LIVE tier",
+    );
+    return false;
+  }
+  pass(
+    "Conviction tier identity",
+    tierIdentityRow?.legacy_unscoped_unique === true
+      ? "mode-scoped uniqueness ready; legacy compatibility constraint detected"
+      : "SHADOW and LIVE tier identities are independently protected",
+  );
+
+  const unresolved = await db
+    .from("conviction_tiers")
+    .select("status,planned_position_id,bot_tx_sig")
+    .eq("user_id", cfg.user_id)
+    .in("status", ["claimed", "submitted", "landed", "uncertain"]);
+  if (unresolved.error) {
+    fail("Conviction tier claims", safeDiagnostic(unresolved.error.message));
+    return false;
+  }
+  const claimed = (unresolved.data ?? []).filter((row) => row.status === "claimed");
+  const unsafe = (unresolved.data ?? []).filter(
+    (row) => row.status === "submitted" || row.status === "uncertain",
+  );
+  const landed = (unresolved.data ?? []).filter((row) => row.status === "landed");
+  let landedWithExactEvidence = 0;
+  let landedWithoutEvidence = 0;
+  for (const row of landed) {
+    if (!row.bot_tx_sig) {
+      landedWithoutEvidence += 1;
+      continue;
+    }
+    const [{ data: trade, error: tradeError }, { data: position, error: positionError }] =
+      await Promise.all([
+        db
+          .from("trades")
+          .select("position_id")
+          .eq("user_id", cfg.user_id)
+          .eq("tx_sig", row.bot_tx_sig)
+          .eq("side", "buy")
+          .maybeSingle(),
+        row.planned_position_id
+          ? db
+              .from("positions")
+              .select("entry_tx_sig")
+              .eq("user_id", cfg.user_id)
+              .eq("id", row.planned_position_id)
+              .maybeSingle()
+          : Promise.resolve({ data: null, error: null }),
+      ]);
+    if (tradeError || positionError) {
+      fail(
+        "Conviction tier claims",
+        `exact landed-claim evidence could not be checked: ${safeDiagnostic(tradeError ?? positionError)}`,
+      );
+      return false;
+    }
+    if (trade?.position_id || position?.entry_tx_sig === row.bot_tx_sig) {
+      landedWithExactEvidence += 1;
+    } else {
+      landedWithoutEvidence += 1;
+    }
+  }
+  if (unsafe.length > 0 || landedWithoutEvidence > 0) {
+    fail(
+      "Conviction tier claims",
+      `${unsafe.length + landedWithoutEvidence} unsafe tier claim(s) require manual chain/position reconciliation before restart`,
+    );
+    return false;
+  }
+  if (claimed.length > 0 || landedWithExactEvidence > 0) {
+    warn(
+      "Conviction tier claims",
+      `${claimed.length} pre-submit claim(s) will be released and ${landedWithExactEvidence} landed claim(s) have exact persistence evidence for safe startup reconciliation`,
+    );
+  } else {
+    pass("Conviction tier claims", "no unfinished live Conviction tier claim is recorded");
+  }
+
+  pass(
+    "Conviction Mode schema",
+    "configuration, state, rankings, transitions, and tiers are ready",
+  );
+  pass(
+    "Conviction Mode safety",
+    cfg.conviction_mode_enabled
+      ? `${String(cfg.conviction_trading_mode).toUpperCase()} selected; Conviction is the exclusive automatic entry strategy`
+      : "OFF — legacy entry behavior remains authoritative",
+  );
+  return true;
+}
+
 async function checkSellCoverageSchema(cfg: BotConfigRow): Promise<boolean> {
   const requiredConfigFields: Array<keyof BotConfigRow> = [
     "direct_target_sell_exit_mode",
@@ -622,7 +903,11 @@ async function main() {
   }
 
   const targets = Array.from(
-    new Set([cfg.target_wallet ?? "", ...(cfg.additional_target_wallets ?? [])].filter(Boolean)),
+    new Set(
+      [cfg.target_wallet ?? "", ...(cfg.additional_target_wallets ?? [])]
+        .map((wallet) => wallet.trim())
+        .filter(Boolean),
+    ),
   );
   pass("Config row", {
     user_id: redactedIdentifier(cfg.user_id),
@@ -644,6 +929,8 @@ async function main() {
     );
     return;
   }
+
+  if (!(await checkConvictionModeSchema(cfg, targets.length))) return;
 
   if (
     cfg.follower_seller_exit_enabled === undefined ||
@@ -699,6 +986,40 @@ async function main() {
     follower_seller_exit_pct: cfg.follower_seller_exit_pct,
     target_inactivity_exit_enabled: cfg.target_inactivity_exit_enabled,
     target_inactivity_hours: cfg.target_inactivity_hours,
+  });
+
+  line("Conviction Mode settings", {
+    conviction_mode_enabled: cfg.conviction_mode_enabled,
+    conviction_trading_mode: cfg.conviction_trading_mode,
+    conviction_rapid_follow_enabled: cfg.conviction_rapid_follow_enabled,
+    conviction_primary_window_minutes: cfg.conviction_primary_window_minutes,
+    conviction_score_threshold: cfg.conviction_score_threshold,
+    conviction_top_n: cfg.conviction_top_n,
+    conviction_min_commitment_usd: cfg.conviction_min_commitment_usd,
+    conviction_min_recent_net_inflow_usd: cfg.conviction_min_recent_net_inflow_usd,
+    conviction_min_velocity_usd_per_minute: cfg.conviction_min_velocity_usd_per_minute,
+    conviction_min_acceleration_ratio: cfg.conviction_min_acceleration_ratio,
+    conviction_min_converged_wallets: cfg.conviction_min_converged_wallets,
+    conviction_min_individual_buy_usd: cfg.conviction_min_individual_buy_usd,
+    conviction_market_cap_filter_enabled: cfg.conviction_market_cap_filter_enabled,
+    conviction_liquidity_filter_enabled: cfg.conviction_liquidity_filter_enabled,
+    conviction_token_age_filter_enabled: cfg.conviction_token_age_filter_enabled,
+    conviction_max_position_per_token_usd: cfg.conviction_max_position_per_token_usd,
+    conviction_distribution_sell_ratio: cfg.conviction_distribution_sell_ratio,
+    conviction_distribution_min_sells_usd: cfg.conviction_distribution_min_sells_usd,
+    conviction_distribution_wallet_count: cfg.conviction_distribution_wallet_count,
+    conviction_inactivity_minutes: cfg.conviction_inactivity_minutes,
+    conviction_rank_loss_grace_seconds: cfg.conviction_rank_loss_grace_seconds,
+    conviction_weight_total:
+      Number(cfg.conviction_weight_net_commitment) +
+      Number(cfg.conviction_weight_velocity) +
+      Number(cfg.conviction_weight_acceleration) +
+      Number(cfg.conviction_weight_convergence) +
+      Number(cfg.conviction_weight_persistence),
+    configured_tier_count: cfg.conviction_tier_buy_amounts_usd?.length ?? 0,
+    configured_tier_exposure_usd: cfg.conviction_tier_buy_amounts_usd
+      ?.map(Number)
+      .reduce((sum, amount) => sum + amount, 0),
   });
 
   line("Coordinated-wallet settings", {

@@ -111,7 +111,10 @@ test("observation rows contain the Strategy Lab contract and injected timing", (
   assert.equal(observation.source, "geyser");
   assert.equal(observation.event_at, "2023-11-14T22:13:20.000Z");
   assert.equal(observation.detected_at, "2023-11-14T22:13:20.100Z");
-  assert.deepEqual(observation.metadata, {});
+  assert.deepEqual(observation.metadata, {
+    verifiedSwap: false,
+    sellAttributionVerified: false,
+  });
 });
 
 test("reaction timing includes detection-to-decision and never understates execution", () => {
@@ -149,7 +152,71 @@ test("duplicate enrichment cannot erase a terminal decision or its timing", () =
   assert.equal(merged.execution_ms, 500);
   assert.equal(merged.relationship, "target");
   assert.equal(merged.source, "geyser");
-  assert.deepEqual(merged.metadata, { stage: "landed", rpc: true });
+  assert.deepEqual(merged.metadata, {
+    verifiedSwap: false,
+    sellAttributionVerified: false,
+    stage: "landed",
+    rpc: true,
+  });
+});
+
+test("weaker duplicate evidence cannot erase verified swap attribution", () => {
+  const verified = observationFromEvent(
+    {
+      ...swap,
+      verifiedSwap: true,
+      sellAttribution: {
+        verified: true,
+        tokenBalanceBefore: 10,
+        tokenBalanceAfter: 5,
+        soldFraction: 0.5,
+        proceedsMint: "So11111111111111111111111111111111111111112",
+        proceedsAmount: 1,
+        signerCount: 1,
+      },
+    },
+    { userId: USER_ID, targetWallet: "target-wallet", relationship: "target" },
+  );
+  const weaker = observationFromEvent(
+    { ...swap, source: "rpc", verifiedSwap: false, sellAttribution: undefined },
+    { userId: USER_ID, targetWallet: "target-wallet", relationship: "target" },
+  );
+
+  assert.deepEqual(mergeStrategyObservations(verified, weaker).metadata, {
+    verifiedSwap: true,
+    sellAttributionVerified: true,
+  });
+});
+
+test("richer duplicate keeps the true valuation and market observation timestamps", () => {
+  const early = observationFromEvent(
+    { ...swap, amountUsd: undefined },
+    { userId: USER_ID, targetWallet: "target-wallet", relationship: "target" },
+    { metadata: { valuationSource: "unavailable" } },
+    swap.timestampMs + 100,
+  );
+  const valuationObservedAtMs = swap.timestampMs + 60_000;
+  const marketDataObservedAtMs = valuationObservedAtMs + 250;
+  const richer = observationFromEvent(
+    { ...swap, source: "rpc", amountUsd: 100 },
+    { userId: USER_ID, targetWallet: "target-wallet", relationship: "target" },
+    {
+      amount_usd: 100,
+      market_cap_usd: 50_000,
+      metadata: {
+        valuationSource: "input-token-quote",
+        valuationObservedAtMs,
+        marketDataObservedAtMs,
+      },
+    },
+    valuationObservedAtMs,
+  );
+
+  const merged = mergeStrategyObservations(early, richer);
+  assert.equal(merged.detected_at, early.detected_at, "earliest detection remains diagnostic only");
+  assert.equal(merged.amount_usd, 100);
+  assert.equal(merged.metadata.valuationObservedAtMs, valuationObservedAtMs);
+  assert.equal(merged.metadata.marketDataObservedAtMs, marketDataObservedAtMs);
 });
 
 test("late feed copies cannot downgrade failed or submitted outcomes", () => {

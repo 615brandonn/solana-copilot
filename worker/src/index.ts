@@ -47,6 +47,19 @@ import {
   RecentEventDeduper,
 } from "./event-deduper.js";
 import { resolveTargetBuyValue } from "./target-buy-valuation.js";
+import { automaticEntryStrategy } from "./entry-strategy-router.js";
+import { evaluateConvictionLiveExecutionGate } from "./conviction-execution-policy.js";
+import {
+  ConvictionRuntime,
+  type ConvictionRuntimeAction,
+  type ConvictionTierLifecycleUpdate,
+  type StoredConvictionTier,
+} from "./conviction-runtime.js";
+import { createSupabaseConvictionStore } from "./conviction-supabase-store.js";
+import { convictionConfigFromBotConfig } from "./conviction-config.js";
+import { effectiveConvictionExposureUsd } from "./conviction-exposure.js";
+import { classifyConvictionSwap, classifyConvictionTransfers } from "./conviction-classifier.js";
+import type { ConvictionEvent } from "./conviction-engine.js";
 import {
   transferEventForRecipient,
   transferRecipients,
@@ -285,6 +298,8 @@ async function waitForConfig(userId: string): Promise<BotConfigRow> {
 async function main() {
   const USER_ID = env.HELIX_USER_ID;
   let cfg = await waitForConfig(USER_ID);
+  let entryConfigTransitioning = false;
+  let configRefreshRunning = false;
   let fundingReadiness = await checkFundingWalletReadiness(cfg.user_id, cfg.fixed_buy_usd);
 
   const feed: GeyserFeed = new GeyserFeed(async (event): Promise<void> => {
@@ -316,7 +331,10 @@ async function main() {
     });
   };
   const coordinatedBuys = new CoordinatedBuyTracker();
-  const entryExecutionQueue = new KeyedExecutionQueue();
+  // Every buy and sell for the same mint shares this queue. This prevents a
+  // scale-in from racing an exit and attaching newly bought tokens to a
+  // position that was closed while the buy was being built.
+  const tradeExecutionQueue = new KeyedExecutionQueue();
   const exitExecutionQueue = new KeyedExecutionQueue();
   const exitsInFlight = new Set<string>();
   const pendingTransfers = new PendingTransferBuffer({
@@ -532,6 +550,129 @@ async function main() {
   if (targetWallets.size === 0) throw new Error("config loaded without a target wallet");
   monitor.setBaseWatchedWallets(targetWallets);
 
+  const convictionStore = createSupabaseConvictionStore(db, cfg.user_id);
+  const convictionRuntime = new ConvictionRuntime(
+    convictionConfigFromBotConfig(cfg),
+    convictionStore,
+  );
+  let convictionConfigFingerprint = JSON.stringify(convictionConfigFromBotConfig(cfg));
+  if (automaticEntryStrategy(cfg) === "conviction") {
+    await convictionRuntime.initialize();
+  }
+
+  function convictionExposureIncludingShadow(mint: string, actualPositionUsd: number): number {
+    return effectiveConvictionExposureUsd({
+      tradingMode: cfg.conviction_trading_mode === "live" ? "live" : "shadow",
+      actualPositionUsd,
+      executedTiers: convictionRuntime.snapshot(mint)?.executedTiers ?? [],
+    });
+  }
+
+  async function syncConvictionPositionExposure(): Promise<void> {
+    const { data, error } = await db
+      .from("positions")
+      .select("token_mint,amount_remaining,entry_price_usd")
+      .eq("user_id", cfg.user_id)
+      .is("closed_at", null);
+    if (error) {
+      throw new Error(`Conviction position exposure sync failed: ${safeDiagnostic(error)}`);
+    }
+    for (const position of data ?? []) {
+      if (!convictionRuntime.snapshot(position.token_mint)) continue;
+      await convictionRuntime.setPositionUsd(
+        position.token_mint,
+        convictionExposureIncludingShadow(
+          position.token_mint,
+          Math.max(0, Number(position.amount_remaining)) *
+            Math.max(0, Number(position.entry_price_usd ?? 0)),
+        ),
+      );
+    }
+  }
+
+  async function reconcileConvictionTierClaims(): Promise<void> {
+    // Reconcile unfinished LIVE claims even when Conviction Mode was switched
+    // off before this restart. Otherwise the legacy strategy could resume on
+    // a mint whose Conviction submission is still unresolved.
+    const tiers = await convictionStore.loadTiers();
+    const transitionRecoveredTier = (
+      tier: StoredConvictionTier,
+      update: ConvictionTierLifecycleUpdate,
+    ) =>
+      automaticEntryStrategy(cfg) === "conviction"
+        ? convictionRuntime.transitionAction(tier, update)
+        : convictionStore.updateTier(tier.id, update);
+    for (const tier of tiers) {
+      if (tier.status === "claimed") {
+        await transitionRecoveredTier(tier, {
+          status: "failed_pre_submit",
+          errorCode: "recovered-pre-submit-claim",
+        });
+        continue;
+      }
+      if (tier.status === "submitted") {
+        await transitionRecoveredTier(tier, {
+          status: "uncertain",
+          errorCode: "worker-restarted-during-submission",
+        });
+        uncertainEntryMints.add(tier.tokenMint);
+        continue;
+      }
+      if (tier.status === "uncertain") {
+        uncertainEntryMints.add(tier.tokenMint);
+        continue;
+      }
+      if (tier.status !== "landed") continue;
+      if (!tier.botTxSig) {
+        uncertainEntryMints.add(tier.tokenMint);
+        log.error(
+          { mint: tier.tokenMint, tier: tier.tierNumber },
+          "landed Conviction tier has no transaction signature — coin quarantined",
+        );
+        continue;
+      }
+
+      const [{ data: trade, error: tradeError }, { data: position, error: positionError }] =
+        await Promise.all([
+          db
+            .from("trades")
+            .select("position_id")
+            .eq("user_id", cfg.user_id)
+            .eq("tx_sig", tier.botTxSig)
+            .maybeSingle(),
+          tier.plannedPositionId
+            ? db
+                .from("positions")
+                .select("id,entry_tx_sig")
+                .eq("user_id", cfg.user_id)
+                .eq("id", tier.plannedPositionId)
+                .maybeSingle()
+            : Promise.resolve({ data: null, error: null }),
+        ]);
+      if (tradeError || positionError) {
+        throw new Error(
+          `Conviction tier reconciliation failed: ${safeDiagnostic(tradeError ?? positionError)}`,
+        );
+      }
+      const recoveredPositionId =
+        trade?.position_id ?? (position?.entry_tx_sig === tier.botTxSig ? position.id : null);
+      if (recoveredPositionId) {
+        await transitionRecoveredTier(tier, {
+          status: "persisted",
+          botTxSig: tier.botTxSig,
+          positionId: recoveredPositionId,
+          errorCode: null,
+        });
+      } else {
+        uncertainEntryMints.add(tier.tokenMint);
+        log.error(
+          { mint: tier.tokenMint, tier: tier.tierNumber },
+          "landed Conviction tier lacks exact persistence evidence — coin quarantined",
+        );
+      }
+    }
+  }
+
   let lastStrategyRecorderErrorAt = 0;
   const strategyRecorder = new StrategyRecorder(
     async (rows) => {
@@ -645,34 +786,52 @@ async function main() {
 
     const closedAt = new Date().toISOString();
     const flatIds = new Set(confirmedFlat);
+    const positionsById = new Map((positions ?? []).map((position) => [position.id, position]));
     for (const reduction of confirmedReductions) {
+      const observedPosition = positionsById.get(reduction.id);
+      if (!observedPosition) continue;
       const isFlat = flatIds.has(reduction.id) || reduction.amountRemaining <= 1e-9;
-      const { error: updateError } = await db
-        .from("positions")
-        .update({
-          amount_remaining: isFlat ? 0 : reduction.amountRemaining,
-          closed_at: isFlat ? closedAt : null,
-        })
-        .eq("id", reduction.id)
-        .eq("user_id", cfg.user_id)
-        .is("closed_at", null);
-      if (updateError) {
-        throw new Error(`position reconciliation update failed: ${safeDiagnostic(updateError)}`);
-      }
-      if (isFlat) await releaseMonitoredPosition(reduction.id);
+      await tradeExecutionQueue.run(observedPosition.token_mint, async () => {
+        const { data: updated, error: updateError } = await db
+          .from("positions")
+          .update({
+            amount_remaining: isFlat ? 0 : reduction.amountRemaining,
+            closed_at: isFlat ? closedAt : null,
+          })
+          .eq("id", reduction.id)
+          .eq("user_id", cfg.user_id)
+          .eq("amount_remaining", Number(observedPosition.amount_remaining))
+          .is("closed_at", null)
+          .select("id")
+          .maybeSingle();
+        if (updateError) {
+          throw new Error(`position reconciliation update failed: ${safeDiagnostic(updateError)}`);
+        }
+        // A live buy/exit changed the row after the wallet snapshot. Its newer
+        // accounting wins; the next two confirmed snapshots can reconcile it.
+        if (!updated) return;
+        if (isFlat) await releaseMonitoredPosition(reduction.id);
+      });
     }
     for (const positionId of confirmedFlat) {
       if (confirmedReductions.some((row) => row.id === positionId)) continue;
-      const { error: updateError } = await db
-        .from("positions")
-        .update({ amount_remaining: 0, closed_at: closedAt })
-        .eq("id", positionId)
-        .eq("user_id", cfg.user_id)
-        .is("closed_at", null);
-      if (updateError) {
-        throw new Error(`position reconciliation update failed: ${safeDiagnostic(updateError)}`);
-      }
-      await releaseMonitoredPosition(positionId);
+      const observedPosition = positionsById.get(positionId);
+      if (!observedPosition) continue;
+      await tradeExecutionQueue.run(observedPosition.token_mint, async () => {
+        const { data: updated, error: updateError } = await db
+          .from("positions")
+          .update({ amount_remaining: 0, closed_at: closedAt })
+          .eq("id", positionId)
+          .eq("user_id", cfg.user_id)
+          .eq("amount_remaining", Number(observedPosition.amount_remaining))
+          .is("closed_at", null)
+          .select("id")
+          .maybeSingle();
+        if (updateError) {
+          throw new Error(`position reconciliation update failed: ${safeDiagnostic(updateError)}`);
+        }
+        if (updated) await releaseMonitoredPosition(positionId);
+      });
     }
     log.info(
       {
@@ -773,6 +932,7 @@ async function main() {
   // planned-position/signature match is released; wallet holdings are never
   // auto-adopted as Helix positions.
   await reconcileUnresolvedEntryClaims();
+  await reconcileConvictionTierClaims();
 
   // Rehydrate any positions still open from a previous worker run so we keep
   // monitoring their followers across restarts.
@@ -780,6 +940,7 @@ async function main() {
     id: string;
     token_mint: string;
     amount_remaining: number;
+    entry_price_usd: number | null;
     last_root_buy_wallet: string | null;
     entry_slot: number | null;
     entry_mode: string | null;
@@ -790,13 +951,22 @@ async function main() {
     db
       .from("positions")
       .select(
-        "id,token_mint,amount_remaining,last_root_buy_wallet,entry_slot,entry_mode,root_buy_count,opened_at,last_root_buy_at",
+        "id,token_mint,amount_remaining,entry_price_usd,last_root_buy_wallet,entry_slot,entry_mode,root_buy_count,opened_at,last_root_buy_at",
       )
       .eq("user_id", cfg.user_id)
       .is("closed_at", null),
   );
   for (const pos of openPositions ?? []) {
     if (Number(pos.amount_remaining) <= 0) continue;
+    if (convictionRuntime.snapshot(pos.token_mint)) {
+      await convictionRuntime.setPositionUsd(
+        pos.token_mint,
+        convictionExposureIncludingShadow(
+          pos.token_mint,
+          Number(pos.amount_remaining) * Math.max(0, Number(pos.entry_price_usd ?? 0)),
+        ),
+      );
+    }
     await monitor.onCopyBuy({
       positionId: pos.id,
       tokenMint: pos.token_mint,
@@ -807,6 +977,7 @@ async function main() {
       await linkTargetToPosition(pos.id, pos.last_root_buy_wallet, "recovered");
     }
     await backfillCoordinatedTargetLinks(pos);
+    await backfillConvictionTargetLinks(pos);
   }
   await monitor.reconcileFollowersFromDatabase();
 
@@ -880,12 +1051,34 @@ async function main() {
   }, 10_000);
 
   setInterval(async () => {
+    if (configRefreshRunning) return;
+    configRefreshRunning = true;
     try {
       const next = await loadConfig(cfg.user_id);
       if (!next?.target_wallet) return;
       const previousTargets = targetWallets;
       const nextTargets = new Set(configuredTargetWallets(next));
+      const previousEntryStrategy = automaticEntryStrategy(cfg);
+      const nextEntryStrategy = automaticEntryStrategy(next);
+      const nextConvictionConfig = convictionConfigFromBotConfig(next);
+      const nextConvictionFingerprint = JSON.stringify(nextConvictionConfig);
+      const targetsChanged =
+        Array.from(previousTargets).sort().join(",") !== Array.from(nextTargets).sort().join(",");
+      const convictionConfigChanged = nextConvictionFingerprint !== convictionConfigFingerprint;
+      entryConfigTransitioning =
+        previousEntryStrategy !== nextEntryStrategy ||
+        (nextEntryStrategy === "conviction" && (targetsChanged || convictionConfigChanged));
+
+      // Hydrate and atomically reconfigure the Conviction runtime before the
+      // new strategy/config becomes visible to event handlers. During this
+      // transition every automatic entry path fails closed, while exits and
+      // monitoring continue normally.
+      if (convictionConfigChanged && nextEntryStrategy === "conviction") {
+        await convictionRuntime.reconfigure(nextConvictionConfig);
+      }
+
       cfg = next;
+      targetWallets = nextTargets;
       monitor.setBaseWatchedWallets(nextTargets);
       for (const wallet of previousTargets) {
         if (nextTargets.has(wallet)) continue;
@@ -898,13 +1091,71 @@ async function main() {
         poller.watch(wallet);
         await feed.watch(wallet);
       }
-      targetWallets = nextTargets;
-      if (Array.from(previousTargets).sort().join(",") !== Array.from(nextTargets).sort().join(","))
+      if (convictionConfigChanged) {
+        // The optional module performs no database work while it is disabled.
+        // Its latest settings are still fingerprinted, and enabling it later
+        // hydrates the durable engine once with the complete current config.
+        convictionConfigFingerprint = nextConvictionFingerprint;
+        if (nextEntryStrategy === "conviction") {
+          await syncConvictionPositionExposure();
+        }
+      }
+      if (previousEntryStrategy !== nextEntryStrategy) {
+        log.info(
+          {
+            event:
+              nextEntryStrategy === "conviction"
+                ? "CONVICTION_MODE_ENABLED"
+                : "CONVICTION_MODE_DISABLED",
+            previousEntryStrategy,
+            nextEntryStrategy,
+            tradingMode: cfg.conviction_trading_mode ?? "shadow",
+          },
+          nextEntryStrategy === "conviction"
+            ? "Conviction Mode enabled — it is now the exclusive automatic entry strategy"
+            : "Conviction Mode disabled — the saved legacy entry strategy is restored",
+        );
+      }
+      if (targetsChanged)
         log.info({ targets: Array.from(nextTargets) }, "target wallet subscriptions updated");
     } catch (err) {
       log.error({ err: safeDiagnostic(err) }, "config refresh failed");
+    } finally {
+      entryConfigTransitioning = false;
+      configRefreshRunning = false;
     }
   }, 3000);
+
+  let convictionTickRunning = false;
+  setInterval(() => {
+    if (
+      convictionTickRunning ||
+      entryConfigTransitioning ||
+      automaticEntryStrategy(cfg) !== "conviction"
+    ) {
+      return;
+    }
+    convictionTickRunning = true;
+    convictionRuntime
+      .tick(Date.now())
+      .then((result) => {
+        if (result.persistedRankCount > 0) {
+          log.info(
+            {
+              refreshedTokenCount: result.refreshedTokenCount,
+              persistedRankCount: result.persistedRankCount,
+            },
+            "Conviction rolling windows refreshed during a quiet feed period",
+          );
+        }
+      })
+      .catch((err: unknown) =>
+        log.error({ err: safeDiagnostic(err) }, "Conviction periodic refresh failed safely"),
+      )
+      .finally(() => {
+        convictionTickRunning = false;
+      });
+  }, 30_000);
 
   setInterval(() => {
     log.info(
@@ -1215,9 +1466,15 @@ async function main() {
           metadata: { persistencePending: true },
         });
       }
-      const cur = await retryDb<{ amount_remaining: number } | null>(
-        "load position after exit",
-        () => db.from("positions").select("amount_remaining").eq("id", positionId).maybeSingle(),
+      const cur = await retryDb<{
+        amount_remaining: number;
+        entry_price_usd: number | null;
+      } | null>("load position after exit", () =>
+        db
+          .from("positions")
+          .select("amount_remaining,entry_price_usd")
+          .eq("id", positionId)
+          .maybeSingle(),
       );
       if (!cur) throw new Error(`position ${positionId} disappeared after exit transaction landed`);
       const newRemaining = Math.max(0, Number(cur.amount_remaining) - sellUi);
@@ -1242,6 +1499,15 @@ async function main() {
       await retryDb("save position after exit", () =>
         db.from("positions").update(update).eq("id", positionId),
       );
+      if (convictionRuntime.snapshot(mint)) {
+        await convictionRuntime.setPositionUsd(
+          mint,
+          convictionExposureIncludingShadow(
+            mint,
+            newRemaining * Math.max(0, Number(cur.entry_price_usd ?? 0)),
+          ),
+        );
+      }
       await retryDb("save exit trade", () =>
         db.from("trades").insert({
           user_id: cfg.user_id,
@@ -1302,8 +1568,9 @@ async function main() {
       markFollowerSellerExit?: boolean;
       mirroredSoldFraction?: number;
     } = {},
+    tradeLockHeld = false,
   ): Promise<ExecuteResult | null> {
-    return exitExecutionQueue.run(positionId, async () => {
+    const runClaimedExit = async () => {
       const normalizedPct = Math.min(100, Math.max(0, Number(sellPct)));
       if (normalizedPct <= 0 || exitsInFlight.has(positionId)) return null;
       const sourceWallet =
@@ -1463,7 +1730,15 @@ async function main() {
         });
         throw err;
       }
-    });
+    };
+    // Global lock order is always mint first, then position. A landed buy may
+    // inspect a buffered terminal outflow while already holding the mint lock;
+    // it acquires only the inner position lock. Normal exits can therefore
+    // never hold the position lock while waiting for that buy, avoiding AB/BA
+    // deadlocks while retaining cross-process protection in the DB claim.
+    return tradeLockHeld
+      ? exitExecutionQueue.run(positionId, runClaimedExit)
+      : tradeExecutionQueue.run(mint, () => exitExecutionQueue.run(positionId, runClaimedExit));
   }
 
   async function handle(event: FeedEvent): Promise<void> {
@@ -1471,13 +1746,40 @@ async function main() {
     // recorder timer and cannot delay the serial Geyser hot path.
     recordStrategyEvent(event);
     try {
-      if (event.kind === "transfer") return handleTransfer(event);
+      if (event.kind === "transfer") {
+        await handleTransfer(event);
+        await observeConvictionTransfers(event);
+        return;
+      }
       if (event.kind === "swap") {
         if (targetWallets.has(event.wallet) && event.side === "buy") {
           await handleTargetBuy(event);
           return;
         }
-        if (event.side === "sell") return handleFollowerSell(event);
+        if (event.side === "sell") {
+          // Conviction distribution state must see a linked target sell before
+          // a potentially slow existing exit runs. Observation failure never
+          // suppresses the independently configured sell/risk path.
+          let convictionObservationError: unknown;
+          if (targetWallets.has(event.wallet)) {
+            try {
+              await observeConvictionSell(event);
+            } catch (err) {
+              convictionObservationError = err;
+              log.warn(
+                { err: safeDiagnostic(err), mint: event.tokenMint },
+                "Conviction target-sell observation failed; exit handling will run before replay",
+              );
+            }
+          }
+          await handleFollowerSell(event);
+          // Keep the RPC cursor on this signature so a transient Conviction
+          // persistence/valuation failure can replay after the independent
+          // exit path has had its chance to act. Durable dedupe makes replay
+          // safe for both systems.
+          if (convictionObservationError) throw convictionObservationError;
+          return;
+        }
         log.info(
           {
             eventWallet: event.wallet,
@@ -1610,6 +1912,67 @@ async function main() {
     );
   }
 
+  async function backfillConvictionTargetLinks(position: {
+    id: string;
+    token_mint: string;
+  }): Promise<void> {
+    const { data: tier, error: tierError } = await db
+      .from("conviction_tiers")
+      .select("source_event_key")
+      .eq("user_id", cfg.user_id)
+      .eq("position_id", position.id)
+      .eq("trading_mode", "live")
+      .in("status", ["landed", "persisted"])
+      .order("tier_number", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (tierError) {
+      throw new Error(`Conviction target-link tier lookup failed: ${safeDiagnostic(tierError)}`);
+    }
+    if (!tier?.source_event_key) return;
+
+    const { data: sourceEvent, error: sourceError } = await db
+      .from("conviction_events")
+      .select("event_at")
+      .eq("user_id", cfg.user_id)
+      .eq("event_key", tier.source_event_key)
+      .maybeSingle();
+    if (sourceError) {
+      throw new Error(
+        `Conviction target-link source lookup failed: ${safeDiagnostic(sourceError)}`,
+      );
+    }
+    if (!sourceEvent?.event_at) return;
+
+    const { data: buys, error: buyError } = await db
+      .from("conviction_events")
+      .select("wallet,event_at")
+      .eq("user_id", cfg.user_id)
+      .eq("token_mint", position.token_mint)
+      .eq("classification", "DEX_BUY")
+      .eq("classification_reliable", true)
+      .lte("event_at", sourceEvent.event_at)
+      .order("event_at", { ascending: false })
+      .limit(1_000);
+    if (buyError) {
+      throw new Error(`Conviction target-link evidence lookup failed: ${safeDiagnostic(buyError)}`);
+    }
+    const evidence = new Map<string, string>();
+    for (const buy of buys ?? []) {
+      if (!targetWallets.has(buy.wallet) || evidence.has(buy.wallet)) continue;
+      evidence.set(buy.wallet, buy.event_at);
+    }
+    for (const [wallet, eventAt] of evidence) {
+      await linkTargetToPosition(position.id, wallet, "recovered", eventAt);
+    }
+    if (evidence.size > 0) {
+      log.info(
+        { positionId: position.id, recoveredTargetCount: evidence.size },
+        "Conviction target links restored from durable verified-buy evidence",
+      );
+    }
+  }
+
   async function recordOpenPositionTargetBuy(event: SwapEvent) {
     const { data: pos, error } = await db
       .from("positions")
@@ -1667,6 +2030,678 @@ async function main() {
     );
   }
 
+  function convictionEventIdentity(event: FeedEvent, suffix: string): string {
+    const transaction = event.txSig || `slot-${event.slot}`;
+    return `${event.kind}:${transaction}:${suffix}:${event.tokenMint}`;
+  }
+
+  function convictionEventMetadata(event: FeedEvent): Record<string, unknown> {
+    return {
+      txSig: event.txSig,
+      slot: event.slot,
+      source: event.source ?? "unknown",
+      delivery: event.delivery ?? "live",
+      blockTimeMs: event.blockTimeMs,
+      observedAtMs: event.observedAtMs ?? event.timestampMs,
+    };
+  }
+
+  async function convictionSellValueUsd(event: SwapEvent): Promise<number | undefined> {
+    const attribution = event.sellAttribution;
+    if (!attribution?.verified) return undefined;
+    const proceedsAmount = Number(attribution.proceedsAmount ?? 0);
+    if (proceedsAmount > 0 && attribution.proceedsMint) {
+      if (STABLECOIN_MINTS.has(attribution.proceedsMint)) return proceedsAmount;
+      const proceedsPrice = await priceUsd(attribution.proceedsMint);
+      if (proceedsPrice !== undefined) return proceedsAmount * proceedsPrice;
+    }
+    const soldPrice = await priceUsd(event.tokenMint);
+    if (soldPrice === undefined) return undefined;
+    const soldTokens = Math.max(0, Number(event.amountTokens));
+    return soldTokens > 0 ? soldTokens * soldPrice : undefined;
+  }
+
+  async function observeConvictionEvent(
+    event: ConvictionEvent,
+    feedEvent: FeedEvent,
+    actionable: boolean,
+  ): Promise<void> {
+    if (automaticEntryStrategy(cfg) !== "conviction") return;
+    let currentPositionUsd: number | undefined;
+    if (event.type === "DEX_BUY") {
+      const { data: openPosition, error } = await db
+        .from("positions")
+        .select("amount_remaining,entry_price_usd")
+        .eq("user_id", cfg.user_id)
+        .eq("token_mint", event.tokenMint)
+        .is("closed_at", null)
+        .limit(1)
+        .maybeSingle();
+      if (error) {
+        throw new Error(`Conviction exposure lookup failed: ${safeDiagnostic(error)}`);
+      }
+      const actualPositionUsd = openPosition
+        ? Math.max(0, Number(openPosition.amount_remaining)) *
+          Math.max(0, Number(openPosition.entry_price_usd ?? 0))
+        : 0;
+      currentPositionUsd = convictionExposureIncludingShadow(event.tokenMint, actualPositionUsd);
+    }
+    // A settings transition can complete while the authoritative exposure
+    // read is in flight. Never feed an event into a strategy that is no
+    // longer selected, and never let a transition-time event submit a tier.
+    if (automaticEntryStrategy(cfg) !== "conviction") return;
+    const result = await convictionRuntime.observe(event, {
+      globalEntriesEnabled: cfg.enabled === true,
+      actionable: actionable && !entryConfigTransitioning,
+      currentPositionUsd,
+    });
+    if (result.duplicate) return;
+
+    for (const transition of result.update.transitions) {
+      log.info(
+        {
+          event: "CONVICTION_STATE_CHANGE",
+          mint: transition.mint,
+          previousState: transition.previousState,
+          newState: transition.newState,
+          previousScore: transition.previousScore,
+          newScore: transition.newScore,
+          reasons: transition.reasons,
+        },
+        "Conviction token state changed",
+      );
+    }
+    for (const breakout of result.update.breakouts) {
+      log.info(
+        {
+          event: "CONVICTION_BREAKOUT",
+          mint: breakout.mint,
+          score: breakout.newScore,
+          netClusterInvestmentUsd: breakout.netClusterInvestmentUsd,
+          capitalVelocityUsdPerMinute: breakout.capitalVelocityUsdPerMinute,
+          walletConvergence: breakout.walletConvergence,
+          reasons: breakout.reasons,
+        },
+        "Conviction breakout detected",
+      );
+    }
+    if (result.action) {
+      await executeConvictionAction(result.action, feedEvent);
+    }
+  }
+
+  async function observeConvictionBuy(
+    event: SwapEvent,
+    meta: Awaited<ReturnType<typeof loadTokenMeta>>,
+    targetBuyUsd: number | undefined,
+    actionable: boolean,
+  ): Promise<void> {
+    const classification = classifyConvictionSwap(event, targetWallets);
+    const reliable = classification.reliable && targetBuyUsd !== undefined;
+    await observeConvictionEvent(
+      {
+        eventId: convictionEventIdentity(event, `${event.wallet}:buy`),
+        timestampMs: event.blockTimeMs ?? event.timestampMs,
+        wallet: event.wallet,
+        tokenMint: event.tokenMint,
+        type: reliable ? classification.classification : "UNKNOWN",
+        amountUsd: targetBuyUsd ?? 0,
+        amountTokens: Math.max(0, Number(event.amountTokens)),
+        symbol: meta.symbol,
+        marketCapUsd: meta.marketCapUsd,
+        liquidityUsd: meta.liquidityUsd,
+        tokenCreatedAtMs: meta.pairCreatedAtMs,
+        classificationReliable: reliable,
+        metadata: {
+          ...convictionEventMetadata(event),
+          side: "buy",
+          inferredRecipientCount: event.inferredRecipients?.length ?? 0,
+        },
+      },
+      event,
+      actionable,
+    );
+  }
+
+  async function observeConvictionSell(event: SwapEvent): Promise<void> {
+    if (automaticEntryStrategy(cfg) !== "conviction" || !targetWallets.has(event.wallet)) return;
+    const classification = classifyConvictionSwap(event, targetWallets);
+    const amountUsd = await convictionSellValueUsd(event);
+    const valuationObservedAtMs = Date.now();
+    const reliable = classification.reliable && amountUsd !== undefined;
+    if (amountUsd !== undefined) {
+      event.amountUsd = amountUsd;
+      recordStrategyEvent(event, {
+        amount_usd: amountUsd,
+        metadata: {
+          side: "sell",
+          verifiedSwap: event.verifiedSwap === true,
+          sellAttributionVerified: event.sellAttribution?.verified === true,
+          valuationSource: event.sellAttribution?.proceedsMint
+            ? "verified-proceeds"
+            : "sold-token-price",
+          proceedsMint: event.sellAttribution?.proceedsMint,
+          valuationObservedAtMs,
+        },
+      });
+    }
+    const meta = await loadTokenMeta(event.tokenMint);
+    const marketDataObservedAtMs = Date.now();
+    recordStrategyEvent(event, {
+      market_cap_usd: meta.marketCapUsd,
+      liquidity_usd: meta.liquidityUsd,
+      metadata: { marketDataObservedAtMs },
+    });
+    await observeConvictionEvent(
+      {
+        eventId: convictionEventIdentity(event, `${event.wallet}:sell`),
+        timestampMs: event.blockTimeMs ?? event.timestampMs,
+        wallet: event.wallet,
+        tokenMint: event.tokenMint,
+        type: reliable ? classification.classification : "UNKNOWN",
+        amountUsd: amountUsd ?? 0,
+        amountTokens: Math.max(0, Number(event.amountTokens)),
+        symbol: meta.symbol,
+        marketCapUsd: meta.marketCapUsd,
+        liquidityUsd: meta.liquidityUsd,
+        tokenCreatedAtMs: meta.pairCreatedAtMs,
+        classificationReliable: reliable,
+        metadata: {
+          ...convictionEventMetadata(event),
+          side: "sell",
+          proceedsMint: event.sellAttribution?.proceedsMint,
+          valuationObservedAtMs,
+          marketDataObservedAtMs,
+        },
+      },
+      event,
+      isFreshAutomaticAction(event, 15_000),
+    );
+  }
+
+  async function observeConvictionTransfers(event: TransferEvent): Promise<void> {
+    if (automaticEntryStrategy(cfg) !== "conviction") return;
+    const rows = classifyConvictionTransfers(event, targetWallets);
+    for (const row of rows) {
+      if (row.classification === "UNKNOWN") continue;
+      await observeConvictionEvent(
+        {
+          eventId: convictionEventIdentity(
+            event,
+            `${row.fromWallet}:${row.toWallet}:${row.classification}`,
+          ),
+          timestampMs: event.blockTimeMs ?? event.timestampMs,
+          wallet: targetWallets.has(row.fromWallet) ? row.fromWallet : row.toWallet,
+          tokenMint: event.tokenMint,
+          type: row.classification,
+          amountUsd: 0,
+          amountTokens: Math.max(0, Number(row.amountTokens)),
+          fromWallet: row.fromWallet,
+          toWallet: row.toWallet,
+          classificationReliable: row.reliable,
+          metadata: convictionEventMetadata(event),
+        },
+        event,
+        false,
+      );
+    }
+  }
+
+  async function executeConvictionAction(
+    action: ConvictionRuntimeAction,
+    sourceEvent: FeedEvent,
+  ): Promise<void> {
+    const event = sourceEvent.kind === "swap" ? sourceEvent : null;
+    if (!event || event.side !== "buy") {
+      await convictionRuntime.transitionAction(action.claim, {
+        status: "failed_pre_submit",
+        errorCode: "non-buy-conviction-action",
+      });
+      return;
+    }
+
+    await tradeExecutionQueue.run(event.tokenMint, async () => {
+      const monitoringGate = currentEntryMonitoringGate();
+      const initialGate = evaluateConvictionLiveExecutionGate({
+        strategy: automaticEntryStrategy(cfg),
+        tradingMode: cfg.conviction_trading_mode === "live" ? "live" : "shadow",
+        entriesEnabled: cfg.enabled === true,
+        monitoringBlocked: monitoringGate.blocked,
+        fresh: isFreshAutomaticAction(event, 15_000),
+        uncertainEntry: uncertainEntryMints.has(event.tokenMint),
+        existingExposureUsd: 0,
+        requestedBuyUsd: action.claim.amountUsd,
+        maxExposureUsd: Math.max(0, Number(cfg.conviction_max_position_per_token_usd)),
+      });
+      if (!initialGate.allowed) {
+        const reason = initialGate.reason;
+        await convictionRuntime.transitionAction(action.claim, {
+          status: "failed_pre_submit",
+          errorCode: reason,
+        });
+        log.warn(
+          { event: "CONVICTION_TRADE_SKIPPED", mint: event.tokenMint, reason },
+          "Conviction live tier cancelled at a final safety gate",
+        );
+        return;
+      }
+
+      const { data: openPosition, error: openPositionError } = await db
+        .from("positions")
+        .select(
+          "id,amount_tokens,amount_remaining,entry_price_usd,root_buy_count,entry_tx_sig,entry_slot,entry_mode",
+        )
+        .eq("user_id", cfg.user_id)
+        .eq("token_mint", event.tokenMint)
+        .is("closed_at", null)
+        .limit(1)
+        .maybeSingle();
+      if (openPositionError) {
+        await convictionRuntime.transitionAction(action.claim, {
+          status: "failed_pre_submit",
+          errorCode: safeDiagnostic(openPositionError),
+        });
+        throw new Error(
+          `Conviction open-position check failed: ${safeDiagnostic(openPositionError)}`,
+        );
+      }
+
+      const existingExposureUsd = openPosition
+        ? Math.max(
+            0,
+            Number(openPosition.amount_remaining) * Number(openPosition.entry_price_usd ?? 0),
+          )
+        : 0;
+      if (openPosition) {
+        const { data: activeSellClaim, error: activeSellClaimError } = await db
+          .from("sell_signal_claims")
+          .select("id")
+          .eq("position_id", openPosition.id)
+          .in("status", ["claimed", "submitted", "uncertain"])
+          .limit(1)
+          .maybeSingle();
+        if (activeSellClaimError) {
+          await convictionRuntime.transitionAction(action.claim, {
+            status: "failed_pre_submit",
+            errorCode: "sell-claim-safety-check-failed",
+          });
+          throw new Error(
+            `Conviction sell-claim safety check failed: ${safeDiagnostic(activeSellClaimError)}`,
+          );
+        }
+        if (activeSellClaim || exitsInFlight.has(openPosition.id)) {
+          await convictionRuntime.transitionAction(action.claim, {
+            status: "failed_pre_submit",
+            errorCode: "position-exit-in-progress",
+          });
+          await convictionRuntime.setPositionUsd(event.tokenMint, existingExposureUsd);
+          return;
+        }
+      }
+      const maxExposureUsd = Math.max(0, Number(cfg.conviction_max_position_per_token_usd));
+      const exposureGate = evaluateConvictionLiveExecutionGate({
+        strategy: automaticEntryStrategy(cfg),
+        tradingMode: cfg.conviction_trading_mode === "live" ? "live" : "shadow",
+        entriesEnabled: cfg.enabled === true,
+        monitoringBlocked: currentEntryMonitoringGate().blocked,
+        fresh: isFreshAutomaticAction(event, 15_000),
+        uncertainEntry: uncertainEntryMints.has(event.tokenMint),
+        existingExposureUsd,
+        requestedBuyUsd: action.claim.amountUsd,
+        maxExposureUsd,
+      });
+      if (!exposureGate.allowed) {
+        await convictionRuntime.transitionAction(action.claim, {
+          status: "failed_pre_submit",
+          errorCode: exposureGate.reason,
+        });
+        await convictionRuntime.setPositionUsd(event.tokenMint, existingExposureUsd);
+        return;
+      }
+
+      let secret: string | null;
+      try {
+        secret = await loadSigner(cfg.user_id);
+      } catch (err) {
+        await convictionRuntime.transitionAction(action.claim, {
+          status: "failed_pre_submit",
+          errorCode: safeDiagnostic(err),
+        });
+        throw err;
+      }
+      if (!secret) {
+        await convictionRuntime.transitionAction(action.claim, {
+          status: "failed_pre_submit",
+          errorCode: "funding-key-unavailable",
+        });
+        return;
+      }
+      const solPrice = await priceUsd(WSOL);
+      if (solPrice === undefined) {
+        await convictionRuntime.transitionAction(action.claim, {
+          status: "failed_pre_submit",
+          errorCode: "sol-price-unavailable",
+        });
+        return;
+      }
+      const amountLamports = Math.floor((action.claim.amountUsd / solPrice) * 1e9);
+      if (!Number.isSafeInteger(amountLamports) || amountLamports <= 0) {
+        await convictionRuntime.transitionAction(action.claim, {
+          status: "failed_pre_submit",
+          errorCode: "invalid-buy-size",
+        });
+        return;
+      }
+
+      // Keep the tier in `claimed` while the executor performs local quote and
+      // transaction construction. The executor's last callback atomically
+      // revalidates the live score/rank/distribution state and advances the
+      // durable row to `submitted` immediately before its first network send.
+      if (
+        automaticEntryStrategy(cfg) !== "conviction" ||
+        entryConfigTransitioning ||
+        cfg.conviction_trading_mode !== "live" ||
+        !cfg.enabled ||
+        currentEntryMonitoringGate().blocked
+      ) {
+        await convictionRuntime.transitionAction(action.claim, {
+          status: "failed_pre_submit",
+          errorCode: "final-safety-gate",
+        });
+        return;
+      }
+
+      uncertainEntryMints.add(event.tokenMint);
+      log.info(
+        {
+          event: "CONVICTION_TRADE_EXECUTED",
+          phase: "pre-submit",
+          mint: event.tokenMint,
+          tier: action.claim.tierNumber,
+          amountUsd: action.claim.amountUsd,
+          score: action.snapshot.convictionScore,
+          route: cfg.execution_route,
+        },
+        "preparing live Conviction tier buy; final runtime authorization is still required",
+      );
+
+      let result: ExecuteResult;
+      try {
+        result = await executeSwap({
+          signerSecret: secret,
+          inputMint: WSOL,
+          outputMint: event.tokenMint,
+          amountLamports,
+          slippageBps: 300,
+          route: cfg.execution_route,
+          jitoTipSol: cfg.jito_tip_sol,
+          outputDecimals: event.decimals,
+          beforeSubmit: async () => {
+            if (
+              cfg.enabled !== true ||
+              entryConfigTransitioning ||
+              automaticEntryStrategy(cfg) !== "conviction" ||
+              cfg.conviction_trading_mode !== "live" ||
+              currentEntryMonitoringGate().blocked
+            ) {
+              return false;
+            }
+            const authorization = await convictionRuntime.authorizeLiveClaimForSubmission(
+              action.claim,
+              {
+                nowMs: Date.now(),
+                globalEntriesEnabled: cfg.enabled === true,
+                currentPositionUsd: existingExposureUsd,
+                maxSourceEventAgeMs: 15_000,
+              },
+            );
+            if (!authorization.allowed) {
+              log.warn(
+                {
+                  event: "CONVICTION_TRADE_SKIPPED",
+                  mint: event.tokenMint,
+                  tier: action.claim.tierNumber,
+                  reasons: authorization.reasons,
+                },
+                "Conviction tier no longer qualifies at the network submission boundary",
+              );
+            }
+            // The durable claimed -> submitted update above is asynchronous.
+            // Re-read process-local gates after it completes so Entries OFF,
+            // a mode change, stale source data, or monitoring degradation that
+            // happened during the database round trip still cancels before the
+            // executor begins its network request.
+            return (
+              authorization.allowed &&
+              cfg.enabled === true &&
+              !entryConfigTransitioning &&
+              automaticEntryStrategy(cfg) === "conviction" &&
+              cfg.conviction_trading_mode === "live" &&
+              isFreshAutomaticAction(event, 15_000) &&
+              !currentEntryMonitoringGate().blocked
+            );
+          },
+        });
+      } catch (err) {
+        const disposition = entryClaimFailureDisposition(err);
+        await convictionRuntime.transitionAction(action.claim, {
+          status: disposition.status,
+          botTxSig: disposition.botTxSig,
+          errorCode: safeDiagnostic(err),
+        });
+        if (disposition.status !== "uncertain") uncertainEntryMints.delete(event.tokenMint);
+        throw err;
+      }
+
+      await convictionRuntime.transitionAction(action.claim, {
+        status: "landed",
+        botTxSig: result.txSig,
+        receivedTokens: result.outUiAmount,
+      });
+      const receivedUi = Math.max(0, Number(result.outUiAmount ?? 0));
+      const entryPrice =
+        receivedUi > 0
+          ? action.claim.amountUsd / receivedUi
+          : ((await priceUsd(event.tokenMint)) ?? 0);
+      const positionId = openPosition?.id ?? action.claim.plannedPositionId;
+      if (!positionId) {
+        throw new SubmissionUncertainError({
+          route: result.route,
+          txSig: result.txSig,
+          detail: "Conviction buy landed without a planned position identity",
+        });
+      }
+      const newAmount = Number(openPosition?.amount_remaining ?? 0) + receivedUi;
+      const newTotalAmount = Number(openPosition?.amount_tokens ?? 0) + receivedUi;
+      const newCostBasis = existingExposureUsd + action.claim.amountUsd;
+      const blendedEntryPrice = newAmount > 0 ? newCostBasis / newAmount : entryPrice;
+      const targetBuyAt = new Date(event.timestampMs).toISOString();
+      const { data: savedPosition, error: positionError } = await db
+        .from("positions")
+        .upsert(
+          {
+            id: positionId,
+            user_id: cfg.user_id,
+            token_mint: event.tokenMint,
+            entry_price_usd: blendedEntryPrice,
+            amount_tokens: newTotalAmount,
+            amount_remaining: newAmount,
+            decimals: event.decimals,
+            entry_tx_sig: openPosition?.entry_tx_sig ?? result.txSig,
+            entry_slot: openPosition?.entry_slot ?? event.slot,
+            // Conviction is an entry selector, not an exit-mode rewrite. Keep
+            // the original exit semantics when scaling an existing position.
+            entry_mode: openPosition?.entry_mode ?? "regular",
+            last_root_buy_at: targetBuyAt,
+            last_root_buy_wallet: event.wallet,
+            root_buy_count: Math.max(
+              1,
+              Number(openPosition?.root_buy_count ?? 0),
+              action.snapshot.walletsThatBought.length,
+            ),
+          },
+          { onConflict: "id" },
+        )
+        .select("id")
+        .maybeSingle();
+      if (positionError || !savedPosition) {
+        throw new SubmissionUncertainError({
+          route: result.route,
+          txSig: result.txSig,
+          detail: `Conviction buy landed but position persistence failed: ${safeDiagnostic(positionError ?? "missing position")}`,
+        });
+      }
+
+      // The trade row is the exact crash-recovery evidence for scale-ins,
+      // whose transaction signature is intentionally not the position's
+      // original entry signature. Save it before fallible monitoring/linkage
+      // side effects and before marking the tier persisted.
+      const { data: priorTrade, error: priorTradeError } = await db
+        .from("trades")
+        .select("position_id")
+        .eq("user_id", cfg.user_id)
+        .eq("tx_sig", result.txSig)
+        .eq("side", "buy")
+        .maybeSingle();
+      if (priorTradeError) {
+        throw new SubmissionUncertainError({
+          route: result.route,
+          txSig: result.txSig,
+          detail: `Conviction buy landed but trade recovery lookup failed: ${safeDiagnostic(priorTradeError)}`,
+        });
+      }
+      if (priorTrade && priorTrade.position_id !== savedPosition.id) {
+        throw new SubmissionUncertainError({
+          route: result.route,
+          txSig: result.txSig,
+          detail: "Conviction buy transaction is already linked to a different position",
+        });
+      }
+      if (!priorTrade) {
+        const { error: tradeError } = await db.from("trades").insert({
+          user_id: cfg.user_id,
+          position_id: savedPosition.id,
+          side: "buy",
+          token_mint: event.tokenMint,
+          amount_tokens: receivedUi,
+          amount_usd: action.claim.amountUsd,
+          tx_sig: result.txSig,
+          reason: `Conviction Mode tier ${action.claim.tierNumber ?? action.claim.tierId}`,
+          latency_ms: result.latencyMs,
+          route: result.route,
+        });
+        if (tradeError) {
+          const { data: recoveredTrade, error: recoveryError } = await db
+            .from("trades")
+            .select("position_id")
+            .eq("user_id", cfg.user_id)
+            .eq("tx_sig", result.txSig)
+            .eq("side", "buy")
+            .maybeSingle();
+          if (recoveryError || recoveredTrade?.position_id !== savedPosition.id) {
+            throw new SubmissionUncertainError({
+              route: result.route,
+              txSig: result.txSig,
+              detail: `Conviction buy landed but its trade record could not be confirmed: ${safeDiagnostic(recoveryError ?? tradeError)}`,
+            });
+          }
+        }
+      }
+
+      await convictionRuntime.transitionAction(action.claim, {
+        status: "landed",
+        botTxSig: result.txSig,
+        positionId: savedPosition.id,
+        receivedTokens: receivedUi,
+      });
+
+      // Make the landed buy's exposure authoritative before replaying any
+      // buffered terminal outflow. A nested exit updates exposure again; it
+      // must be the last writer instead of being overwritten below with this
+      // pre-exit cost basis.
+      await convictionRuntime.setPositionUsd(event.tokenMint, newCostBasis);
+
+      await monitor.onCopyBuy({
+        positionId: savedPosition.id,
+        tokenMint: event.tokenMint,
+        targetWallet: event.wallet,
+        entrySlot: event.slot > 0 ? event.slot : undefined,
+      });
+      for (const wallet of action.snapshot.walletsThatBought) {
+        if (targetWallets.has(wallet)) {
+          // Conviction selects the entry; the target-position relationship is
+          // still an ordinary source-entry link used by the existing exits.
+          await linkTargetToPosition(savedPosition.id, wallet, "entry", targetBuyAt);
+        }
+      }
+      if (!openPosition) {
+        for (const transfer of pendingTransfers.drainForLandedBuy(event.tokenMint, event.slot)) {
+          const classifiedPending = await classifyTransferRecipients(transfer);
+          for (const recipient of classifiedPending) {
+            if (!recipient.track) continue;
+            await monitor.recordTransfer(
+              savedPosition.id,
+              recipient.wallet,
+              recipient.amountTokens,
+              {
+                hopDepth: 1,
+                parentWallet: transfer.from,
+                txSig: transfer.txSig,
+                slot: transfer.slot,
+                triggerEligible: Boolean(recipient.triggerEligible),
+              },
+            );
+          }
+          await handleTargetTerminalOutflows(
+            transfer,
+            {
+              positionId: savedPosition.id,
+              tokenMint: event.tokenMint,
+              targetWallet: event.wallet,
+              entrySlot: event.slot > 0 ? event.slot : undefined,
+            },
+            classifiedPending,
+            true,
+          );
+        }
+      }
+      await convictionRuntime.transitionAction(action.claim, {
+        status: "persisted",
+        botTxSig: result.txSig,
+        positionId: savedPosition.id,
+        receivedTokens: receivedUi,
+      });
+      uncertainEntryMints.delete(event.tokenMint);
+
+      const { error: tradedError } = await db
+        .from("traded_tokens")
+        .upsert({ user_id: cfg.user_id, token_mint: event.tokenMint });
+      if (tradedError) {
+        log.error(
+          { err: safeDiagnostic(tradedError), mint: event.tokenMint },
+          "Conviction buy landed but traded-token history save failed",
+        );
+      }
+      recordStrategyDecision(
+        event,
+        "copied",
+        `live Conviction tier ${action.claim.tierNumber ?? action.claim.tierId} landed`,
+        {
+          position_id: savedPosition.id,
+          bot_tx_sig: result.txSig,
+          execution_ms: result.latencyMs,
+          reaction_ms: strategyReactionMs(event, Date.now(), result.latencyMs),
+          metadata: {
+            entryMode: "conviction",
+            tier: action.claim.tierNumber,
+            score: action.snapshot.convictionScore,
+            configuredBuyUsd: action.claim.amountUsd,
+          },
+        },
+      );
+    });
+  }
+
   async function handleTargetBuy(event: SwapEvent) {
     if (event.tokenMint === WSOL || STABLECOIN_MINTS.has(event.tokenMint)) {
       recordStrategyDecision(event, "skipped", "output is SOL or a stablecoin");
@@ -1683,7 +2718,8 @@ async function main() {
     const firstBuy = await targetFirstBuyAccounting.getOrCreate(dedupeKey, () =>
       observeTargetFirstBuy(event.wallet, event.tokenMint),
     );
-    if (!isFreshAutomaticAction(event, 15_000)) {
+    const freshForAutomaticEntry = isFreshAutomaticAction(event, 15_000);
+    if (!freshForAutomaticEntry && automaticEntryStrategy(cfg) !== "conviction") {
       recordStrategyDecision(event, "tracked", "historical target buy recovered without entry", {
         metadata: {
           delivery: event.delivery ?? "live",
@@ -1713,6 +2749,10 @@ async function main() {
           "skipped",
           "inferred output recipient is program controlled, off-curve, or unavailable",
         );
+        if (automaticEntryStrategy(cfg) === "conviction") {
+          const meta = await loadTokenMeta(event.tokenMint);
+          await observeConvictionBuy(event, meta, undefined, false);
+        }
         return;
       }
     }
@@ -1721,6 +2761,7 @@ async function main() {
       quoteTokenSpendUsd,
       solPriceUsd: () => priceUsd(WSOL),
     });
+    const valuationObservedAtMs = Date.now();
     const targetBuyUsd = valuation.amountUsd;
     event.amountUsd = targetBuyUsd;
     recordStrategyEvent(event, {
@@ -1728,6 +2769,7 @@ async function main() {
       metadata: {
         valuationSource: valuation.source,
         inputMint: event.spentToken?.mint,
+        valuationObservedAtMs,
       },
     });
     log.info(
@@ -1742,9 +2784,38 @@ async function main() {
       "target buy value resolved",
     );
 
-    const requiresKnownValue = cfg.coordinated_mode_enabled
-      ? true
-      : Number(cfg.min_target_buy_usd) > 0;
+    const entryStrategy = automaticEntryStrategy(cfg);
+    if (entryStrategy === "conviction") {
+      const meta = await loadTokenMeta(event.tokenMint);
+      const marketDataObservedAtMs = Date.now();
+      const actionable = freshForAutomaticEntry;
+      await observeConvictionBuy(event, meta, targetBuyUsd, actionable);
+      recordStrategyDecision(
+        event,
+        "tracked",
+        targetBuyUsd === undefined
+          ? "Conviction observed an unvalued target buy; no automatic tier is eligible"
+          : cfg.conviction_trading_mode === "live"
+            ? "Conviction Mode evaluated this target buy in live mode"
+            : "Conviction Mode evaluated this target buy in shadow mode; no transaction sent",
+        {
+          market_cap_usd: meta.marketCapUsd,
+          liquidity_usd: meta.liquidityUsd,
+          amount_usd: targetBuyUsd,
+          metadata: {
+            entryMode: "conviction",
+            tradingMode: cfg.conviction_trading_mode,
+            actionable,
+            valuationObservedAtMs,
+            marketDataObservedAtMs,
+          },
+        },
+      );
+      return;
+    }
+
+    const requiresKnownValue =
+      entryStrategy === "coordinated" ? true : Number(cfg.min_target_buy_usd) > 0;
     if (requiresKnownValue && targetBuyUsd === undefined) {
       log.info(
         { wallet: event.wallet, mint: event.tokenMint, txSig: event.txSig },
@@ -1782,6 +2853,14 @@ async function main() {
     targetBuyUsd: number | undefined,
     firstBuy: boolean,
   ) {
+    const entryStrategy = automaticEntryStrategy(cfg);
+    if (entryStrategy === "conviction") {
+      log.warn(
+        { mint: event.tokenMint },
+        "legacy target-buy path blocked by the exclusive Conviction strategy router",
+      );
+      return;
+    }
     if (!cfg.enabled) {
       log.info(
         { wallet: event.wallet, mint: event.tokenMint },
@@ -1791,7 +2870,7 @@ async function main() {
       return;
     }
 
-    if (!cfg.coordinated_mode_enabled) {
+    if (entryStrategy === "regular") {
       await tryCopyBuy(event, "target copy buy", {
         entryMode: "regular",
         firstBuy,
@@ -1977,6 +3056,7 @@ async function main() {
     ev: TransferEvent,
     ctx: { positionId: string; tokenMint: string; targetWallet: string; entrySlot?: number },
     recipients: ClassifiedTransferRecipient[],
+    tradeLockHeld = false,
   ) {
     const terminalRecipients = recipients.filter((recipient) => !recipient.track);
     if (terminalRecipients.length === 0) return;
@@ -2073,6 +3153,8 @@ async function main() {
       "target_terminal_outflow",
       ev,
       "high-risk linked target custody-transfer response (deposit is not proof of sale)",
+      {},
+      tradeLockHeld,
     );
   }
 
@@ -2468,6 +3550,14 @@ async function main() {
     reason = "target copy buy",
     options: CopyBuyOptions,
   ): Promise<string | null> {
+    if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== options.entryMode) {
+      recordStrategyDecision(
+        event,
+        "skipped",
+        "automatic entry strategy changed before this buy could be evaluated",
+      );
+      return null;
+    }
     if (!cfg.enabled) {
       recordStrategyDecision(event, "skipped", "new entries disabled");
       return null;
@@ -2485,7 +3575,7 @@ async function main() {
       );
       return null;
     }
-    return entryExecutionQueue.run(event.tokenMint, () => tryCopyBuyLocked(event, reason, options));
+    return tradeExecutionQueue.run(event.tokenMint, () => tryCopyBuyLocked(event, reason, options));
   }
 
   async function tryCopyBuyLocked(
@@ -2493,6 +3583,14 @@ async function main() {
     reason: string,
     options: CopyBuyOptions,
   ): Promise<string | null> {
+    if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== options.entryMode) {
+      log.info(
+        { mint: event.tokenMint, expectedStrategy: options.entryMode },
+        "entry cancelled after queue wait — automatic strategy changed",
+      );
+      recordStrategyDecision(event, "skipped", "automatic entry strategy changed while queued");
+      return null;
+    }
     if (!cfg.enabled) {
       log.info(
         { mint: event.tokenMint, txSig: event.txSig },
@@ -2569,6 +3667,7 @@ async function main() {
     }
 
     const meta = await loadTokenMeta(event.tokenMint);
+    const marketDataObservedAtMs = Date.now();
     const metaPatch: StrategyObservationPatch = {
       market_cap_usd: meta.marketCapUsd,
       liquidity_usd: meta.liquidityUsd,
@@ -2578,6 +3677,7 @@ async function main() {
         pairCreatedAtMs: meta.pairCreatedAtMs,
         isPumpFun: meta.isPumpFun,
         firstBuy: options.firstBuy,
+        marketDataObservedAtMs,
       },
     };
     recordStrategyEvent(event, metaPatch);
@@ -2670,6 +3770,15 @@ async function main() {
         );
         return null;
       }
+      if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== options.entryMode) {
+        recordStrategyDecision(
+          event,
+          "skipped",
+          "automatic entry strategy changed before the durable claim",
+          metaPatch,
+        );
+        return null;
+      }
 
       const entryClaim = await claimEntrySubmission(event, options.entryMode, amountLamports);
       if (!entryClaim) {
@@ -2692,15 +3801,21 @@ async function main() {
       // monitoring health may have changed during those awaits, so re-check at
       // the final boundary with no intervening await before executeSwap starts.
       const finalSubmissionGate = currentEntryMonitoringGate();
-      if (!cfg.enabled || finalSubmissionGate.blocked) {
-        const gateReason = !cfg.enabled
-          ? "Entries turned off after the durable claim"
-          : `monitoring became unsafe after the durable claim: ${finalSubmissionGate.reasons.join("; ")}`;
+      const strategyChangedAfterClaim =
+        entryConfigTransitioning || automaticEntryStrategy(cfg) !== options.entryMode;
+      if (!cfg.enabled || finalSubmissionGate.blocked || strategyChangedAfterClaim) {
+        const gateReason = strategyChangedAfterClaim
+          ? "automatic entry strategy changed after the durable claim"
+          : !cfg.enabled
+            ? "Entries turned off after the durable claim"
+            : `monitoring became unsafe after the durable claim: ${finalSubmissionGate.reasons.join("; ")}`;
         await updateEntryClaim(entryClaim.id, {
           status: "failed_pre_submit",
-          error_code: !cfg.enabled
-            ? "entries-disabled-after-claim"
-            : "monitoring-degraded-after-claim",
+          error_code: strategyChangedAfterClaim
+            ? "strategy-changed-after-claim"
+            : !cfg.enabled
+              ? "entries-disabled-after-claim"
+              : "monitoring-degraded-after-claim",
         });
         uncertainEntryMints.delete(event.tokenMint);
         recordStrategyDecision(event, "skipped", gateReason, metaPatch);
@@ -2742,6 +3857,11 @@ async function main() {
           route: cfg.execution_route,
           jitoTipSol: cfg.jito_tip_sol,
           outputDecimals: event.decimals,
+          beforeSubmit: () =>
+            cfg.enabled === true &&
+            !entryConfigTransitioning &&
+            automaticEntryStrategy(cfg) === options.entryMode &&
+            !currentEntryMonitoringGate().blocked,
         });
       } catch (err) {
         const disposition = entryClaimFailureDisposition(err);
@@ -2911,6 +4031,7 @@ async function main() {
             entrySlot: event.slot > 0 ? event.slot : undefined,
           },
           classifiedPending,
+          true,
         );
       }
       log.info(
