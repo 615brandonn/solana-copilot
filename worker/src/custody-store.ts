@@ -151,6 +151,16 @@ function metadata(event: PersistedCustodyEvent): Record<string, unknown> {
   };
 }
 
+const RAW_DIGITS = /^[0-9]+$/;
+
+function isRawString(value: unknown): value is string {
+  return typeof value === "string" && RAW_DIGITS.test(value.trim());
+}
+
+
+
+
+
 export function createSupabaseCustodyStore(client: SupabaseClient, userId: string): CustodyStore {
   const call = async (
     name: string,
@@ -194,6 +204,24 @@ export function createSupabaseCustodyStore(client: SupabaseClient, userId: strin
     },
 
     recordTransfer(event, recipients) {
+      // The database treats raw balance evidence as all-or-nothing across the
+      // entire payload (sender, chain, and every recipient). The feed can only
+      // supply chain raws when the retained balance is exact, so a partial set
+      // is possible here — and sending one makes record_custody_transfer raise
+      // 'same-transaction acquisition raw evidence is incomplete' on every
+      // retry, wedging the cursor. If the set is incomplete, drop ALL raw
+      // fields and let the event validate through the decimal path instead.
+      const rawEvidenceComplete =
+        isRawString(event.senderPreRaw) &&
+        isRawString(event.senderPostRaw) &&
+        (event.sameTransactionAcquisition !== true ||
+          (isRawString(event.chainSenderPreRaw) && isRawString(event.chainSenderPostRaw))) &&
+        recipients.every(
+          (recipient) =>
+            isRawString(recipient.amountRaw) &&
+            isRawString(recipient.recipientPreRaw) &&
+            isRawString(recipient.recipientPostRaw),
+        );
       return call("record_custody_transfer", {
         p_user_id: userId,
         p_token_mint: event.tokenMint,
@@ -205,11 +233,11 @@ export function createSupabaseCustodyStore(client: SupabaseClient, userId: strin
         p_recipients: recipients.map((recipient) => ({
           wallet: recipient.wallet,
           amountTokens: recipient.amountTokens,
-          amountRaw: recipient.amountRaw ?? null,
+          amountRaw: rawEvidenceComplete ? recipient.amountRaw : null,
           recipientPreAmount: recipient.recipientPreAmount ?? null,
           recipientPostAmount: recipient.recipientPostAmount ?? null,
-          recipientPreRaw: recipient.recipientPreRaw ?? null,
-          recipientPostRaw: recipient.recipientPostRaw ?? null,
+          recipientPreRaw: rawEvidenceComplete ? (recipient.recipientPreRaw ?? null) : null,
+          recipientPostRaw: rawEvidenceComplete ? (recipient.recipientPostRaw ?? null) : null,
           watchable: recipient.watchable,
           inferredType: recipient.inferredType,
           inferredLabel: recipient.inferredLabel,
@@ -221,13 +249,14 @@ export function createSupabaseCustodyStore(client: SupabaseClient, userId: strin
           ...metadata(event),
           senderPreAmount: event.senderPreAmount,
           senderPostAmount: event.senderPostAmount,
-          senderPreRaw: event.senderPreRaw,
-          senderPostRaw: event.senderPostRaw,
+          senderPreRaw: rawEvidenceComplete ? event.senderPreRaw : undefined,
+          senderPostRaw: rawEvidenceComplete ? event.senderPostRaw : undefined,
           sameTransactionAcquisition: event.sameTransactionAcquisition === true,
           chainSenderPreAmount: event.chainSenderPreAmount,
           chainSenderPostAmount: event.chainSenderPostAmount,
-          chainSenderPreRaw: event.chainSenderPreRaw,
-          chainSenderPostRaw: event.chainSenderPostRaw,
+          chainSenderPreRaw: rawEvidenceComplete ? event.chainSenderPreRaw : undefined,
+          chainSenderPostRaw: rawEvidenceComplete ? event.chainSenderPostRaw : undefined,
+        },
         },
       });
     },
