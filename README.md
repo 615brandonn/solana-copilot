@@ -86,6 +86,32 @@ before restarting the worker. Fresh installations can run `supabase/schema.sql`,
 which already contains the same schema. Applying the migration does not enable
 Conviction Mode or Entries.
 
+### Optional Custody Journey observer
+
+Custody Journey runs as a separate observation-only VPS process. It starts on
+verified configured-target buys even when Entries is off, follows conservatively
+attributed balances across split and merged wallet transfers, records strict
+verified sells, and builds destination/journey leaderboards. It never imports
+the trade executor, reads the funding key, changes a position, or participates
+in the trading worker's health gate.
+
+The observer applies one ordered, confirmed-RPC timeline and keeps one active
+campaign per user and token mint. Later verified target buys extend that
+campaign while its immutable event graph preserves each transaction and split.
+Verified swap seeding currently covers Jupiter v6, Pump, and PumpSwap; other
+protocols remain visible only after a dedicated, fail-closed decoder is added.
+RPC monitoring follows wallet-address transaction history. A delegated token
+account action that omits the owner address can remain outside that history;
+the dashboard discloses this limitation instead of claiming exhaustive chain
+coverage.
+
+Existing deployments must run the additive
+`supabase/custody-journey-migration.sql`, build the worker, and start
+`dist/custody-index.js` separately. The feature installs OFF. Transfers into
+exchanges, bridges, vaults, or other opaque custody are shown as tracking
+boundaries—not automatically labeled as sales—and inferred wallet identities
+are clearly shown as candidates unless confirmed or manually labeled.
+
 ## Security notes
 
 - Your funding private key is sent over HTTPS to the dashboard's server

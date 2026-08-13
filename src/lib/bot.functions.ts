@@ -2,6 +2,20 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import type { BotConfig } from "./bot-config";
 import { BotConfigSchema, FundingKeySchema } from "./bot.schemas";
+import { isSolanaPublicKey } from "./base58";
+import {
+  buildCustodyDashboardData,
+  buildCustodyJourneyDetail,
+  custodyWindowSince,
+  type CustodyDashboardData,
+  type CustodyCoverageReasonRow,
+  type CustodyJourneyDetailData,
+  type CustodyJourneyEventRow,
+  type CustodyJourneyRow,
+  type CustodyJourneyWalletRow,
+  type CustodyWorkerHeartbeatRow,
+  type CustodyWalletProfileRow,
+} from "./custody";
 import type {
   ConvictionBacktestResult,
   ConvictionBacktestSettings,
@@ -323,6 +337,327 @@ export const getStrategyInsights = createServerFn({ method: "GET" }).handler(asy
     }
   );
 });
+
+const CustodyDashboardInputSchema = z
+  .object({
+    window: z.enum(["24h", "7d", "30d", "all"]),
+    limit: z.number().int().min(5).max(100).default(30),
+  })
+  .strict();
+const CustodyJourneyDetailInputSchema = z.object({ journeyId: z.string().uuid() }).strict();
+const CustodyWalletManualTypeSchema = z.enum([
+  "unknown",
+  "exchange",
+  "cold_storage_candidate",
+  "hot_wallet_candidate",
+  "routing_wallet",
+  "custody",
+  "bridge",
+  "vault",
+  "other",
+]);
+const CustodyWalletLabelInputSchema = z
+  .object({
+    wallet: z.string().trim().refine(isSolanaPublicKey, "Invalid Solana wallet address"),
+    label: z.string().trim().min(1, "Wallet label is required").max(80),
+    type: CustodyWalletManualTypeSchema,
+  })
+  .strict();
+const CUSTODY_JOURNEY_READ_CAP = 100;
+const CUSTODY_WALLET_READ_CAP = 5_000;
+const CUSTODY_EVENT_READ_CAP = 5_000;
+const CUSTODY_PROFILE_READ_CAP = 5_000;
+const CUSTODY_COVERAGE_REASON_READ_CAP = 10_000;
+
+async function readCustodyCoverageReasons(
+  db: ReturnType<typeof adminClient>,
+  userId: string,
+  journeyIds: string[],
+): Promise<{ rows: CustodyCoverageReasonRow[]; complete: boolean }> {
+  if (journeyIds.length === 0) return { rows: [], complete: true };
+  const [eventReasons, inboxReasons] = await Promise.all([
+    db
+      .from("custody_journey_events")
+      .select("journey_id,result_reason", { count: "exact" })
+      .eq("user_id", userId)
+      .in("journey_id", journeyIds)
+      .not("result_reason", "is", null)
+      .limit(CUSTODY_COVERAGE_REASON_READ_CAP),
+    db
+      .from("custody_pending_events")
+      .select("journey_id,status,last_error_code", { count: "exact" })
+      .eq("user_id", userId)
+      .in("journey_id", journeyIds)
+      .in("status", ["pending", "expired", "terminal"])
+      .limit(CUSTODY_COVERAGE_REASON_READ_CAP),
+  ]);
+  if (eventReasons.error) custodyReadError(eventReasons.error);
+  if (inboxReasons.error) custodyReadError(inboxReasons.error);
+  const eventRows = (eventReasons.data ?? []).flatMap((row) =>
+    typeof row.journey_id === "string"
+      ? [{ journeyId: row.journey_id, reason: row.result_reason ?? null }]
+      : [],
+  );
+  const inboxRows = (inboxReasons.data ?? []).flatMap((row) =>
+    typeof row.journey_id === "string"
+      ? [
+          {
+            journeyId: row.journey_id,
+            // Status is material evidence too: an unresolved pending row is
+            // partial coverage even when its last error is only "upstream".
+            reason: `${String(row.status ?? "unknown")}_${String(row.last_error_code ?? "unknown")}`,
+          },
+        ]
+      : [],
+  );
+  const rows = [...eventRows, ...inboxRows];
+  const available =
+    Number(eventReasons.count ?? eventRows.length) + Number(inboxReasons.count ?? inboxRows.length);
+  return { rows, complete: rows.length >= available };
+}
+
+function custodyReadError(error: unknown): never {
+  const errorRecord = error && typeof error === "object" ? (error as Record<string, unknown>) : {};
+  const code = typeof errorRecord.code === "string" ? errorRecord.code : "";
+  if (code === "42P01" || code === "PGRST205") {
+    throw new Error(
+      "Custody Journey storage is not installed yet. Apply the Custody Journey migration first.",
+    );
+  }
+  throw new Error("Custody Journey data is temporarily unavailable. Trading is unaffected.");
+}
+
+/**
+ * Read-only observation data. Every table read is scoped to the current user,
+ * and this function has no dependency on entry or exit configuration.
+ */
+export const getCustodyDashboard = createServerFn({ method: "POST" })
+  .validator((data) => CustodyDashboardInputSchema.parse(data))
+  .handler(async ({ data }): Promise<CustodyDashboardData> => {
+    const db = adminClient();
+    const userId = currentUserId();
+    const since = custodyWindowSince(data.window);
+    let journeyQuery = db
+      .from("custody_journeys")
+      .select("*", { count: "exact" })
+      .eq("user_id", userId);
+    if (since) journeyQuery = journeyQuery.gte("last_activity_at", since);
+    const [
+      journeysResult,
+      heartbeatResult,
+      pendingEventsResult,
+      expiredEventsResult,
+      terminalEventsResult,
+    ] = await Promise.all([
+      journeyQuery
+        .order("last_activity_at", { ascending: false })
+        .order("id", { ascending: true })
+        .limit(CUSTODY_JOURNEY_READ_CAP),
+      db.from("custody_worker_heartbeat").select("*").eq("user_id", userId).maybeSingle(),
+      db
+        .from("custody_pending_events")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("status", "pending")
+        .not("journey_id", "is", null),
+      db
+        .from("custody_pending_events")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("status", "expired")
+        .not("journey_id", "is", null),
+      db
+        .from("custody_pending_events")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("status", "terminal")
+        .not("journey_id", "is", null),
+    ]);
+    if (journeysResult.error) custodyReadError(journeysResult.error);
+    if (heartbeatResult.error) custodyReadError(heartbeatResult.error);
+    const inboxFailure = [pendingEventsResult, expiredEventsResult, terminalEventsResult].find(
+      (result) => result.error,
+    );
+    if (inboxFailure?.error) custodyReadError(inboxFailure.error);
+
+    const journeys = (journeysResult.data ?? []) as CustodyJourneyRow[];
+    const heartbeat = heartbeatResult.data as CustodyWorkerHeartbeatRow | null;
+    const pendingEvents = {
+      pending: Number(pendingEventsResult.count ?? 0),
+      expired: Number(expiredEventsResult.count ?? 0),
+      terminal: Number(terminalEventsResult.count ?? 0),
+    };
+    const journeyIds = journeys.map((journey) => journey.id);
+    if (journeyIds.length === 0) {
+      return buildCustodyDashboardData({
+        window: data.window,
+        journeys: [],
+        wallets: [],
+        events: [],
+        profiles: [],
+        heartbeat,
+        pendingEvents,
+        limit: data.limit,
+        available: {
+          journeyRowsAvailable: Number(journeysResult.count ?? 0),
+          walletRowsAvailable: 0,
+          eventRowsAvailable: 0,
+        },
+      });
+    }
+
+    let eventQuery = db
+      .from("custody_journey_events")
+      .select("*", { count: "exact" })
+      .eq("user_id", userId)
+      .in("journey_id", journeyIds);
+    if (since) eventQuery = eventQuery.gte("event_at", since);
+    const [walletsResult, eventsResult, profilesResult, coverageReasons] = await Promise.all([
+      db
+        .from("custody_journey_wallets")
+        .select("*", { count: "exact" })
+        .eq("user_id", userId)
+        .in("journey_id", journeyIds)
+        .order("last_activity_at", { ascending: false })
+        .limit(CUSTODY_WALLET_READ_CAP),
+      eventQuery
+        .order("event_at", { ascending: false })
+        .order("event_key", { ascending: true })
+        .limit(CUSTODY_EVENT_READ_CAP),
+      db
+        .from("custody_wallet_profiles")
+        .select("*")
+        .eq("user_id", userId)
+        .order("last_seen_at", { ascending: false })
+        .limit(CUSTODY_PROFILE_READ_CAP),
+      readCustodyCoverageReasons(db, userId, journeyIds),
+    ]);
+    const failed = [walletsResult, eventsResult, profilesResult].find((result) => result.error);
+    if (failed?.error) custodyReadError(failed.error);
+
+    return buildCustodyDashboardData({
+      window: data.window,
+      journeys,
+      wallets: (walletsResult.data ?? []) as CustodyJourneyWalletRow[],
+      events: (eventsResult.data ?? []) as CustodyJourneyEventRow[],
+      profiles: (profilesResult.data ?? []) as CustodyWalletProfileRow[],
+      heartbeat,
+      pendingEvents,
+      coverageReasons: coverageReasons.rows,
+      coverageReasonsComplete: coverageReasons.complete,
+      limit: data.limit,
+      available: {
+        journeyRowsAvailable: Number(journeysResult.count ?? journeys.length),
+        walletRowsAvailable: Number(walletsResult.count ?? walletsResult.data?.length ?? 0),
+        eventRowsAvailable: Number(eventsResult.count ?? eventsResult.data?.length ?? 0),
+      },
+    });
+  });
+
+/** Detail rows are loaded only when the dashboard opens a journey. */
+export const getCustodyJourney = createServerFn({ method: "POST" })
+  .validator((data) => CustodyJourneyDetailInputSchema.parse(data))
+  .handler(async ({ data }): Promise<CustodyJourneyDetailData> => {
+    const db = adminClient();
+    const userId = currentUserId();
+    const journeyResult = await db
+      .from("custody_journeys")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("id", data.journeyId)
+      .maybeSingle();
+    if (journeyResult.error) custodyReadError(journeyResult.error);
+    if (!journeyResult.data) throw new Error("Custody journey was not found.");
+
+    const [walletsResult, eventsResult, profilesResult, coverageReasons] = await Promise.all([
+      db
+        .from("custody_journey_wallets")
+        .select("*", { count: "exact" })
+        .eq("user_id", userId)
+        .eq("journey_id", data.journeyId)
+        .order("hop_depth", { ascending: true })
+        .order("first_seen_at", { ascending: true })
+        .limit(CUSTODY_WALLET_READ_CAP),
+      db
+        .from("custody_journey_events")
+        .select("*", { count: "exact" })
+        .eq("user_id", userId)
+        .eq("journey_id", data.journeyId)
+        .order("event_at", { ascending: true })
+        .order("event_key", { ascending: true })
+        .limit(CUSTODY_EVENT_READ_CAP),
+      db
+        .from("custody_wallet_profiles")
+        .select("*")
+        .eq("user_id", userId)
+        .order("last_seen_at", { ascending: false })
+        .limit(CUSTODY_PROFILE_READ_CAP),
+      readCustodyCoverageReasons(db, userId, [data.journeyId]),
+    ]);
+    const failed = [walletsResult, eventsResult, profilesResult].find((result) => result.error);
+    if (failed?.error) custodyReadError(failed.error);
+
+    return buildCustodyJourneyDetail({
+      journey: journeyResult.data as CustodyJourneyRow,
+      wallets: (walletsResult.data ?? []) as CustodyJourneyWalletRow[],
+      events: (eventsResult.data ?? []) as CustodyJourneyEventRow[],
+      profiles: (profilesResult.data ?? []) as CustodyWalletProfileRow[],
+      coverageReasons: coverageReasons.rows,
+      coverageReasonsComplete: coverageReasons.complete,
+      availableWalletCount: Number(walletsResult.count ?? walletsResult.data?.length ?? 0),
+      availableEventCount: Number(eventsResult.count ?? eventsResult.data?.length ?? 0),
+    });
+  });
+
+/**
+ * Saves an explicit user annotation. A manual label is display metadata only:
+ * it does not change inferred evidence, watching, journey accounting, or trades.
+ */
+export const saveCustodyWalletLabel = createServerFn({ method: "POST" })
+  .validator((data) => CustodyWalletLabelInputSchema.parse(data))
+  .handler(async ({ data }) => {
+    const db = adminClient();
+    const userId = currentUserId();
+    const existing = await db
+      .from("custody_wallet_profiles")
+      .select("wallet")
+      .eq("user_id", userId)
+      .eq("wallet", data.wallet)
+      .maybeSingle();
+    if (existing.error) custodyReadError(existing.error);
+
+    if (existing.data) {
+      const updated = await db
+        .from("custody_wallet_profiles")
+        .update({
+          manual_type: data.type,
+          manual_label: data.label,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("user_id", userId)
+        .eq("wallet", data.wallet)
+        .select("wallet")
+        .maybeSingle();
+      if (updated.error) custodyReadError(updated.error);
+      if (!updated.data) throw new Error("The wallet label could not be saved.");
+    } else {
+      const observedAt = new Date().toISOString();
+      const inserted = await db.from("custody_wallet_profiles").insert({
+        user_id: userId,
+        wallet: data.wallet,
+        inferred_type: "unknown",
+        inferred_label: null,
+        inference_confidence: 0,
+        inference_source: "manual_only",
+        manual_type: data.type,
+        manual_label: data.label,
+        first_seen_at: observedAt,
+        last_seen_at: observedAt,
+      });
+      if (inserted.error) custodyReadError(inserted.error);
+    }
+    return { ok: true as const };
+  });
 
 const ConvictionWindowSchema = z.union([z.literal(5), z.literal(30), z.literal(60)]);
 const ConvictionDashboardInputSchema = z.object({ windowMinutes: ConvictionWindowSchema });

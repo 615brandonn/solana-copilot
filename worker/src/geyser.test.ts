@@ -28,6 +28,25 @@ function tokenBalance(owner: string, mint: string, amount: number, decimals = 6)
   };
 }
 
+function exactTokenBalance(
+  owner: string,
+  mint: string,
+  amountRaw: string,
+  uiAmountString: string,
+  decimals = 6,
+) {
+  return {
+    owner,
+    mint,
+    uiTokenAmount: {
+      amount: amountRaw,
+      decimals,
+      uiAmount: Number(uiAmountString),
+      uiAmountString,
+    },
+  };
+}
+
 const trustedLogs = [
   `Program ${VERIFIED_SWAP_PROGRAMS.jupiterV6} invoke [1]`,
   "Program log: Instruction: Route",
@@ -105,6 +124,59 @@ test("Geyser preserves exact token and wrapped-SOL input attribution", () => {
   assert.ok(wsolBuy?.kind === "swap");
   assert.equal(wsolBuy.spentToken?.mint, WSOL_MINT);
   assert.equal(wsolBuy.spentToken?.amountRaw, "1000000000");
+});
+
+test("Geyser uses raw balance deltas when UI numbers collapse a one-unit acquisition", () => {
+  const before = "9007199254740992000";
+  const after = "9007199254740992001";
+  const events = decode({
+    preTokens: [
+      tokenBalance(target, USDC_MINT, 60),
+      exactTokenBalance(target, OUTPUT_MINT, before, "9007199254740.992"),
+    ],
+    postTokens: [
+      tokenBalance(target, USDC_MINT, 0),
+      exactTokenBalance(target, OUTPUT_MINT, after, "9007199254740.992"),
+    ],
+  });
+  const buy = buys(events)[0];
+  assert.ok(buy?.kind === "swap");
+  assert.equal(buy.amountRaw, "1");
+  assert.equal(buy.amountTokens, 0.000001);
+});
+
+test("Geyser emits net legacy buy plus gross custody acquisition for an atomic partial forward", () => {
+  const events = decode({
+    preTokens: [
+      tokenBalance(target, USDC_MINT, 100),
+      tokenBalance(target, OUTPUT_MINT, 10),
+      tokenBalance(recipient, OUTPUT_MINT, 5),
+    ],
+    postTokens: [
+      tokenBalance(target, USDC_MINT, 40),
+      tokenBalance(target, OUTPUT_MINT, 50),
+      tokenBalance(recipient, OUTPUT_MINT, 65),
+    ],
+  });
+  const buy = buys(events)[0];
+  assert.equal(buys(events).length, 1);
+  assert.ok(buy?.kind === "swap");
+  assert.equal(buy.amountTokens, 40);
+  assert.equal(buy.amountRaw, "40000000");
+  assert.equal(buy.grossAmountTokens, 100);
+  assert.equal(buy.grossAmountRaw, "100000000");
+  assert.equal(buy.inferredRecipients, undefined);
+  assert.deepEqual(buy.custodyForwardRecipients, [recipient]);
+
+  const transfer = events.find((event) => event.kind === "transfer");
+  assert.ok(transfer?.kind === "transfer");
+  assert.equal(transfer.amountTokens, 60);
+  assert.equal(transfer.sameTransactionAcquisition, true);
+  assert.equal(transfer.senderPreRaw, "100000000");
+  assert.equal(transfer.senderPostRaw, "40000000");
+  assert.equal(transfer.chainSenderPreRaw, "10000000");
+  assert.equal(transfer.chainSenderPostRaw, "50000000");
+  assert.equal(transfer.recipients?.[0]?.amountRaw, "60000000");
 });
 
 test("Geyser accepts adjusted native SOL only with one trusted signer", () => {
@@ -217,20 +289,70 @@ test("a failed subscription write stays pending and is retried for the same wall
   assert.equal(feed.health().connected, true);
 });
 
-test("a disconnected watch is desired but never reported as server-subscribed", async () => {
+test("a disconnected watch restarts the suspended stream without claiming subscription early", async () => {
+  let connects = 0;
   const feed = Object.create(GeyserFeed.prototype) as any;
   feed.desiredWatched = new Set<string>();
   feed.watched = new Set<string>();
   feed.stream = undefined;
+  feed.stopped = false;
   feed.lastMessageAt = undefined;
+  feed.pendingMessages = [];
+  feed.discardedQueuedMessageCount = 0;
   feed.decodedEventCount = 0;
+  feed.connect = async () => {
+    connects += 1;
+  };
 
   await feed.watch(target);
   const health = feed.health();
+  assert.equal(connects, 1);
   assert.equal(health.desiredWatchedCount, 1);
   assert.equal(health.watchedCount, 0);
   assert.equal(health.pendingSubscriptionCount, 1);
   assert.equal(health.connected, false);
+});
+
+test("an empty start and final unwatch close the stream without writing an empty filter", async () => {
+  let connects = 0;
+  let writes = 0;
+  let ends = 0;
+  const stream = {
+    write(_request: unknown, callback: (error?: Error) => void) {
+      writes += 1;
+      callback();
+    },
+    removeAllListeners() {},
+    end() {
+      ends += 1;
+    },
+  };
+  const feed = Object.create(GeyserFeed.prototype) as any;
+  feed.desiredWatched = new Set<string>();
+  feed.watched = new Set<string>();
+  feed.stream = stream;
+  feed.streamGeneration = 1;
+  feed.pendingMessages = [];
+  feed.discardedQueuedMessageCount = 0;
+  feed.stopped = false;
+  feed.connect = async () => {
+    connects += 1;
+  };
+
+  await feed.start([]);
+  assert.equal(connects, 0);
+  assert.equal(writes, 0);
+  assert.equal(ends, 1);
+  assert.equal(feed.stream, undefined);
+
+  feed.stream = stream;
+  feed.desiredWatched = new Set([target]);
+  feed.watched = new Set([target]);
+  await feed.unwatch(target);
+  assert.equal(writes, 0);
+  assert.equal(ends, 2);
+  assert.equal(feed.desiredWatched.size, 0);
+  assert.equal(feed.stream, undefined);
 });
 
 test("Geyser health requires recent message evidence, not only a writable stream", () => {
@@ -365,9 +487,14 @@ test("Geyser accepts a multi-signer sell only with one watched-wallet debit and 
     verified: true,
     tokenBalanceBefore: 100,
     tokenBalanceAfter: 25,
+    tokenBalanceBeforeRaw: "100000000",
+    tokenBalanceAfterRaw: "25000000",
+    soldAmountRaw: "75000000",
     soldFraction: 0.75,
     proceedsMint: USDC_MINT,
     proceedsAmount: 60,
+    proceedsAmountRaw: "60000000",
+    proceedsDecimals: 6,
     signerCount: 2,
   });
 });
@@ -435,14 +562,32 @@ test("Geyser emits a single conserving batch with every split-transfer recipient
   const batch = transfers[0];
   assert.ok(batch?.kind === "transfer");
   assert.equal(batch.amountTokens, 100);
+  assert.equal(batch.senderPreAmount, 100);
+  assert.equal(batch.senderPostAmount, 0);
+  assert.equal(batch.senderPreRaw, "100000000");
+  assert.equal(batch.senderPostRaw, "0");
+  assert.deepEqual((batch.recipients ?? []).map((row) => row.amountRaw).sort(), [
+    "40000000",
+    "60000000",
+  ]);
+  assert.deepEqual(
+    (batch.recipients ?? [])
+      .map((row) => [row.recipientPreRaw, row.recipientPostRaw])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    [
+      ["5000000", "65000000"],
+      ["10000000", "50000000"],
+    ].sort((a, b) => a[0].localeCompare(b[0])),
+  );
   const recipients = (batch.recipients ?? []).map((row) => ({
     to: row.wallet,
     amount: row.amountTokens,
     pre: row.recipientPreAmount,
+    post: row.recipientPostAmount,
   }));
   const expected = [
-    { to: recipient, amount: 60, pre: 5 },
-    { to: otherRecipient, amount: 40, pre: 10 },
+    { to: recipient, amount: 60, pre: 5, post: 65 },
+    { to: otherRecipient, amount: 40, pre: 10, post: 50 },
   ].sort((a, b) => a.to.localeCompare(b.to));
   assert.deepEqual(recipients, expected);
 });

@@ -9,6 +9,8 @@ import {
   hasWalletSpecificSpend,
   isOnCurveWallet,
   parseRawTokenAmount,
+  tokenDelta,
+  tokenDeltaSign,
   USDC_MINT,
   verifiedSpendForOutput,
   type WalletTokenDelta,
@@ -123,6 +125,21 @@ test("raw token parsing and on-curve recipient checks fail closed", () => {
   assert.equal(isOnCurveWallet("not-a-wallet"), false);
 });
 
+test("raw deltas decide sign and amount when lossy UI balances are identical", () => {
+  const exact: WalletTokenDelta = {
+    mint: OUTPUT_MINT,
+    pre: 9_007_199_254_740.992,
+    post: 9_007_199_254_740.992,
+    decimals: 6,
+    preRaw: 9_007_199_254_740_992_000n,
+    postRaw: 9_007_199_254_740_992_001n,
+    rawExact: true,
+  };
+  assert.equal(tokenDeltaSign(exact), 1);
+  assert.equal(tokenDelta(exact), 0.000001);
+  assert.equal(tokenDeltaSign({ ...exact, preRaw: exact.postRaw, postRaw: exact.preRaw }), -1);
+});
+
 test("verifies a single- or multi-signer sell only with attributable proceeds", () => {
   const sold = row(OUTPUT_MINT, 100, 25);
   const usdc = row(USDC_MINT, 0, 60);
@@ -130,15 +147,17 @@ test("verifies a single- or multi-signer sell only with attributable proceeds", 
     verified: true,
     tokenBalanceBefore: 100,
     tokenBalanceAfter: 25,
+    tokenBalanceBeforeRaw: "100000000",
+    tokenBalanceAfterRaw: "25000000",
+    soldAmountRaw: "75000000",
     soldFraction: 0.75,
     proceedsMint: USDC_MINT,
     proceedsAmount: 60,
+    proceedsAmountRaw: "60000000",
+    proceedsDecimals: 6,
     signerCount: 2,
   });
-  assert.equal(
-    attributeVerifiedSell([sold], OUTPUT_MINT, 1, true, true, 1).verified,
-    true,
-  );
+  assert.equal(attributeVerifiedSell([sold], OUTPUT_MINT, 1, true, true, 1).verified, true);
 });
 
 test("sell attribution rejects transfers, unrelated signers, and ambiguous balance flows", () => {

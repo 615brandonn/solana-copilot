@@ -21,6 +21,7 @@ import { ActivityFeed } from "@/components/dashboard/ActivityFeed";
 import { StrategyLab } from "@/components/dashboard/StrategyLab";
 import { ConvictionDashboard } from "@/components/dashboard/ConvictionDashboard";
 import { PositionFollowers } from "@/components/dashboard/PositionFollowers";
+import { CustodyJourneyDashboard } from "@/components/dashboard/CustodyJourneyDashboard";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -299,6 +300,7 @@ function Dashboard() {
           tradingMode={cfg.convictionTradingMode}
         />
         <StrategyLab />
+        <CustodyJourneyDashboard enabled={cfg.custodyJourneyEnabled} />
 
         <footer className="mt-10 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-6 text-[11px] text-muted-foreground">
           <span className="mono">helix · self-hosted · supabase + cloudflare + jito</span>

@@ -49,6 +49,7 @@ export type BotConfigRow = {
   execution_route: "jito" | "rpc";
   jito_tip_sol: number;
   fixed_buy_usd: number;
+  custody_journey_enabled?: boolean;
   conviction_mode_enabled?: boolean;
   conviction_trading_mode?: "shadow" | "live";
   conviction_rapid_follow_enabled?: boolean;

@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "custody:dev": "tsx src/custody-index.ts",
     "doctor": "tsx src/doctor.ts",
     "trace": "tsx src/trace-tx.ts",
     "save-key": "tsx src/save-key.ts",
     "watch": "tsx watch src/index.ts",
     "test": "tsc -p tsconfig.json && node --test dist/*.test.js",
     "start": "node dist/index.js",
+    "custody": "node dist/custody-index.js",
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {

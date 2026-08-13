@@ -17,7 +17,9 @@ import {
   hasWalletSpecificSpend,
   isOnCurveWallet,
   parseRawTokenAmount,
+  rawTokenDelta,
   tokenDelta,
+  tokenDeltaSign,
   WSOL_MINT,
   type VerifiedTokenSpend,
   type VerifiedSellAttribution,
@@ -28,7 +30,8 @@ import { hasVerifiedSwapSignal } from "./swap-signal.js";
 const log = pino({ level: env.LOG_LEVEL });
 const require = createRequire(import.meta.url);
 const YellowstoneGrpc = require("@triton-one/yellowstone-grpc") as Record<string, any>;
-const CommitmentLevel = YellowstoneGrpc.CommitmentLevel ?? YellowstoneGrpc.default?.CommitmentLevel ?? { PROCESSED: 0 };
+const CommitmentLevel = YellowstoneGrpc.CommitmentLevel ??
+  YellowstoneGrpc.default?.CommitmentLevel ?? { PROCESSED: 0 };
 const GEYSER_HEALTH_MAX_SILENCE_MS = 60_000;
 const GEYSER_LIVE_QUEUE_MAX_AGE_MS = 5_000;
 
@@ -60,7 +63,8 @@ function symmetricDifferenceSize(left: ReadonlySet<string>, right: ReadonlySet<s
 function sanitizeGeyserError(error: unknown): string {
   const message = safeDiagnostic(error).toLowerCase();
   if (/timed? out|timeout|etimedout/.test(message)) return "Geyser request timed out";
-  if (/rate.?limit|too many requests|\b429\b/.test(message)) return "Geyser request was rate limited";
+  if (/rate.?limit|too many requests|\b429\b/.test(message))
+    return "Geyser request was rate limited";
   if (/unauthori[sz]ed|authentication|invalid api|\b401\b/.test(message)) {
     return "Geyser authentication failed";
   }
@@ -116,11 +120,23 @@ export type SwapEvent = {
   side: "buy" | "sell";
   tokenMint: string;
   amountTokens: number;
+  /** Exact raw amount represented by amountTokens when token balances supplied it. */
+  amountRaw?: string;
+  /** Gross acquisition before a same-transaction forward; amountTokens stays legacy net. */
+  grossAmountTokens?: number;
+  grossAmountRaw?: string;
+  /** Wallet balance boundary for this mint in the observed transaction. */
+  tokenBalanceBefore?: number;
+  tokenBalanceAfter?: number;
+  tokenBalanceBeforeRaw?: string;
+  tokenBalanceAfterRaw?: string;
   decimals: number;
   amountUsd?: number;
   spentToken?: VerifiedTokenSpend;
   solSpend?: number;
   inferredRecipients?: string[];
+  /** Atomic forwards for custody only; does not activate legacy inferred-buy gates. */
+  custodyForwardRecipients?: string[];
   solDelta: number; // WSOL/SOL change for this wallet in this tx (negative = spent, positive = received)
   slot: number;
   txSig: string;
@@ -137,20 +153,37 @@ export type SwapEvent = {
 export type TransferRecipient = {
   wallet: string;
   amountTokens: number;
+  amountRaw?: string;
   recipientPreAmount?: number;
+  recipientPostAmount?: number;
+  recipientPreRaw?: string;
+  recipientPostRaw?: string;
 };
 
 export type TransferEvent = {
   kind: "transfer";
-  from: string;               // sender (must be a watched wallet)
-  to: string;                 // recipient
+  from: string; // sender (must be a watched wallet)
+  to: string; // recipient
   tokenMint: string;
   amountTokens: number;
   decimals: number;
   slot: number;
   txSig: string;
   timestampMs: number;
+  /** Sender balance facts used for conservative pro-rata custody attribution. */
+  senderPreAmount?: number;
+  senderPostAmount?: number;
+  senderPreRaw?: string;
+  senderPostRaw?: string;
   recipientPreAmount?: number;
+  recipientPostAmount?: number;
+  /** True when sender balances model the acquired lot before/after an atomic forward. */
+  sameTransactionAcquisition?: boolean;
+  /** Actual transaction boundary balances, retained separately from the lot model. */
+  chainSenderPreAmount?: number;
+  chainSenderPostAmount?: number;
+  chainSenderPreRaw?: string;
+  chainSenderPostRaw?: string;
   /** Complete conserving recipient set for this sender/mint/transaction. */
   recipients?: TransferRecipient[];
   blockTimeMs?: number;
@@ -191,15 +224,21 @@ export class GeyserFeed {
   async start(initialWallets: string[]) {
     initialWallets.forEach((w) => this.desiredWatched.add(w));
     this.stopped = false;
+    if (this.desiredWatched.size === 0) {
+      this.suspendStream("no watched wallets");
+      return;
+    }
     await this.connect();
   }
 
   async watch(wallet: string) {
     if (!wallet) return;
     this.desiredWatched.add(wallet);
+    this.stopped = false;
     if (sameWalletSet(this.watched, this.desiredWatched)) return;
     try {
-      await this.push();
+      if (this.stream) await this.push();
+      else await this.connect();
     } catch (error) {
       this.scheduleReconnect("subscription update failed");
       throw new Error(sanitizeGeyserError(error));
@@ -208,6 +247,10 @@ export class GeyserFeed {
 
   async unwatch(wallet: string) {
     if (!this.desiredWatched.delete(wallet)) return;
+    if (this.desiredWatched.size === 0) {
+      this.suspendStream("last wallet removed");
+      return;
+    }
     if (sameWalletSet(this.watched, this.desiredWatched)) return;
     try {
       await this.push();
@@ -217,14 +260,19 @@ export class GeyserFeed {
     }
   }
 
+  /** Permanently closes this feed instance until start/watch is called again. */
+  stop(): void {
+    this.stopped = true;
+    this.desiredWatched.clear();
+    this.suspendStream("feed stopped");
+  }
+
   health(nowMs = Date.now()) {
-    const pendingSubscriptionCount = symmetricDifferenceSize(
-      this.watched,
-      this.desiredWatched,
-    );
-    const secondsSinceLastMessage = this.lastMessageAt === undefined
-      ? null
-      : Math.max(0, Math.round((nowMs - this.lastMessageAt) / 1000));
+    const pendingSubscriptionCount = symmetricDifferenceSize(this.watched, this.desiredWatched);
+    const secondsSinceLastMessage =
+      this.lastMessageAt === undefined
+        ? null
+        : Math.max(0, Math.round((nowMs - this.lastMessageAt) / 1000));
     const messageFresh =
       this.lastMessageAt !== undefined &&
       this.lastMessageGeneration === this.streamGeneration &&
@@ -254,6 +302,10 @@ export class GeyserFeed {
     const stream = this.stream;
     if (!stream) return;
     const requestedWallets = Array.from(this.desiredWatched);
+    if (requestedWallets.length === 0) {
+      this.suspendStream("no watched wallets");
+      return;
+    }
     const req: SubscribeRequest = {
       accounts: {},
       slots: {},
@@ -273,7 +325,9 @@ export class GeyserFeed {
       accountsDataSlice: [],
       commitment: CommitmentLevel.PROCESSED,
     };
-    await new Promise<void>((res, rej) => stream.write(req, (err: unknown) => (err ? rej(err) : res())));
+    await new Promise<void>((res, rej) =>
+      stream.write(req, (err: unknown) => (err ? rej(err) : res())),
+    );
     // Ignore acknowledgements from a stream that was replaced while the write
     // was in flight. A later call will reconcile any concurrently changed
     // desired set.
@@ -286,6 +340,10 @@ export class GeyserFeed {
 
   private async connect() {
     if (this.reconnecting || this.stopped) return;
+    if (this.desiredWatched.size === 0) {
+      this.suspendStream("no watched wallets");
+      return;
+    }
     this.reconnecting = true;
     try {
       this.stream?.removeAllListeners();
@@ -293,11 +351,15 @@ export class GeyserFeed {
       this.watched.clear();
       this.discardQueuedMessages("stream replaced");
       const stream = await this.client.subscribe();
+      if (this.stopped || this.desiredWatched.size === 0) {
+        stream?.removeAllListeners?.();
+        stream?.end?.();
+        return;
+      }
       const generation = ++this.streamGeneration;
       this.stream = stream;
 
-      stream.on("data", (msg: any) =>
-        this.processMessageWithBackpressure(msg, stream, generation));
+      stream.on("data", (msg: any) => this.processMessageWithBackpressure(msg, stream, generation));
       stream.on("error", (e: any) => {
         if (!this.isCurrentStream(stream, generation)) return;
         log.error({ error: sanitizeGeyserError(e) }, "geyser stream error");
@@ -315,6 +377,20 @@ export class GeyserFeed {
     } finally {
       this.reconnecting = false;
     }
+  }
+
+  private suspendStream(reason: string) {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    const prior = this.stream;
+    this.stream = undefined;
+    this.streamGeneration = (this.streamGeneration ?? 0) + 1;
+    this.watched.clear();
+    this.discardQueuedMessages(reason);
+    prior?.removeAllListeners?.();
+    prior?.end?.();
   }
 
   private processMessageWithBackpressure(
@@ -345,15 +421,14 @@ export class GeyserFeed {
       return;
     }
     this.processingMessage = true;
-    this.drainMessages(stream, generation)
-      .finally(() => {
-        this.processingMessage = false;
-        if (this.stream === stream && !this.stopped) stream.resume?.();
-        // A replacement stream can receive and pause while the old generation's
-        // final handler is still unwinding. Always give the current generation
-        // an opportunity to drain after releasing the global serial handler.
-        this.startMessageDrain();
-      });
+    this.drainMessages(stream, generation).finally(() => {
+      this.processingMessage = false;
+      if (this.stream === stream && !this.stopped) stream.resume?.();
+      // A replacement stream can receive and pause while the old generation's
+      // final handler is still unwinding. Always give the current generation
+      // an opportunity to drain after releasing the global serial handler.
+      this.startMessageDrain();
+    });
   }
 
   private async drainMessages(stream: any, generation: number) {
@@ -401,8 +476,14 @@ export class GeyserFeed {
       const message = tx.transaction?.message ?? tx.message;
       const accountKeys = this.decodeAccountKeys([
         ...(message?.accountKeys ?? []),
-        ...(tx.meta?.loadedWritableAddresses ?? tx.transaction?.meta?.loadedWritableAddresses ?? msg.transaction.meta?.loadedWritableAddresses ?? []),
-        ...(tx.meta?.loadedReadonlyAddresses ?? tx.transaction?.meta?.loadedReadonlyAddresses ?? msg.transaction.meta?.loadedReadonlyAddresses ?? []),
+        ...(tx.meta?.loadedWritableAddresses ??
+          tx.transaction?.meta?.loadedWritableAddresses ??
+          msg.transaction.meta?.loadedWritableAddresses ??
+          []),
+        ...(tx.meta?.loadedReadonlyAddresses ??
+          tx.transaction?.meta?.loadedReadonlyAddresses ??
+          msg.transaction.meta?.loadedReadonlyAddresses ??
+          []),
       ]);
       const matchedWatchedCount = accountKeys.reduce(
         (count, account) => count + (this.desiredWatched.has(account) ? 1 : 0),
@@ -436,7 +517,15 @@ export class GeyserFeed {
       // prevents delayed queued messages from being treated as freshly arrived.
       if (delayed && ev.blockTimeMs === undefined) ev.blockTimeMs = receivedAtMs;
       this.decodedEventCount += 1;
-      log.debug({ kind: ev.kind, wallet: (ev as any).wallet ?? (ev as any).from, side: (ev as any).side, mint: ev.tokenMint }, "feed event");
+      log.debug(
+        {
+          kind: ev.kind,
+          wallet: (ev as any).wallet ?? (ev as any).from,
+          side: (ev as any).side,
+          mint: ev.tokenMint,
+        },
+        "feed event",
+      );
       await this.onSwap(ev);
     }
   }
@@ -446,10 +535,10 @@ export class GeyserFeed {
   }
 
   private discardQueuedMessages(reason: string) {
-    const discarded = this.pendingMessages.length;
+    const discarded = this.pendingMessages?.length ?? 0;
     if (discarded === 0) return;
     this.pendingMessages = [];
-    this.discardedQueuedMessageCount += discarded;
+    this.discardedQueuedMessageCount = (this.discardedQueuedMessageCount ?? 0) + discarded;
     log.warn(
       { discarded, reason },
       "queued Geyser messages discarded — confirmed RPC recovery remains active",
@@ -460,7 +549,7 @@ export class GeyserFeed {
     const out: FeedEvent[] = [];
     const slot: number = Number(msg.transaction.slot ?? 0);
     const meta = tx.meta ?? tx.transaction?.meta ?? msg.transaction.meta;
-    if (!meta || meta.err !== null && meta.err !== undefined) return out;
+    if (!meta || (meta.err !== null && meta.err !== undefined)) return out;
     const txSig = this.decodeSignature(tx.signature ?? tx.transaction?.signatures?.[0]);
 
     // Native SOL deltas per account key (lamports).
@@ -472,9 +561,7 @@ export class GeyserFeed {
       ...(meta?.loadedReadonlyAddresses ?? []),
     ]);
     const requiredSignatures = Number(
-      message?.header?.numRequiredSignatures ??
-      message?.header?.num_required_signatures ??
-      0,
+      message?.header?.numRequiredSignatures ?? message?.header?.num_required_signatures ?? 0,
     );
     const signerKeys = new Set(
       Number.isFinite(requiredSignatures) && requiredSignatures > 0
@@ -512,12 +599,11 @@ export class GeyserFeed {
 
       const attributionRows = table.filter((r) => r.owner === wallet);
       const walletRows = attributionRows.filter((r) => r.mint !== WSOL_MINT);
-      const positiveOutputRows = walletRows.filter((row) => tokenDelta(row) > 1e-12);
+      const positiveOutputRows = walletRows.filter((row) => tokenDeltaSign(row) > 0);
       const walletSigned = signerKeys.has(wallet);
       const walletCanAuthorizeSwap = signerKeys.size === 1 && signerKeys.has(wallet);
-      const emittedBuyMints = new Set<string>();
       const negativeWalletMints = new Set(
-        walletRows.filter((row) => tokenDelta(row) < -1e-12).map((row) => row.mint),
+        walletRows.filter((row) => tokenDeltaSign(row) < 0).map((row) => row.mint),
       );
       const globalOutputMints = new Set(positiveOutputRows.map((row) => row.mint));
       for (const recipientRow of table) {
@@ -525,39 +611,61 @@ export class GeyserFeed {
           recipientRow.owner !== wallet &&
           recipientRow.mint !== WSOL_MINT &&
           isOnCurveWallet(recipientRow.owner) &&
-          tokenDelta(recipientRow) > 1e-12 &&
+          tokenDeltaSign(recipientRow) > 0 &&
           !negativeWalletMints.has(recipientRow.mint)
         ) {
           globalOutputMints.add(recipientRow.mint);
         }
       }
+      const forwardedBuy = this.inferBuyForwardedOut(
+        table,
+        wallet,
+        solSpend,
+        hasSwapSignal,
+        walletCanAuthorizeSwap,
+        negativeWalletMints,
+      );
       if (walletRows.length > 0) {
-        log.info({
-          wallet,
-          txSig,
-          solDelta,
-          hasSolMove,
-          hasSwapSignal,
-          tokenDeltas: walletRows.map((r) => ({ mint: r.mint, delta: Number((r.post - r.pre).toFixed(12)), decimals: r.decimals })),
-        }, "watched wallet token delta");
+        log.info(
+          {
+            wallet,
+            txSig,
+            solDelta,
+            hasSolMove,
+            hasSwapSignal,
+            tokenDeltas: walletRows.map((r) => ({
+              mint: r.mint,
+              delta: tokenDelta(r),
+              amountRaw: rawTokenDelta(r)?.toString(),
+              decimals: r.decimals,
+            })),
+          },
+          "watched wallet token delta",
+        );
       }
       for (const row of walletRows) {
-        const delta = row.post - row.pre;
-        if (Math.abs(delta) < 1e-12) continue;
-        const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
-        const sellAttribution = side === "sell"
-          ? attributeVerifiedSell(
-              attributionRows,
-              row.mint,
-              natDelta,
-              hasSwapSignal,
-              walletSigned,
-              signerKeys.size,
-            )
-          : undefined;
-        const verifiedSwapForWallet = side === "buy"
-          ? walletCanAuthorizeSwap && (hasSolMove || hasSwapSignal)
-          : Boolean(sellAttribution?.verified);
+        const sign = tokenDeltaSign(row);
+        if (sign === 0) continue;
+        const delta = tokenDelta(row);
+        const side: "buy" | "sell" = sign > 0 ? "buy" : "sell";
+        // The legacy swap event for an atomic partial forward is emitted below
+        // with the same net amount plus explicit gross custody evidence.
+        if (side === "buy" && forwardedBuy?.tokenMint === row.mint) continue;
+        const sellAttribution =
+          side === "sell"
+            ? attributeVerifiedSell(
+                attributionRows,
+                row.mint,
+                natDelta,
+                hasSwapSignal,
+                walletSigned,
+                signerKeys.size,
+              )
+            : undefined;
+        const verifiedSwapForWallet =
+          side === "buy"
+            ? walletCanAuthorizeSwap && (hasSolMove || hasSwapSignal)
+            : Boolean(sellAttribution?.verified);
         if (verifiedSwapForWallet) {
           // Buys retain the strict sole-signer rule. Sells may include a
           // separate fee payer only when the watched wallet's exact debit and
@@ -565,18 +673,38 @@ export class GeyserFeed {
           // When we have a real SOL delta, require signs to match:
           // Buy: token+ and SOL-. Sell: token- and SOL+.
           if (side === "buy" && !hasSwapSignal) {
-            log.info({ wallet, txSig, mint: row.mint }, "positive token delta skipped — no explicit swap instruction");
+            log.info(
+              { wallet, txSig, mint: row.mint },
+              "positive token delta skipped — no explicit swap instruction",
+            );
             continue;
           }
-          if (hasSolMove && !hasSwapSignal && ((side === "buy" && solDelta > 0) || (side === "sell" && solDelta < 0))) {
-            log.info({ wallet, txSig, mint: row.mint, side, solDelta, tokenDelta: delta }, "swap sign mismatch — skipped");
+          if (
+            hasSolMove &&
+            !hasSwapSignal &&
+            ((side === "buy" && solDelta > 0) || (side === "sell" && solDelta < 0))
+          ) {
+            log.info(
+              { wallet, txSig, mint: row.mint, side, solDelta, tokenDelta: delta },
+              "swap sign mismatch — skipped",
+            );
             continue;
           }
-          const verifiedSpend = side === "buy"
-            ? attributeVerifiedBuy(attributionRows, row.mint, globalOutputMints.size, solSpend, hasSwapSignal)
-            : undefined;
+          const verifiedSpend =
+            side === "buy"
+              ? attributeVerifiedBuy(
+                  attributionRows,
+                  row.mint,
+                  globalOutputMints.size,
+                  solSpend,
+                  hasSwapSignal,
+                )
+              : undefined;
           if (side === "buy" && !verifiedSpend?.verified) {
-            log.info({ wallet, txSig, mint: row.mint }, "positive token delta skipped — no unambiguous wallet-specific spend");
+            log.info(
+              { wallet, txSig, mint: row.mint },
+              "positive token delta skipped — no unambiguous wallet-specific spend",
+            );
             continue;
           }
           out.push({
@@ -585,6 +713,12 @@ export class GeyserFeed {
             side,
             tokenMint: row.mint,
             amountTokens: Math.abs(delta),
+            amountRaw: row.rawExact
+              ? (row.postRaw - row.preRaw < 0n
+                  ? row.preRaw - row.postRaw
+                  : row.postRaw - row.preRaw
+                ).toString()
+              : undefined,
             decimals: row.decimals,
             amountUsd: verifiedSpend?.amountUsd,
             spentToken: verifiedSpend?.spentToken,
@@ -597,27 +731,34 @@ export class GeyserFeed {
             verifiedSwap: hasSwapSignal,
             sellAttribution,
           });
-          if (side === "buy") emittedBuyMints.add(row.mint);
-        } else if (delta < 0) {
+        } else if (sign < 0) {
           // Pure token transfer OUT. Support split recipients only when this
           // wallet is the transaction's sole negative owner for the mint and
           // the positive recipient deltas conserve the complete amount.
           const negativeOwners = table.filter(
-            (candidate) => candidate.mint === row.mint && tokenDelta(candidate) < -1e-12,
+            (candidate) => candidate.mint === row.mint && tokenDeltaSign(candidate) < 0,
           );
           const peers = table.filter(
             (candidate) =>
               candidate.mint === row.mint &&
               candidate.owner !== wallet &&
-              tokenDelta(candidate) > 1e-12,
+              tokenDeltaSign(candidate) > 0,
           );
           const received = peers.reduce((sum, peer) => sum + tokenDelta(peer), 0);
           const sent = Math.abs(delta);
+          const senderRawDelta = rawTokenDelta(row);
+          const rawConserves =
+            senderRawDelta !== undefined && peers.every((peer) => rawTokenDelta(peer) !== undefined)
+              ? peers.reduce((sum, peer) => sum + (rawTokenDelta(peer) ?? 0n), 0n) ===
+                -senderRawDelta
+              : null;
           if (
             negativeOwners.length !== 1 ||
             negativeOwners[0]?.owner !== wallet ||
             peers.length === 0 ||
-            Math.abs(received - sent) / Math.max(sent, 1e-9) >= 0.05
+            (rawConserves === null
+              ? Math.abs(received - sent) / Math.max(sent, 1e-9) >= 0.05
+              : !rawConserves)
           ) {
             continue;
           }
@@ -625,7 +766,11 @@ export class GeyserFeed {
             .map((peer) => ({
               wallet: peer.owner,
               amountTokens: tokenDelta(peer),
+              amountRaw: peer.rawExact ? (peer.postRaw - peer.preRaw).toString() : undefined,
               recipientPreAmount: peer.pre,
+              recipientPostAmount: peer.post,
+              recipientPreRaw: peer.rawExact ? peer.preRaw.toString() : undefined,
+              recipientPostRaw: peer.rawExact ? peer.postRaw.toString() : undefined,
             }))
             .sort((a, b) => a.wallet.localeCompare(b.wallet));
           const first = recipients[0]!;
@@ -636,6 +781,10 @@ export class GeyserFeed {
             tokenMint: row.mint,
             amountTokens: received,
             decimals: row.decimals,
+            senderPreAmount: row.pre,
+            senderPostAmount: row.post,
+            senderPreRaw: row.rawExact ? row.preRaw.toString() : undefined,
+            senderPostRaw: row.rawExact ? row.postRaw.toString() : undefined,
             recipientPreAmount: first.recipientPreAmount,
             recipients,
             slot,
@@ -651,17 +800,7 @@ export class GeyserFeed {
       // Require the watched wallet to be a signer with its own economic debit.
       // Transaction-wide swap logs alone do not prove that every watched wallet
       // in the transaction bought the recipient token.
-      const inferredBuy = positiveOutputRows.length === 0
-        ? this.inferBuyTransferredOut(
-            table,
-            wallet,
-            solSpend,
-            hasSwapSignal,
-            walletCanAuthorizeSwap,
-            emittedBuyMints,
-            negativeWalletMints,
-          )
-        : null;
+      const inferredBuy = forwardedBuy;
       if (inferredBuy) {
         const verifiedSpend = attributeVerifiedBuy(
           attributionRows,
@@ -671,30 +810,52 @@ export class GeyserFeed {
           hasSwapSignal,
         );
         if (!verifiedSpend.verified) {
-          log.info({ wallet, txSig, mint: inferredBuy.tokenMint }, "inferred target buy skipped — input/output attribution is ambiguous");
+          log.info(
+            { wallet, txSig, mint: inferredBuy.tokenMint },
+            "inferred target buy skipped — input/output attribution is ambiguous",
+          );
           continue;
         }
-        log.warn({
-          wallet,
-          txSig,
-          mint: inferredBuy.tokenMint,
-          amountTokens: inferredBuy.amountTokens,
-          recipients: inferredBuy.recipients.map((r) => ({ wallet: r.owner, amountTokens: r.amountTokens })),
-          solDelta,
-          hasSwapSignal,
-        }, "inferred target buy from same-tx recipient balances");
+        log.warn(
+          {
+            wallet,
+            txSig,
+            mint: inferredBuy.tokenMint,
+            amountTokens: inferredBuy.amountTokens,
+            recipients: inferredBuy.recipients.map((r) => ({
+              wallet: r.owner,
+              amountTokens: r.amountTokens,
+            })),
+            solDelta,
+            hasSwapSignal,
+          },
+          "inferred target buy from same-tx recipient balances",
+        );
 
         out.push({
           kind: "swap",
           wallet,
           side: "buy",
           tokenMint: inferredBuy.tokenMint,
-          amountTokens: inferredBuy.amountTokens,
+          amountTokens:
+            inferredBuy.retainedAmountTokens > 0
+              ? inferredBuy.retainedAmountTokens
+              : inferredBuy.amountTokens,
+          amountRaw:
+            inferredBuy.retainedAmountTokens > 0
+              ? inferredBuy.retainedAmountRaw
+              : inferredBuy.amountRaw,
+          grossAmountTokens: inferredBuy.amountTokens,
+          grossAmountRaw: inferredBuy.amountRaw,
           decimals: inferredBuy.decimals,
           amountUsd: verifiedSpend.amountUsd,
           spentToken: verifiedSpend.spentToken,
           solSpend: verifiedSpend.solSpend,
-          inferredRecipients: inferredBuy.recipients.map((recipient) => recipient.owner),
+          inferredRecipients:
+            inferredBuy.retainedAmountTokens > 0
+              ? undefined
+              : inferredBuy.recipients.map((recipient) => recipient.owner),
+          custodyForwardRecipients: inferredBuy.recipients.map((recipient) => recipient.owner),
           solDelta,
           slot,
           txSig,
@@ -708,6 +869,10 @@ export class GeyserFeed {
             wallet: recipient.owner,
             amountTokens: recipient.amountTokens,
             recipientPreAmount: recipient.pre,
+            amountRaw: recipient.amountRaw,
+            recipientPostAmount: recipient.post,
+            recipientPreRaw: recipient.preRaw,
+            recipientPostRaw: recipient.postRaw,
           }))
           .sort((a, b) => a.wallet.localeCompare(b.wallet));
         const first = recipients[0]!;
@@ -716,8 +881,17 @@ export class GeyserFeed {
           from: wallet,
           to: first.wallet,
           tokenMint: inferredBuy.tokenMint,
-          amountTokens: inferredBuy.amountTokens,
+          amountTokens: inferredBuy.forwardedAmountTokens,
           decimals: inferredBuy.decimals,
+          senderPreAmount: inferredBuy.amountTokens,
+          senderPostAmount: inferredBuy.retainedAmountTokens,
+          senderPreRaw: inferredBuy.amountRaw,
+          senderPostRaw: inferredBuy.retainedAmountRaw,
+          sameTransactionAcquisition: true,
+          chainSenderPreAmount: inferredBuy.chainPreAmount,
+          chainSenderPostAmount: inferredBuy.chainPostAmount,
+          chainSenderPreRaw: inferredBuy.chainPreRaw,
+          chainSenderPostRaw: inferredBuy.chainPostRaw,
           recipientPreAmount: first.recipientPreAmount,
           recipients,
           slot,
@@ -730,35 +904,126 @@ export class GeyserFeed {
     return out;
   }
 
-  private inferBuyTransferredOut(
+  private inferBuyForwardedOut(
     table: Array<{ owner: string } & WalletTokenDelta>,
     wallet: string,
     solSpend: number | undefined,
     hasSwapSignal: boolean,
     walletCanAuthorizeSwap: boolean,
-    emittedBuyMints: Set<string>,
     negativeWalletMints: Set<string>,
-  ): { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number; pre: number }> } | null {
+  ): {
+    tokenMint: string;
+    amountTokens: number;
+    amountRaw?: string;
+    retainedAmountTokens: number;
+    retainedAmountRaw?: string;
+    forwardedAmountTokens: number;
+    decimals: number;
+    chainPreAmount: number;
+    chainPostAmount: number;
+    chainPreRaw?: string;
+    chainPostRaw?: string;
+    recipients: Array<{
+      owner: string;
+      amountTokens: number;
+      amountRaw?: string;
+      pre: number;
+      post: number;
+      preRaw?: string;
+      postRaw?: string;
+    }>;
+  } | null {
     const walletRows = table.filter((row) => row.owner === wallet);
-    if (!walletCanAuthorizeSwap || !hasSwapSignal || !hasWalletSpecificSpend(walletRows, solSpend)) return null;
+    if (!walletCanAuthorizeSwap || !hasSwapSignal || !hasWalletSpecificSpend(walletRows, solSpend))
+      return null;
 
-    const byMint = new Map<string, { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number; pre: number }> }>();
+    const candidateMints = new Set(
+      walletRows
+        .filter((row) => row.mint !== WSOL_MINT && tokenDeltaSign(row) > 0)
+        .map((row) => row.mint),
+    );
+    const byMint = new Map<
+      string,
+      {
+        tokenMint: string;
+        forwardedAmountTokens: number;
+        forwardedAmountRaw?: bigint;
+        rawExact: boolean;
+        decimals: number;
+        recipients: Array<{
+          owner: string;
+          amountTokens: number;
+          amountRaw?: string;
+          pre: number;
+          post: number;
+          preRaw?: string;
+          postRaw?: string;
+        }>;
+      }
+    >();
     for (const row of table) {
       if (row.owner === wallet || row.mint === WSOL_MINT || !isOnCurveWallet(row.owner)) continue;
-      if (emittedBuyMints.has(row.mint) || negativeWalletMints.has(row.mint)) continue;
-      const delta = row.post - row.pre;
-      if (delta <= 1e-12) continue;
-      const cur = byMint.get(row.mint) ?? { tokenMint: row.mint, amountTokens: 0, decimals: row.decimals, recipients: [] };
-      cur.amountTokens += delta;
+      if (negativeWalletMints.has(row.mint) || tokenDeltaSign(row) <= 0) continue;
+      candidateMints.add(row.mint);
+      const delta = tokenDelta(row);
+      const rawDelta = rawTokenDelta(row);
+      const cur = byMint.get(row.mint) ?? {
+        tokenMint: row.mint,
+        forwardedAmountTokens: 0,
+        forwardedAmountRaw: 0n,
+        rawExact: true,
+        decimals: row.decimals,
+        recipients: [],
+      };
+      cur.forwardedAmountTokens += delta;
+      if (rawDelta === undefined) {
+        cur.rawExact = false;
+        cur.forwardedAmountRaw = undefined;
+      } else if (cur.rawExact) {
+        cur.forwardedAmountRaw = (cur.forwardedAmountRaw ?? 0n) + rawDelta;
+      }
       cur.decimals = row.decimals;
-      cur.recipients.push({ owner: row.owner, amountTokens: delta, pre: row.pre });
+      cur.recipients.push({
+        owner: row.owner,
+        amountTokens: delta,
+        amountRaw: row.rawExact ? (row.postRaw - row.preRaw).toString() : undefined,
+        pre: row.pre,
+        post: row.post,
+        preRaw: row.rawExact ? row.preRaw.toString() : undefined,
+        postRaw: row.rawExact ? row.postRaw.toString() : undefined,
+      });
       byMint.set(row.mint, cur);
     }
 
-    const candidates = Array.from(byMint.values())
-      .filter((candidate) => candidate.amountTokens > 0 && candidate.recipients.length > 0)
-      .sort((a, b) => b.amountTokens - a.amountTokens);
-    return candidates.length === 1 ? candidates[0] : null;
+    if (candidateMints.size !== 1) return null;
+    const tokenMint = Array.from(candidateMints)[0]!;
+    const forwarded = byMint.get(tokenMint);
+    if (!forwarded || forwarded.forwardedAmountTokens <= 0 || forwarded.recipients.length === 0)
+      return null;
+
+    const retained = walletRows.find((row) => row.mint === tokenMint);
+    const retainedAmountTokens =
+      retained && tokenDeltaSign(retained) > 0 ? tokenDelta(retained) : 0;
+    const retainedRaw = retained && tokenDeltaSign(retained) > 0 ? rawTokenDelta(retained) : 0n;
+    const grossAmountTokens = retainedAmountTokens + forwarded.forwardedAmountTokens;
+    const grossRaw =
+      retainedRaw !== undefined && forwarded.rawExact
+        ? retainedRaw + (forwarded.forwardedAmountRaw ?? 0n)
+        : undefined;
+    return {
+      tokenMint,
+      amountTokens: grossAmountTokens,
+      amountRaw: grossRaw?.toString(),
+      retainedAmountTokens,
+      retainedAmountRaw: retainedRaw?.toString(),
+      forwardedAmountTokens: forwarded.forwardedAmountTokens,
+      decimals: forwarded.decimals,
+      chainPreAmount: retained?.pre ?? 0,
+      chainPostAmount: retained?.post ?? 0,
+      chainPreRaw: retained?.rawExact ? retained.preRaw.toString() : undefined,
+      chainPostRaw: retained?.rawExact ? retained.postRaw.toString() : undefined,
+      recipients: forwarded.recipients,
+    };
   }
 
   private toBase58(v: unknown): string {
@@ -769,13 +1034,18 @@ export class GeyserFeed {
     if (typeof v === "object") {
       const obj = v as Record<string, unknown>;
       if (Array.isArray(obj.data)) return bs58.encode(Buffer.from(obj.data));
-      if (obj.type === "Buffer" && Array.isArray(obj.data)) return bs58.encode(Buffer.from(obj.data));
+      if (obj.type === "Buffer" && Array.isArray(obj.data))
+        return bs58.encode(Buffer.from(obj.data));
       for (const key of ["pubkey", "publicKey", "key", "value", "bytes"]) {
         const decoded = this.toBase58(obj[key]);
         if (decoded) return decoded;
       }
       if (typeof obj.toBase58 === "function") {
-        try { return String(obj.toBase58()); } catch { return ""; }
+        try {
+          return String(obj.toBase58());
+        } catch {
+          return "";
+        }
       }
       if (typeof obj.toString === "function") {
         const s = obj.toString();
@@ -785,7 +1055,10 @@ export class GeyserFeed {
     return "";
   }
 
-  private buildOwnerMintDeltas(meta: any, accountKeys: string[]): Array<{ owner: string } & WalletTokenDelta> {
+  private buildOwnerMintDeltas(
+    meta: any,
+    accountKeys: string[],
+  ): Array<{ owner: string } & WalletTokenDelta> {
     const key = (owner: string, mint: string) => `${owner}::${mint}`;
     const m = new Map<string, { owner: string } & WalletTokenDelta>();
     const ingest = (balances: any[], field: "pre" | "post") => {
@@ -830,7 +1103,11 @@ export class GeyserFeed {
 
     for (const wallet of this.watched) {
       try {
-        const ata = getAssociatedTokenAddressSync(new PublicKey(mint), new PublicKey(wallet), true).toBase58();
+        const ata = getAssociatedTokenAddressSync(
+          new PublicKey(mint),
+          new PublicKey(wallet),
+          true,
+        ).toBase58();
         if (ata === tokenAccount) return wallet;
       } catch {
         continue;

@@ -440,6 +440,110 @@ async function checkConvictionModeSchema(cfg: BotConfigRow, targetCount: number)
   return true;
 }
 
+async function checkCustodyJourneySchema(cfg: BotConfigRow): Promise<boolean> {
+  if (typeof cfg.custody_journey_enabled !== "boolean") {
+    fail(
+      "Custody Journey migration",
+      "missing custody_journey_enabled — run supabase/custody-journey-migration.sql before deploying the custody observer",
+    );
+    return false;
+  }
+
+  const checks = await Promise.all([
+    db
+      .from("custody_journeys")
+      .select(
+        "id,user_id,token_mint,status,started_at,last_activity_at,flat_at,flat_reason,total_verified_target_buy_tokens,total_verified_custody_sell_tokens,total_unresolved_outflow_tokens,current_attributed_tokens,source_target_wallets,first_event_key,last_event_key,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_journey_wallets")
+      .select(
+        "id,journey_id,user_id,token_mint,wallet,hop_depth,parent_wallet,source_target_wallets,watch_status,current_attributed_tokens,last_observed_balance_tokens,attributed_share,balance_evidence_reliable,total_received_tokens,total_transferred_tokens,total_verified_sold_tokens,total_unresolved_outflow_tokens,first_seen_at,last_activity_at,last_balance_observed_at,released_at,release_reason,last_event_key,last_tx_sig,watch_anchor_slot,last_slot,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_journey_events")
+      .select(
+        "id,journey_id,user_id,event_key,event_type,request_fingerprint,tx_sig,slot,event_at,source_wallet,destination_wallet,requested_amount_tokens,applied_amount_tokens,reconciled_amount_tokens,source_pre_amount_tokens,source_post_amount_tokens,evidence_reliable,recipients,result_reason,result_journey_status,result_watched_wallets,result_released_wallets,journey_released,metadata,recorded_at",
+      )
+      .limit(1),
+    db
+      .from("custody_wallet_profiles")
+      .select(
+        "user_id,wallet,inferred_type,inferred_label,inference_confidence,inference_source,manual_type,manual_label,first_seen_at,last_seen_at,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_rpc_wallet_cursors")
+      .select(
+        "user_id,wallet,start_slot,last_processed_signature,last_processed_slot,last_block_time,backlog_detected,last_success_at,last_error,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_worker_heartbeat")
+      .select(
+        "user_id,started_at,updated_at,enabled,geyser_connected,last_geyser_message_at,decoded_event_count,rpc_last_poll_at,rpc_last_success_at,rpc_backlog_wallet_count,watched_wallet_count,active_journey_count,last_event_at,degraded,last_error",
+      )
+      .limit(1),
+    db
+      .from("custody_pending_events")
+      .select(
+        "id,user_id,event_key,event_type,request_fingerprint,token_mint,tx_sig,slot,event_at,source_wallet,requested_amount_tokens,payload,status,retry_count,next_retry_at,last_retry_at,last_error_code,journey_id,event_id,result,expires_at,created_at,updated_at",
+      )
+      .limit(1),
+  ]);
+  const schemaError = checks.find((result) => result.error)?.error;
+  if (schemaError) {
+    fail(
+      "Custody Journey schema",
+      `${safeDiagnostic(schemaError.message)} — run supabase/custody-journey-migration.sql`,
+    );
+    return false;
+  }
+
+  try {
+    const apiUrl = new URL("/rest/v1/", env.BOT_SUPABASE_URL);
+    const headers: Record<string, string> = { apikey: env.BOT_SUPABASE_SERVICE_ROLE_KEY };
+    if (!env.BOT_SUPABASE_SERVICE_ROLE_KEY.startsWith("sb_")) {
+      headers.Authorization = `Bearer ${env.BOT_SUPABASE_SERVICE_ROLE_KEY}`;
+    }
+    const response = await fetch(apiUrl, {
+      headers,
+      signal: AbortSignal.timeout(5_000),
+    });
+    const payload = response.ok
+      ? ((await response.json()) as { paths?: Record<string, unknown> })
+      : undefined;
+    const paths = payload?.paths ?? {};
+    const missingRpc = [
+      "/rpc/record_custody_target_buy",
+      "/rpc/record_custody_transfer",
+      "/rpc/record_verified_custody_sell",
+      "/rpc/record_custody_unresolved_outflow",
+      "/rpc/replay_custody_pending_events",
+    ].filter((path) => !paths[path]);
+    if (!response.ok || missingRpc.length > 0) {
+      fail("Custody Journey RPCs", {
+        httpStatus: response.status,
+        missingFunctionCount: missingRpc.length,
+      });
+      return false;
+    }
+  } catch (error) {
+    fail("Custody Journey RPCs", safeDiagnostic(error));
+    return false;
+  }
+
+  pass(
+    "Custody Journey schema",
+    cfg.custody_journey_enabled
+      ? "observer enabled; isolated ledger, cursors, heartbeat, and replay-safe RPCs are ready"
+      : "OFF — observation ledger is installed but no custody monitoring is enabled",
+  );
+  return true;
+}
+
 async function checkSellCoverageSchema(cfg: BotConfigRow): Promise<boolean> {
   const requiredConfigFields: Array<keyof BotConfigRow> = [
     "direct_target_sell_exit_mode",
@@ -931,6 +1035,7 @@ async function main() {
   }
 
   if (!(await checkConvictionModeSchema(cfg, targets.length))) return;
+  if (!(await checkCustodyJourneySchema(cfg))) return;
 
   if (
     cfg.follower_seller_exit_enabled === undefined ||
@@ -986,6 +1091,13 @@ async function main() {
     follower_seller_exit_pct: cfg.follower_seller_exit_pct,
     target_inactivity_exit_enabled: cfg.target_inactivity_exit_enabled,
     target_inactivity_hours: cfg.target_inactivity_hours,
+  });
+
+  line("Custody Journey settings", {
+    custody_journey_enabled: cfg.custody_journey_enabled,
+    observation_only: true,
+    max_hops: 8,
+    max_active_wallets_per_journey: 250,
   });
 
   line("Conviction Mode settings", {

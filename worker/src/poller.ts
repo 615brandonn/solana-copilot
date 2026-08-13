@@ -10,7 +10,9 @@ import {
   hasWalletSpecificSpend,
   isOnCurveWallet,
   parseRawTokenAmount,
+  rawTokenDelta,
   tokenDelta,
+  tokenDeltaSign,
   WSOL_MINT,
   type WalletTokenDelta,
 } from "./swap-attribution.js";
@@ -28,8 +30,37 @@ const log = pino({ level: env.LOG_LEVEL });
 const RPC_SIGNATURE_PAGE_SIZE = 1_000;
 const RPC_SIGNATURE_MAX_PAGES = 1_000;
 const RPC_RECOVERY_CHUNK_SIZE = 5_000;
+const RPC_READ_TIMEOUT_MS = 15_000;
 
 export type PollerHandler = (event: FeedEvent) => Promise<void> | void;
+
+export type UnresolvedOutflowEvent = {
+  kind: "unresolved_outflow";
+  wallet: string;
+  tokenMint: string;
+  amountTokens: number;
+  amountRaw?: string;
+  preAmount: number;
+  postAmount: number;
+  preRaw?: string;
+  postRaw?: string;
+  decimals: number;
+  slot: number;
+  txSig: string;
+  timestampMs: number;
+  blockTimeMs?: number;
+  observedAtMs?: number;
+  delivery?: "live" | "catchup";
+  source?: "rpc" | "unknown";
+  reason: "negative_token_delta_not_attributed";
+};
+
+export type RpcBackfillPollerOptions = {
+  /** Custody-only coverage hook. Omit it to preserve the trading poller's behavior. */
+  onUnresolvedOutflow?: (event: UnresolvedOutflowEvent) => Promise<void> | void;
+  /** Custody-only: replay an older range when a new mint attribution predates this wallet cursor. */
+  allowEarlierAnchorRewind?: boolean;
+};
 
 export type RpcWatchOptions = {
   anchorSlot?: number;
@@ -56,6 +87,8 @@ export class RpcBackfillPoller {
     private onEvent: PollerHandler,
     private cursorStore: RpcCursorStore,
     private intervalMs = 1200,
+    private includeActivationHead = false,
+    private options: RpcBackfillPollerOptions = {},
   ) {}
 
   start(initialWallets: string[]) {
@@ -63,10 +96,12 @@ export class RpcBackfillPoller {
     if (this.timer) return;
     this.timer = setInterval(() => {
       this.poll().catch((error) =>
-        log.warn({ error: sanitizeRpcCursorError(error) }, "rpc fallback poll failed"));
+        log.warn({ error: sanitizeRpcCursorError(error) }, "rpc fallback poll failed"),
+      );
     }, this.intervalMs);
     this.poll().catch((error) =>
-      log.warn({ error: sanitizeRpcCursorError(error) }, "rpc fallback initial poll failed"));
+      log.warn({ error: sanitizeRpcCursorError(error) }, "rpc fallback initial poll failed"),
+    );
     log.info(
       { watchedCount: this.watched.size, intervalMs: this.intervalMs },
       "durable RPC fallback poller started",
@@ -78,14 +113,31 @@ export class RpcBackfillPoller {
     const current = this.watched.get(wallet);
     const nextAnchor = positiveSlot(options.anchorSlot);
     const currentAnchor = positiveSlot(current?.anchorSlot);
+    // An already-continuous target watch has no activation floor. Adding
+    // another owner must not skip an unresolved target backlog.
+    const mergedAnchor =
+      currentAnchor !== undefined && nextAnchor !== undefined
+        ? Math.min(currentAnchor, nextAnchor)
+        : current
+          ? currentAnchor
+          : nextAnchor;
     this.watched.set(wallet, {
-      anchorSlot:
-        currentAnchor !== undefined && nextAnchor !== undefined
-          ? Math.min(currentAnchor, nextAnchor)
-          : currentAnchor ?? nextAnchor,
+      anchorSlot: mergedAnchor,
     });
     const cached = this.cursorCache.get(wallet);
     if (cached) {
+      const currentBoundary = cached.lastProcessedSlot ?? cached.startSlot;
+      if (
+        this.options.allowEarlierAnchorRewind === true &&
+        nextAnchor !== undefined &&
+        nextAnchor < currentBoundary
+      ) {
+        // Keep health fail-closed until pollWallet durably rewinds and begins
+        // replay. Trading pollers leave this option off.
+        this.cursorHydrationPending.add(wallet);
+        this.backlogWallets.add(wallet);
+        return;
+      }
       this.applyCursorHealth(wallet, cached);
       return;
     }
@@ -94,7 +146,8 @@ export class RpcBackfillPoller {
       log.warn(
         { wallet, error: sanitizeRpcCursorError(error) },
         "RPC fallback cursor health hydration failed",
-      ));
+      ),
+    );
   }
 
   unwatch(wallet: string) {
@@ -105,14 +158,13 @@ export class RpcBackfillPoller {
   }
 
   health() {
-    const unavailableWallets = new Set([
-      ...this.backlogWallets,
-      ...this.cursorHydrationPending,
-    ]);
+    const unavailableWallets = new Set([...this.backlogWallets, ...this.cursorHydrationPending]);
     return {
       watchedCount: this.watched.size,
       lastPollAt: this.lastPollAt,
-      secondsSinceLastPoll: this.lastPollAt ? Math.round((Date.now() - this.lastPollAt) / 1000) : null,
+      secondsSinceLastPoll: this.lastPollAt
+        ? Math.round((Date.now() - this.lastPollAt) / 1000)
+        : null,
       lastSuccessAt: this.lastSuccessAt,
       secondsSinceLastSuccess: this.lastSuccessAt
         ? Math.round((Date.now() - this.lastSuccessAt) / 1000)
@@ -204,39 +256,66 @@ export class RpcBackfillPoller {
       return;
     }
 
-    let cursor = this.cursorCache.get(wallet) ?? await this.cursorStore.load(wallet);
+    let cursor = this.cursorCache.get(wallet) ?? (await this.cursorStore.load(wallet));
     if (cursor) {
+      const anchorSlot = positiveSlot(options.anchorSlot);
+      const currentBoundary = cursor.lastProcessedSlot ?? cursor.startSlot;
+      if (
+        this.options.allowEarlierAnchorRewind === true &&
+        anchorSlot !== undefined &&
+        anchorSlot < currentBoundary &&
+        this.cursorStore.rewind
+      ) {
+        cursor = await this.cursorStore.rewind(wallet, anchorSlot);
+        log.warn(
+          { wallet, anchorSlot, priorBoundarySlot: currentBoundary },
+          "RPC cursor rewound to cover newly discovered earlier custody attribution",
+        );
+      }
       this.cursorCache.set(wallet, cursor);
       this.applyCursorHealth(wallet, cursor);
     }
     if (!cursor) {
       const anchorSlot = positiveSlot(options.anchorSlot);
       if (anchorSlot === undefined) {
-        const head = await this.conn.getSignaturesForAddress(pubkey, { limit: 1 }, "confirmed");
+        const head = await rpcReadWithTimeout(
+          this.conn.getSignaturesForAddress(pubkey, { limit: 1 }, "confirmed"),
+          "signature head",
+        );
         cursor = await this.cursorStore.ensure(wallet, head[0]?.slot ?? 0);
         this.cursorCache.set(wallet, cursor);
-        if (head[0]) {
-          cursor = await this.cursorStore.advance(
-            wallet,
-            head[0].signature,
-            head[0].slot,
-            head[0].blockTime ?? null,
-          );
+        if (!this.includeActivationHead) {
+          if (head[0]) {
+            cursor = await this.cursorStore.advance(
+              wallet,
+              head[0].signature,
+              head[0].slot,
+              head[0].blockTime ?? null,
+            );
+            this.cursorCache.set(wallet, cursor);
+          }
+          cursor = await this.cursorStore.markSuccess(wallet);
           this.cursorCache.set(wallet, cursor);
+          this.applyCursorHealth(wallet, cursor);
+          this.cursorSuccessPersistedAt.set(wallet, Date.now());
+          this.lastSuccessAt = Date.now();
+          this.backlogWallets.delete(wallet);
+          log.info({ wallet, headSlot: head[0]?.slot ?? null }, "RPC target cursor baseline ready");
+          return;
         }
-        cursor = await this.cursorStore.markSuccess(wallet);
-        this.cursorCache.set(wallet, cursor);
-        this.applyCursorHealth(wallet, cursor);
-        this.cursorSuccessPersistedAt.set(wallet, Date.now());
-        this.lastSuccessAt = Date.now();
-        this.backlogWallets.delete(wallet);
-        log.info({ wallet, headSlot: head[0]?.slot ?? null }, "RPC target cursor baseline ready");
-        return;
+        log.info(
+          { wallet, headSlot: head[0]?.slot ?? null },
+          "RPC target activation boundary ready; current head will be decoded",
+        );
       }
       cursor = await this.cursorStore.ensure(wallet, anchorSlot);
       this.cursorCache.set(wallet, cursor);
     }
 
+    // A pre-existing durable cursor is always authoritative. The watch anchor
+    // only initializes a missing cursor; raising an older cursor to a newer DB
+    // state would skip an unprocessed recovery gap.
+    const recoveryBoundary = cursor;
     const pages: Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[] = [];
     // Find the trusted lower boundary before releasing any work. The previous
     // 5,000-signature discovery cap could leave a busy wallet permanently
@@ -247,15 +326,18 @@ export class RpcBackfillPoller {
       maxPages: RPC_SIGNATURE_MAX_PAGES,
     };
     while (true) {
-      const request = planNextRpcSignaturePage(pages, cursor, paging);
+      const request = planNextRpcSignaturePage(pages, recoveryBoundary, paging);
       if (!request) break;
-      const page = await this.conn.getSignaturesForAddress(pubkey, request, "confirmed");
+      const page = await rpcReadWithTimeout(
+        this.conn.getSignaturesForAddress(pubkey, request, "confirmed"),
+        "signature page",
+      );
       pages.push(page);
-      const plan = planRpcSignaturePages(pages, cursor, paging);
+      const plan = planRpcSignaturePages(pages, recoveryBoundary, paging);
       if (plan.complete || plan.backlogDetected) break;
     }
 
-    const plan = planRpcSignaturePages(pages, cursor, paging);
+    const plan = planRpcSignaturePages(pages, recoveryBoundary, paging);
     if (plan.backlogDetected || !plan.complete) {
       this.backlogWallets.add(wallet);
       cursor = await this.cursorStore.markBacklog(
@@ -271,9 +353,12 @@ export class RpcBackfillPoller {
 
     for (let offset = 0; offset < recovery.signatures.length; offset += 50) {
       const signatureBatch = recovery.signatures.slice(offset, offset + 50);
-      const txs = await this.conn.getParsedTransactions(
-        signatureBatch.map((sig) => sig.signature),
-        { commitment: "confirmed", maxSupportedTransactionVersion: 0 },
+      const txs = await rpcReadWithTimeout(
+        this.conn.getParsedTransactions(
+          signatureBatch.map((sig) => sig.signature),
+          { commitment: "confirmed", maxSupportedTransactionVersion: 0 },
+        ),
+        "parsed transaction batch",
       );
       for (const [index, sig] of signatureBatch.entries()) {
         const tx = txs[index];
@@ -287,7 +372,8 @@ export class RpcBackfillPoller {
           this.applyCursorHealth(wallet, cursor);
           return;
         }
-        const events = decodeParsedTransaction(wallet, tx as any);
+        const decoded = decodeParsedTransactionWithCoverage(wallet, tx as any);
+        const events = decoded.events;
         for (const event of events) {
           event.source = "rpc";
           event.delivery = "catchup";
@@ -303,6 +389,23 @@ export class RpcBackfillPoller {
             "RPC fallback feed event",
           );
           await this.onEvent(event);
+        }
+        if (this.options.onUnresolvedOutflow) {
+          for (const event of decoded.unresolvedOutflows) {
+            event.source = "rpc";
+            event.delivery = "catchup";
+            event.observedAtMs = Date.now();
+            log.warn(
+              {
+                wallet: event.wallet,
+                mint: event.tokenMint,
+                ageMs: event.blockTimeMs ? Math.max(0, Date.now() - event.blockTimeMs) : null,
+                reason: event.reason,
+              },
+              "RPC custody outflow could not be classified as a verified sell or transfer",
+            );
+            await this.options.onUnresolvedOutflow(event);
+          }
         }
         cursor = await this.cursorStore.advance(
           wallet,
@@ -344,26 +447,52 @@ export class RpcBackfillPoller {
   }
 }
 
+async function rpcReadWithTimeout<T>(request: Promise<T>, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      request,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`RPC ${label} timed out`)), RPC_READ_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function positiveSlot(value: number | undefined): number | undefined {
   return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value : undefined;
 }
 
 export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
+  return decodeParsedTransactionWithCoverage(wallet, tx).events;
+}
+
+export function decodeParsedTransactionWithCoverage(
+  wallet: string,
+  tx: any,
+): { events: FeedEvent[]; unresolvedOutflows: UnresolvedOutflowEvent[] } {
   const out: FeedEvent[] = [];
+  const unresolvedOutflows: UnresolvedOutflowEvent[] = [];
   const meta = tx?.meta;
-  if (!meta || meta.err !== null && meta.err !== undefined) return out;
+  if (!meta || (meta.err !== null && meta.err !== undefined)) {
+    return { events: out, unresolvedOutflows };
+  }
 
   const signature = String(tx?.transaction?.signatures?.[0] ?? "");
   const slot = Number(tx?.slot ?? 0);
   const observedAtMs = Date.now();
   const parsedBlockTime = Number(tx?.blockTime);
-  const blockTimeMs = Number.isFinite(parsedBlockTime) && parsedBlockTime > 0
-    ? parsedBlockTime * 1000
-    : undefined;
+  const blockTimeMs =
+    Number.isFinite(parsedBlockTime) && parsedBlockTime > 0 ? parsedBlockTime * 1000 : undefined;
   const eventTimeMs = blockTimeMs ?? observedAtMs;
   const message = tx?.transaction?.message;
   const accountKeyEntries = message?.accountKeys ?? [];
-  const accountKeys = accountKeyEntries.map((key: any) => key?.pubkey?.toBase58?.() ?? String(key?.pubkey ?? key));
+  const accountKeys = accountKeyEntries.map(
+    (key: any) => key?.pubkey?.toBase58?.() ?? String(key?.pubkey ?? key),
+  );
   const signerKeys = new Set<string>(
     accountKeyEntries
       .filter((key: any) => key?.signer === true)
@@ -393,51 +522,79 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
   const rows = allRows.filter((row) => row.mint !== WSOL_MINT);
   const hasSwapSignal = hasVerifiedSwapSignal(meta?.logMessages ?? []);
   const hasSolMove = Math.abs(solDelta) > 0.0005;
-  const positiveOutputRows = rows.filter((row) => tokenDelta(row) > 1e-12);
+  const positiveOutputRows = rows.filter((row) => tokenDeltaSign(row) > 0);
   const walletSigned = signerKeys.has(wallet);
   const walletCanAuthorizeSwap = signerKeys.size === 1 && signerKeys.has(wallet);
-  const emittedBuyMints = new Set<string>();
   const negativeWalletMints = new Set(
-    rows.filter((row) => tokenDelta(row) < -1e-12).map((row) => row.mint),
+    rows.filter((row) => tokenDeltaSign(row) < 0).map((row) => row.mint),
   );
   const globalOutputMints = new Set(positiveOutputRows.map((row) => row.mint));
   for (const recipientRow of recipientBalanceRows(meta, wallet, accountKeys)) {
-    if (
-      recipientRow.post - recipientRow.pre > 1e-12 &&
-      !negativeWalletMints.has(recipientRow.tokenMint)
-    ) {
+    if (tokenDeltaSign(recipientRow) > 0 && !negativeWalletMints.has(recipientRow.tokenMint)) {
       globalOutputMints.add(recipientRow.tokenMint);
     }
   }
+  const forwardedBuy = inferBuyForwardedOut(
+    meta,
+    wallet,
+    accountKeys,
+    attributionRows,
+    solSpend,
+    hasSwapSignal,
+    walletCanAuthorizeSwap,
+    negativeWalletMints,
+  );
 
   for (const row of rows) {
-    const delta = row.post - row.pre;
-    if (Math.abs(delta) < 1e-12) continue;
-    const side: "buy" | "sell" = delta > 0 ? "buy" : "sell";
-    const sellAttribution = side === "sell"
-      ? attributeVerifiedSell(
-          attributionRows,
-          row.mint,
-          nativeSolDelta,
-          hasSwapSignal,
-          walletSigned,
-          signerKeys.size,
-        )
-      : undefined;
-    const verifiedSwapForWallet = side === "buy"
-      ? walletCanAuthorizeSwap && (hasSolMove || hasSwapSignal)
-      : Boolean(sellAttribution?.verified);
+    const sign = tokenDeltaSign(row);
+    if (sign === 0) continue;
+    const delta = tokenDelta(row);
+    const side: "buy" | "sell" = sign > 0 ? "buy" : "sell";
+    if (side === "buy" && forwardedBuy?.tokenMint === row.mint) continue;
+    const sellAttribution =
+      side === "sell"
+        ? attributeVerifiedSell(
+            attributionRows,
+            row.mint,
+            nativeSolDelta,
+            hasSwapSignal,
+            walletSigned,
+            signerKeys.size,
+          )
+        : undefined;
+    const verifiedSwapForWallet =
+      side === "buy"
+        ? walletCanAuthorizeSwap && (hasSolMove || hasSwapSignal)
+        : Boolean(sellAttribution?.verified);
     if (verifiedSwapForWallet) {
       if (side === "buy" && !hasSwapSignal) {
-        log.info({ wallet, signature, mint: row.mint }, "positive token delta skipped — no explicit swap instruction");
+        log.info(
+          { wallet, signature, mint: row.mint },
+          "positive token delta skipped — no explicit swap instruction",
+        );
         continue;
       }
-      if (hasSolMove && !hasSwapSignal && ((side === "buy" && solDelta > 0) || (side === "sell" && solDelta < 0))) continue;
-      const verifiedSpend = side === "buy"
-        ? attributeVerifiedBuy(attributionRows, row.mint, globalOutputMints.size, solSpend, hasSwapSignal)
-        : undefined;
+      if (
+        hasSolMove &&
+        !hasSwapSignal &&
+        ((side === "buy" && solDelta > 0) || (side === "sell" && solDelta < 0))
+      )
+        continue;
+      const verifiedSpend =
+        side === "buy"
+          ? attributeVerifiedBuy(
+              attributionRows,
+              row.mint,
+              globalOutputMints.size,
+              solSpend,
+              hasSwapSignal,
+            )
+          : undefined;
       if (side === "buy" && !verifiedSpend?.verified) {
-        log.info({ wallet, signature, mint: row.mint }, "positive token delta skipped — no unambiguous wallet-specific spend");
+        log.info(
+          { wallet, signature, mint: row.mint },
+          "positive token delta skipped — no unambiguous wallet-specific spend",
+        );
         continue;
       }
       out.push({
@@ -446,6 +603,16 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
         side,
         tokenMint: row.mint,
         amountTokens: Math.abs(delta),
+        amountRaw: row.rawExact
+          ? (row.postRaw - row.preRaw < 0n
+              ? row.preRaw - row.postRaw
+              : row.postRaw - row.preRaw
+            ).toString()
+          : undefined,
+        tokenBalanceBefore: row.pre,
+        tokenBalanceAfter: row.post,
+        tokenBalanceBeforeRaw: row.rawExact ? row.preRaw.toString() : undefined,
+        tokenBalanceAfterRaw: row.rawExact ? row.postRaw.toString() : undefined,
         decimals: row.decimals,
         amountUsd: verifiedSpend?.amountUsd,
         spentToken: verifiedSpend?.spentToken,
@@ -460,18 +627,27 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
         blockTimeMs,
         observedAtMs,
       });
-      if (side === "buy") emittedBuyMints.add(row.mint);
       continue;
     }
 
-    if (delta < 0) {
-      const recipients = findTransferRecipients(meta, row.mint, wallet, Math.abs(delta), accountKeys);
+    if (sign < 0) {
+      const recipients = findTransferRecipients(
+        meta,
+        row.mint,
+        wallet,
+        Math.abs(delta),
+        accountKeys,
+      );
       if (recipients.length > 0) {
         const batchRecipients = recipients
           .map((recipient) => ({
             wallet: recipient.owner,
             amountTokens: recipient.amount,
+            amountRaw: recipient.amountRaw,
             recipientPreAmount: recipient.pre,
+            recipientPostAmount: recipient.post,
+            recipientPreRaw: recipient.preRaw,
+            recipientPostRaw: recipient.postRaw,
           }))
           .sort((a, b) => a.wallet.localeCompare(b.wallet));
         const first = batchRecipients[0]!;
@@ -482,6 +658,10 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
           tokenMint: row.mint,
           amountTokens: batchRecipients.reduce((sum, recipient) => sum + recipient.amountTokens, 0),
           decimals: row.decimals,
+          senderPreAmount: row.pre,
+          senderPostAmount: row.post,
+          senderPreRaw: row.rawExact ? row.preRaw.toString() : undefined,
+          senderPostRaw: row.rawExact ? row.postRaw.toString() : undefined,
           recipientPreAmount: first.recipientPreAmount,
           recipients: batchRecipients,
           slot,
@@ -494,19 +674,39 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
     }
   }
 
-  const inferredBuy = positiveOutputRows.length === 0
-    ? inferBuyTransferredOut(
-        meta,
-        wallet,
-        accountKeys,
-        attributionRows,
-        solSpend,
-        hasSwapSignal,
-        walletCanAuthorizeSwap,
-        emittedBuyMints,
-        negativeWalletMints,
-      )
-    : null;
+  const attributedNegativeMints = new Set(
+    out.flatMap((event) => {
+      if (event.kind === "transfer" && event.from === wallet) return [event.tokenMint];
+      if (event.kind === "swap" && event.wallet === wallet && event.side === "sell") {
+        return [event.tokenMint];
+      }
+      return [];
+    }),
+  );
+  for (const row of rows) {
+    if (tokenDeltaSign(row) >= 0 || attributedNegativeMints.has(row.mint)) continue;
+    const deltaRaw = rawTokenDelta(row);
+    unresolvedOutflows.push({
+      kind: "unresolved_outflow",
+      wallet,
+      tokenMint: row.mint,
+      amountTokens: Math.abs(tokenDelta(row)),
+      amountRaw: deltaRaw !== undefined ? (-deltaRaw).toString() : undefined,
+      preAmount: row.pre,
+      postAmount: row.post,
+      preRaw: row.rawExact ? row.preRaw.toString() : undefined,
+      postRaw: row.rawExact ? row.postRaw.toString() : undefined,
+      decimals: row.decimals,
+      slot,
+      txSig: signature,
+      timestampMs: eventTimeMs,
+      blockTimeMs,
+      observedAtMs,
+      reason: "negative_token_delta_not_attributed",
+    });
+  }
+
+  const inferredBuy = forwardedBuy;
   if (inferredBuy) {
     const verifiedSpend = attributeVerifiedBuy(
       attributionRows,
@@ -516,30 +716,56 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
       hasSwapSignal,
     );
     if (!verifiedSpend.verified) {
-      log.info({ wallet, signature, mint: inferredBuy.tokenMint }, "inferred target buy skipped — input/output attribution is ambiguous");
-      return out;
+      log.info(
+        { wallet, signature, mint: inferredBuy.tokenMint },
+        "inferred target buy skipped — input/output attribution is ambiguous",
+      );
+      return { events: out, unresolvedOutflows };
     }
-    log.warn({
-      wallet,
-      signature,
-      mint: inferredBuy.tokenMint,
-      amountTokens: inferredBuy.amountTokens,
-      recipients: inferredBuy.recipients.map((r) => ({ wallet: r.owner, amountTokens: r.amountTokens })),
-      nativeSolDelta: solDelta,
-      hasSwapSignal,
-    }, "rpc fallback inferred target buy from same-tx recipient balances");
+    log.warn(
+      {
+        wallet,
+        signature,
+        mint: inferredBuy.tokenMint,
+        amountTokens: inferredBuy.amountTokens,
+        recipients: inferredBuy.recipients.map((r) => ({
+          wallet: r.owner,
+          amountTokens: r.amountTokens,
+        })),
+        nativeSolDelta: solDelta,
+        hasSwapSignal,
+      },
+      "rpc fallback inferred target buy from same-tx recipient balances",
+    );
 
     out.push({
       kind: "swap",
       wallet,
       side: "buy",
       tokenMint: inferredBuy.tokenMint,
-      amountTokens: inferredBuy.amountTokens,
+      amountTokens:
+        inferredBuy.retainedAmountTokens > 0
+          ? inferredBuy.retainedAmountTokens
+          : inferredBuy.amountTokens,
+      amountRaw:
+        inferredBuy.retainedAmountTokens > 0
+          ? inferredBuy.retainedAmountRaw
+          : inferredBuy.amountRaw,
+      grossAmountTokens: inferredBuy.amountTokens,
+      grossAmountRaw: inferredBuy.amountRaw,
+      tokenBalanceBefore: inferredBuy.chainPreAmount,
+      tokenBalanceAfter: inferredBuy.chainPostAmount,
+      tokenBalanceBeforeRaw: inferredBuy.chainPreRaw,
+      tokenBalanceAfterRaw: inferredBuy.chainPostRaw,
       decimals: inferredBuy.decimals,
       amountUsd: verifiedSpend.amountUsd,
       spentToken: verifiedSpend.spentToken,
       solSpend: verifiedSpend.solSpend,
-      inferredRecipients: inferredBuy.recipients.map((recipient) => recipient.owner),
+      inferredRecipients:
+        inferredBuy.retainedAmountTokens > 0
+          ? undefined
+          : inferredBuy.recipients.map((recipient) => recipient.owner),
+      custodyForwardRecipients: inferredBuy.recipients.map((recipient) => recipient.owner),
       solDelta,
       slot,
       txSig: signature,
@@ -555,6 +781,10 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
         wallet: recipient.owner,
         amountTokens: recipient.amountTokens,
         recipientPreAmount: recipient.pre,
+        amountRaw: recipient.amountRaw,
+        recipientPostAmount: recipient.post,
+        recipientPreRaw: recipient.preRaw,
+        recipientPostRaw: recipient.postRaw,
       }))
       .sort((a, b) => a.wallet.localeCompare(b.wallet));
     const first = recipients[0]!;
@@ -563,8 +793,17 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
       from: wallet,
       to: first.wallet,
       tokenMint: inferredBuy.tokenMint,
-      amountTokens: inferredBuy.amountTokens,
+      amountTokens: inferredBuy.forwardedAmountTokens,
       decimals: inferredBuy.decimals,
+      senderPreAmount: inferredBuy.amountTokens,
+      senderPostAmount: inferredBuy.retainedAmountTokens,
+      senderPreRaw: inferredBuy.amountRaw,
+      senderPostRaw: inferredBuy.retainedAmountRaw,
+      sameTransactionAcquisition: true,
+      chainSenderPreAmount: inferredBuy.chainPreAmount,
+      chainSenderPostAmount: inferredBuy.chainPostAmount,
+      chainSenderPreRaw: inferredBuy.chainPreRaw,
+      chainSenderPostRaw: inferredBuy.chainPostRaw,
       recipientPreAmount: first.recipientPreAmount,
       recipients,
       slot,
@@ -575,7 +814,7 @@ export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {
     });
   }
 
-  return out;
+  return { events: out, unresolvedOutflows };
 }
 
 function ownerMintRows(meta: any, owner: string, accountKeys: string[]): WalletTokenDelta[] {
@@ -593,7 +832,9 @@ function ownerMintRows(meta: any, owner: string, accountKeys: string[]): WalletT
         postRaw: 0n,
         rawExact: true,
       };
-      row[field] += Number(balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0);
+      row[field] += Number(
+        balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0,
+      );
       const raw = parseRawTokenAmount(balance?.uiTokenAmount?.amount);
       if (raw === undefined) row.rawExact = false;
       else if (field === "pre") row.preRaw += raw;
@@ -613,6 +854,9 @@ type RecipientBalanceRow = {
   pre: number;
   post: number;
   decimals: number;
+  preRaw: bigint;
+  postRaw: bigint;
+  rawExact: boolean;
 };
 
 function recipientBalanceRows(
@@ -620,7 +864,7 @@ function recipientBalanceRows(
   wallet: string,
   accountKeys: string[],
 ): RecipientBalanceRow[] {
-  const ownerMintRows = new Map<string, { owner: string; tokenMint: string; pre: number; post: number; decimals: number }>();
+  const ownerMintRows = new Map<string, RecipientBalanceRow>();
   const ingestRecipientBalances = (balances: any[], field: "pre" | "post") => {
     for (const balance of balances ?? []) {
       const owner = resolveTokenOwner(balance, balance?.mint, accountKeys, wallet);
@@ -632,8 +876,17 @@ function recipientBalanceRows(
         pre: 0,
         post: 0,
         decimals: Number(balance?.uiTokenAmount?.decimals ?? 0),
+        preRaw: 0n,
+        postRaw: 0n,
+        rawExact: true,
       };
-      row[field] += Number(balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0);
+      row[field] += Number(
+        balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0,
+      );
+      const raw = parseRawTokenAmount(balance?.uiTokenAmount?.amount);
+      if (raw === undefined) row.rawExact = false;
+      else if (field === "pre") row.preRaw += raw;
+      else row.postRaw += raw;
       row.decimals = Number(balance?.uiTokenAmount?.decimals ?? row.decimals);
       ownerMintRows.set(key, row);
     }
@@ -643,7 +896,7 @@ function recipientBalanceRows(
   return Array.from(ownerMintRows.values());
 }
 
-function inferBuyTransferredOut(
+function inferBuyForwardedOut(
   meta: any,
   wallet: string,
   accountKeys: string[],
@@ -651,45 +904,151 @@ function inferBuyTransferredOut(
   solSpend: number | undefined,
   hasSwapSignal: boolean,
   walletCanAuthorizeSwap: boolean,
-  emittedBuyMints: Set<string>,
   negativeWalletMints: Set<string>,
-): { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number; pre: number }> } | null {
-  if (!walletCanAuthorizeSwap || !hasSwapSignal || !hasWalletSpecificSpend(walletRows, solSpend)) return null;
+): {
+  tokenMint: string;
+  amountTokens: number;
+  amountRaw?: string;
+  retainedAmountTokens: number;
+  retainedAmountRaw?: string;
+  forwardedAmountTokens: number;
+  decimals: number;
+  chainPreAmount: number;
+  chainPostAmount: number;
+  chainPreRaw?: string;
+  chainPostRaw?: string;
+  recipients: Array<{
+    owner: string;
+    amountTokens: number;
+    amountRaw?: string;
+    pre: number;
+    post: number;
+    preRaw?: string;
+    postRaw?: string;
+  }>;
+} | null {
+  if (!walletCanAuthorizeSwap || !hasSwapSignal || !hasWalletSpecificSpend(walletRows, solSpend))
+    return null;
 
-  const rows = new Map<string, { tokenMint: string; amountTokens: number; decimals: number; recipients: Array<{ owner: string; amountTokens: number; pre: number }> }>();
+  const candidateMints = new Set(
+    walletRows
+      .filter((row) => row.mint !== WSOL_MINT && tokenDeltaSign(row) > 0)
+      .map((row) => row.mint),
+  );
+  const rows = new Map<
+    string,
+    {
+      tokenMint: string;
+      forwardedAmountTokens: number;
+      forwardedAmountRaw?: bigint;
+      rawExact: boolean;
+      decimals: number;
+      recipients: Array<{
+        owner: string;
+        amountTokens: number;
+        amountRaw?: string;
+        pre: number;
+        post: number;
+        preRaw?: string;
+        postRaw?: string;
+      }>;
+    }
+  >();
   for (const balance of recipientBalanceRows(meta, wallet, accountKeys)) {
     if (!isOnCurveWallet(balance.owner)) continue;
-    if (emittedBuyMints.has(balance.tokenMint) || negativeWalletMints.has(balance.tokenMint)) continue;
-    const delta = balance.post - balance.pre;
-    if (delta <= 1e-12) continue;
+    if (negativeWalletMints.has(balance.tokenMint) || tokenDeltaSign(balance) <= 0) continue;
+    candidateMints.add(balance.tokenMint);
+    const delta = tokenDelta(balance);
+    const rawDelta = rawTokenDelta(balance);
     const row: {
       tokenMint: string;
-      amountTokens: number;
+      forwardedAmountTokens: number;
+      forwardedAmountRaw?: bigint;
+      rawExact: boolean;
       decimals: number;
-      recipients: Array<{ owner: string; amountTokens: number; pre: number }>;
+      recipients: Array<{
+        owner: string;
+        amountTokens: number;
+        amountRaw?: string;
+        pre: number;
+        post: number;
+        preRaw?: string;
+        postRaw?: string;
+      }>;
     } = rows.get(balance.tokenMint) ?? {
       tokenMint: balance.tokenMint,
-      amountTokens: 0,
+      forwardedAmountTokens: 0,
+      forwardedAmountRaw: 0n,
+      rawExact: true,
       decimals: balance.decimals,
       recipients: [],
     };
-    row.amountTokens += delta;
+    row.forwardedAmountTokens += delta;
+    if (rawDelta === undefined) {
+      row.rawExact = false;
+      row.forwardedAmountRaw = undefined;
+    } else if (row.rawExact) {
+      row.forwardedAmountRaw = (row.forwardedAmountRaw ?? 0n) + rawDelta;
+    }
     row.decimals = balance.decimals;
-    row.recipients.push({ owner: balance.owner, amountTokens: delta, pre: balance.pre });
+    row.recipients.push({
+      owner: balance.owner,
+      amountTokens: delta,
+      amountRaw: balance.rawExact ? (balance.postRaw - balance.preRaw).toString() : undefined,
+      pre: balance.pre,
+      post: balance.post,
+      preRaw: balance.rawExact ? balance.preRaw.toString() : undefined,
+      postRaw: balance.rawExact ? balance.postRaw.toString() : undefined,
+    });
     rows.set(balance.tokenMint, row);
   }
 
-  const candidates = Array.from(rows.values()).sort((a, b) => b.amountTokens - a.amountTokens);
-  return candidates.length === 1 ? candidates[0] : null;
+  if (candidateMints.size !== 1) return null;
+  const tokenMint = Array.from(candidateMints)[0]!;
+  const forwarded = rows.get(tokenMint);
+  if (!forwarded || forwarded.forwardedAmountTokens <= 0 || forwarded.recipients.length === 0)
+    return null;
+
+  const retained = walletRows.find((row) => row.mint === tokenMint);
+  const retainedAmountTokens = retained && tokenDeltaSign(retained) > 0 ? tokenDelta(retained) : 0;
+  const retainedRaw = retained && tokenDeltaSign(retained) > 0 ? rawTokenDelta(retained) : 0n;
+  const grossAmountTokens = retainedAmountTokens + forwarded.forwardedAmountTokens;
+  const grossRaw =
+    retainedRaw !== undefined && forwarded.rawExact
+      ? retainedRaw + (forwarded.forwardedAmountRaw ?? 0n)
+      : undefined;
+  return {
+    tokenMint,
+    amountTokens: grossAmountTokens,
+    amountRaw: grossRaw?.toString(),
+    retainedAmountTokens,
+    retainedAmountRaw: retainedRaw?.toString(),
+    forwardedAmountTokens: forwarded.forwardedAmountTokens,
+    decimals: forwarded.decimals,
+    chainPreAmount: retained?.pre ?? 0,
+    chainPostAmount: retained?.post ?? 0,
+    chainPreRaw: retained?.rawExact ? retained.preRaw.toString() : undefined,
+    chainPostRaw: retained?.rawExact ? retained.postRaw.toString() : undefined,
+    recipients: forwarded.recipients,
+  };
 }
 
-function resolveTokenOwner(balance: any, mint: string | undefined, accountKeys: string[], watchedWallet: string): string {
+function resolveTokenOwner(
+  balance: any,
+  mint: string | undefined,
+  accountKeys: string[],
+  watchedWallet: string,
+): string {
   if (balance?.owner) return String(balance.owner);
   const accountIndex = Number(balance?.accountIndex);
   const tokenAccount = Number.isFinite(accountIndex) ? accountKeys[accountIndex] : "";
   if (!tokenAccount || !mint) return "";
   try {
-    const ata = getAssociatedTokenAddressSync(new PublicKey(mint), new PublicKey(watchedWallet), true).toBase58();
+    const ata = getAssociatedTokenAddressSync(
+      new PublicKey(mint),
+      new PublicKey(watchedWallet),
+      true,
+    ).toBase58();
     if (ata === tokenAccount) return watchedWallet;
   } catch {
     return tokenAccount;
@@ -703,24 +1062,48 @@ function findTransferRecipients(
   sender: string,
   amount: number,
   accountKeys: string[],
-): Array<{ owner: string; pre: number; amount: number }> {
+): Array<{
+  owner: string;
+  pre: number;
+  post: number;
+  amount: number;
+  amountRaw?: string;
+  preRaw?: string;
+  postRaw?: string;
+}> {
   const senderRows = ownerMintRows(meta, sender, accountKeys).filter(
-    (row) => row.mint === mint && tokenDelta(row) < -1e-12,
+    (row) => row.mint === mint && tokenDeltaSign(row) < 0,
   );
   if (senderRows.length !== 1) return [];
-  const peerRows = recipientBalanceRows(meta, sender, accountKeys)
-    .filter((row) => row.tokenMint === mint);
+  const peerRows = recipientBalanceRows(meta, sender, accountKeys).filter(
+    (row) => row.tokenMint === mint,
+  );
   // Do not attribute transaction-wide recipients to this sender when another
   // owner also supplied the same mint. Parsed RPC payloads can contain several
   // independent transfers, so conservation alone is not enough in that case.
-  if (peerRows.some((row) => row.post - row.pre < -1e-12)) return [];
+  if (peerRows.some((row) => tokenDeltaSign(row) < 0)) return [];
   const recipients = peerRows
-    .filter((row) => row.tokenMint === mint && row.post - row.pre > 1e-12)
-    .map((row) => ({ owner: row.owner, pre: row.pre, amount: row.post - row.pre }));
+    .filter((row) => row.tokenMint === mint && tokenDeltaSign(row) > 0)
+    .map((row) => ({
+      owner: row.owner,
+      pre: row.pre,
+      post: row.post,
+      amount: tokenDelta(row),
+      amountRaw: row.rawExact ? (row.postRaw - row.preRaw).toString() : undefined,
+      preRaw: row.rawExact ? row.preRaw.toString() : undefined,
+      postRaw: row.rawExact ? row.postRaw.toString() : undefined,
+    }));
   const received = recipients.reduce((sum, row) => sum + row.amount, 0);
+  const senderRawDelta = rawTokenDelta(senderRows[0]!);
+  const rawConserves =
+    senderRawDelta !== undefined && recipients.every((row) => row.amountRaw !== undefined)
+      ? recipients.reduce((sum, row) => sum + BigInt(row.amountRaw!), 0n) === -senderRawDelta
+      : null;
   if (
     recipients.length === 0 ||
-    Math.abs(received - amount) / Math.max(amount, 1e-9) >= 0.05
+    (rawConserves === null
+      ? Math.abs(received - amount) / Math.max(amount, 1e-9) >= 0.05
+      : !rawConserves)
   ) {
     return [];
   }

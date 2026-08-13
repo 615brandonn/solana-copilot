@@ -103,6 +103,45 @@ hypothetical tiers only. LIVE still requires global Entries to be on and all
 monitoring, classification, freshness, funding, exposure, and durable-claim
 safety gates to pass immediately before the shared executor is called.
 
+## Custody Journey observer
+
+Custody Journey is an optional, observation-only service. It starts a durable
+journey after every verified configured-target buy, follows attributed token
+balances through split and merged wallet transfers, and closes attributed
+amounts only after a strictly verified on-chain sell. It does not read the
+funding key, submit transactions, change Entries, mutate positions, or feed the
+trading worker's safety gate.
+
+For deterministic custody accounting, this service uses one ordered confirmed
+RPC timeline rather than the trading worker's processed Geyser hot path. It
+keeps one active per-mint campaign and records every buy/transfer/sell edge
+inside that campaign. Jupiter v6, Pump, and PumpSwap are the currently verified
+swap sources; unsupported DEX activity is never guessed into a sale.
+Confirmed RPC watches follow wallet-address transaction history. An approved
+SPL-token delegate can move an owner's token account without including that
+owner address; such activity may remain unobserved until balance continuity or
+another attributed event exposes the gap. The dashboard discloses this limit
+and never represents the journey as proof of exhaustive off-chain custody.
+
+Run `supabase/custody-journey-migration.sql` before starting it on an existing
+deployment. The migration is additive and leaves `custody_journey_enabled`
+OFF. After the worker tests and dashboard build pass, the observer can run as a
+separate process using the same server-only environment:
+
+```bash
+cd worker
+npm run build
+pm2 start dist/custody-index.js --name helix-custody-v1
+```
+
+The separate `custody_worker_heartbeat` and `custody_rpc_wallet_cursors`
+tables keep observer outages and catch-up state isolated from copy trading.
+Ordinary wallet transfers are never called sales. Known program boundaries,
+bridges, vaults, and centralized-exchange deposits may end observable on-chain
+custody; the dashboard reports that boundary instead of inventing an off-chain
+sale. Wallet/entity names are confirmed only from explicit evidence or a user
+label. Behavioral guesses are shown as candidates.
+
 ## Security
 
 - Funding private keys are AES-256-GCM encrypted by the dashboard server
@@ -116,5 +155,7 @@ safety gates to pass immediately before the shared executor is called.
 ## Deploying
 
 - Systemd unit or `pm2 start dist/index.js --name helix-worker-v3`.
+- Optional observation-only custody service:
+  `pm2 start dist/custody-index.js --name helix-custody-v1` after its migration.
 - Log to stdout, pipe to Vector/Grafana Loki if you want history.
-- Restart policy: always. The Geyser stream reconnects automatically.
+- Restart policy: always. Durable confirmed-RPC cursors resume after restart.
