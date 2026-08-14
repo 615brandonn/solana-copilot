@@ -58,6 +58,7 @@ export const BotConfigSchema = z
     convictionTierBuyAmountsUsd: z.array(z.number().finite().positive().max(1_000_000)).length(4),
     coordinatedModeEnabled: z.boolean(),
     coordinatedFixedBuyUsd: z.number().finite().positive().max(1_000_000),
+    coordinatedThreeWalletBuyUsd: z.number().min(0).max(100000),
     coordinatedTargetWalletCount: z.number().int().min(2).max(20),
     coordinatedWindowSeconds: z.number().int().min(1).max(21_600),
     coordinatedMcMinUsd: z.number().finite().min(0).max(1_000_000_000),

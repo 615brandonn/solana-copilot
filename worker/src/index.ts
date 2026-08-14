@@ -3845,10 +3845,16 @@ async function main() {
         recordStrategyDecision(event, "failed", "live SOL/USD price is unavailable", metaPatch);
         return null;
       }
+      // Tiered coordinated sizing: when 3+ target wallets converge (his highest-
+      // conviction tier), use the larger three-wallet buy size if configured.
+      const coordinatedWalletCount = options.coordinatedWallets?.length ?? 0;
+      const threeWalletBuyUsd = Number(cfg.coordinated_three_wallet_buy_usd ?? 0);
+      const coordinatedBuyUsd =
+        coordinatedWalletCount >= 3 && threeWalletBuyUsd > 0
+          ? threeWalletBuyUsd
+          : Number(cfg.coordinated_fixed_buy_usd);
       const buyUsd =
-        options.entryMode === "coordinated"
-          ? Number(cfg.coordinated_fixed_buy_usd)
-          : Number(cfg.fixed_buy_usd);
+        options.entryMode === "coordinated" ? coordinatedBuyUsd : Number(cfg.fixed_buy_usd);
       const amountLamports = Math.floor((buyUsd / solPrice) * 1e9);
       if (!cfg.enabled) {
         log.info(

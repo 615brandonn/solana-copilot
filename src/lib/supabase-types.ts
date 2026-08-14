@@ -61,6 +61,7 @@ export type BotConfigRow = {
   conviction_tier_buy_amounts_usd: number[];
   coordinated_mode_enabled: boolean;
   coordinated_fixed_buy_usd: number;
+  coordinated_three_wallet_buy_usd?: number;
   coordinated_target_wallet_count: number;
   coordinated_window_seconds: number;
   coordinated_mc_min_usd: number;

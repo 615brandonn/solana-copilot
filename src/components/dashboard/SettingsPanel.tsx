@@ -193,6 +193,17 @@ export function SettingsPanel({ cfg, onChange }: Props) {
                 />
               </SettingRow>
               <SettingRow
+                label="3-wallet buy amount"
+                hint="Larger USD size used when all 3 target wallets converge (his highest-conviction tier). Set to 0 to use the base coordinated buy amount for all convergence."
+              >
+                <NumInput
+                  value={cfg.coordinatedThreeWalletBuyUsd}
+                  onChange={(n) => onChange({ coordinatedThreeWalletBuyUsd: n })}
+                  prefix="$"
+                  min={0}
+                />
+              </SettingRow>
+              <SettingRow
                 label="Target-wallet confirmation"
                 hint="Require this many distinct configured target wallets to buy the same coin inside the rolling time window."
               >
