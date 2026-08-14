@@ -16,7 +16,7 @@ import {
   WSOL_MINT,
   type WalletTokenDelta,
 } from "./swap-attribution.js";
-import { hasVerifiedSwapSignal } from "./swap-signal.js";
+import { hasHostileExecutorSignal, hasVerifiedSwapSignal } from "./swap-signal.js";
 import {
   planNextRpcSignaturePage,
   planRpcSignaturePages,
@@ -520,7 +520,9 @@ export function decodeParsedTransactionWithCoverage(
   const solDelta = nativeSolDelta + wsolDelta;
   const attributionRows = allRows;
   const rows = allRows.filter((row) => row.mint !== WSOL_MINT);
-  const hasSwapSignal = hasVerifiedSwapSignal(meta?.logMessages ?? []);
+  const hasSwapSignal =
+    hasVerifiedSwapSignal(meta?.logMessages ?? []) ||
+    hasHostileExecutorSignal(meta?.logMessages ?? []);
   const hasSolMove = Math.abs(solDelta) > 0.0005;
   const positiveOutputRows = rows.filter((row) => tokenDeltaSign(row) > 0);
   const walletSigned = signerKeys.has(wallet);
