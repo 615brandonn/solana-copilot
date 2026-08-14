@@ -20,6 +20,9 @@ export type BotConfigRow = {
   jito_tip_sol: number;
   fixed_buy_usd: number;
   custody_journey_enabled: boolean;
+  crew_exit_enabled?: boolean;
+  crew_exit_pct?: number;
+  crew_exit_min_mints?: number;
   conviction_mode_enabled: boolean;
   conviction_trading_mode: "shadow" | "live";
   conviction_rapid_follow_enabled: boolean;
