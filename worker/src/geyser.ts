@@ -25,7 +25,7 @@ import {
   type VerifiedSellAttribution,
   type WalletTokenDelta,
 } from "./swap-attribution.js";
-import { hasVerifiedSwapSignal } from "./swap-signal.js";
+import { hasHostileExecutorSignal, hasVerifiedSwapSignal } from "./swap-signal.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const require = createRequire(import.meta.url);
@@ -573,7 +573,9 @@ export class GeyserFeed {
     // payloads omit token-balance owner, so accountIndex + ATA matching is used
     // as a fallback for every watched wallet.
     const table = this.buildOwnerMintDeltas(meta, accountKeys);
-    const hasSwapSignal = hasVerifiedSwapSignal(meta?.logMessages ?? []);
+    const hasSwapSignal =
+      hasVerifiedSwapSignal(meta?.logMessages ?? []) ||
+      hasHostileExecutorSignal(meta?.logMessages ?? []);
 
     const preBalances: number[] = (meta?.preBalances ?? []).map((n: any) => Number(n));
     const postBalances: number[] = (meta?.postBalances ?? []).map((n: any) => Number(n));
