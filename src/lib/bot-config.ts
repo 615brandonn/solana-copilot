@@ -54,6 +54,7 @@ export type BotConfig = ConvictionConfig & {
   crewExitMinMints: number;
   coordinatedModeEnabled: boolean;
   coordinatedFixedBuyUsd: number;
+  coordinatedThreeWalletBuyUsd: number;
   coordinatedTargetWalletCount: number;
   coordinatedWindowSeconds: number;
   coordinatedMcMinUsd: number;
@@ -165,6 +166,7 @@ export const DEFAULT_CONFIG: BotConfig = {
   crewExitMinMints: 4,
   coordinatedModeEnabled: false,
   coordinatedFixedBuyUsd: 25,
+  coordinatedThreeWalletBuyUsd: 0,
   coordinatedTargetWalletCount: 2,
   coordinatedWindowSeconds: 30,
   coordinatedMcMinUsd: 0,
