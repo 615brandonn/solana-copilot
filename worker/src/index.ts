@@ -1299,7 +1299,6 @@ async function main() {
       .eq("user_id", cfg.user_id)
       .is("closed_at", null);
     for (const pos of positions ?? []) {
-      
       const remaining = Number(pos.amount_remaining);
       const entry = Number(pos.entry_price_usd);
       if (remaining <= 0 || entry <= 0) continue;
