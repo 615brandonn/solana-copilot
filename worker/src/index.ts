@@ -3183,6 +3183,58 @@ async function main() {
     );
   }
 
+  async function maybeExecuteCrewWalletExit(
+    ev: TransferEvent,
+    ctx: { positionId: string; tokenMint: string; targetWallet: string },
+    recipientWallets: string[],
+  ) {
+    if (cfg.crew_exit_enabled !== true || crewWallets.size === 0) return;
+    if (!isFreshAutomaticAction(ev, 120_000)) return;
+    const crewHit = recipientWallets.find((wallet) => crewWallets.has(wallet));
+    if (!crewHit) return;
+    const monitoringGate = currentEntryMonitoringGate();
+    if (monitoringGate.blocked) {
+      log.warn(
+        { positionId: ctx.positionId, reasons: monitoringGate.reasons },
+        "crew-wallet auto-exit blocked by monitoring safety gate",
+      );
+      recordStrategyDecision(
+        ev,
+        "tracked",
+        `crew-wallet auto-exit blocked: ${monitoringGate.reasons.join("; ")}`,
+        { position_id: ctx.positionId },
+      );
+      return;
+    }
+    const { data: pos, error } = await db
+      .from("positions")
+      .select("id,token_mint,amount_remaining,decimals,entry_slot")
+      .eq("id", ctx.positionId)
+      .is("closed_at", null)
+      .maybeSingle();
+    if (error) throw new Error(`crew exit position lookup failed: ${safeDiagnostic(error)}`);
+    if (
+      !pos ||
+      (Number(pos.entry_slot ?? 0) > 0 && ev.slot > 0 && ev.slot < Number(pos.entry_slot))
+    ) {
+      return;
+    }
+    log.info(
+      { positionId: ctx.positionId, mint: ctx.tokenMint, crewWallet: crewHit, txSig: ev.txSig },
+      "held token transferred to reused exit-desk wallet — firing crew exit",
+    );
+    await executeClaimedPercentageExit(
+      pos.id,
+      pos.token_mint,
+      Number(pos.amount_remaining),
+      Number(pos.decimals ?? 0),
+      Number(cfg.crew_exit_pct ?? 100),
+      "crew_wallet",
+      ev,
+      `supply moved to reused exit-desk wallet ${crewHit.slice(0, 8)}…`,
+    );
+  }
+
   async function maybeExecuteTerminalBatchExit(
     ev: TransferEvent,
     ctx: { positionId: string; tokenMint: string; targetWallet: string },
