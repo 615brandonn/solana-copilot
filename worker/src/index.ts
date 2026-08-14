@@ -1533,6 +1533,23 @@ async function main() {
           ),
         );
       }
+      // Analytics: capture exit price, proceeds, and PnL so the trade log is
+      // measurable. Best-effort and non-blocking to execution — the swap has
+      // already landed above; a price-feed miss simply records nulls (prior
+      // behaviour) and never throws.
+      let exitPriceUsd: number | null = null;
+      try {
+        const p = await priceUsd(mint);
+        exitPriceUsd = typeof p === "number" && Number.isFinite(p) && p > 0 ? p : null;
+      } catch {
+        exitPriceUsd = null;
+      }
+      const entryPriceUsd = Number(cur.entry_price_usd ?? 0);
+      const exitAmountUsd = exitPriceUsd !== null ? sellUi * exitPriceUsd : null;
+      const exitPnlPct =
+        exitPriceUsd !== null && entryPriceUsd > 0
+          ? ((exitPriceUsd - entryPriceUsd) / entryPriceUsd) * 100
+          : null;
       await retryDb("save exit trade", () =>
         db.from("trades").insert({
           user_id: cfg.user_id,
@@ -1540,6 +1557,9 @@ async function main() {
           side: "sell",
           token_mint: mint,
           amount_tokens: sellUi,
+          amount_usd: exitAmountUsd,
+          price_usd: exitPriceUsd,
+          pnl_pct: exitPnlPct,
           tx_sig: result.txSig,
           reason,
           latency_ms: result.latencyMs,
