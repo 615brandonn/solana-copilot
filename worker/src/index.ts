@@ -1272,6 +1272,12 @@ async function main() {
       log.error({ err: safeDiagnostic(err) }, "durable entry claim reconciliation failed"),
     );
   }, 60_000);
+  await refreshCrewWallets(cfg.crew_exit_min_mints ?? 4).catch(() => {});
+  setInterval(() => {
+    if (cfg.crew_exit_enabled !== true) return;
+    void refreshCrewWallets(cfg.crew_exit_min_mints ?? 4);
+  }, 60_000);
+
 
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
   setInterval(() => {
