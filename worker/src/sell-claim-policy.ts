@@ -8,7 +8,8 @@ export type SellTriggerKind =
   | "stop_loss"
   | "target_inactivity"
   | "distinct_follower"
-  | "proportional_follower";
+  | "proportional_follower"
+  | "crew_wallet";
 
 export type DurableSellIdentity = {
   sourceTxSig: string;
