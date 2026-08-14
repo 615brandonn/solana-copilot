@@ -633,18 +633,9 @@ export function SettingsPanel({ cfg, onChange }: Props) {
         </SectionCard>
       </fieldset>
 
-      {/* Coordinated mode owns a separate mandatory exit policy. Preserve that
-          legacy UI behavior while keeping the normal exit controls available
-          to Conviction positions. */}
-      <fieldset
-        disabled={cfg.coordinatedModeEnabled && !cfg.convictionModeEnabled}
-        className={
-          cfg.coordinatedModeEnabled && !cfg.convictionModeEnabled
-            ? "pointer-events-none opacity-45"
-            : undefined
-        }
-        aria-disabled={cfg.coordinatedModeEnabled && !cfg.convictionModeEnabled}
-      >
+      {/* Exits (take profit, stop loss, crew, terminal-outflow, follower-seller)
+          now apply to positions from every entry mode. */}
+      <fieldset>
         <SectionCard
           title="Exit strategy"
           description="Take profit, stop loss, and follower propagation"
