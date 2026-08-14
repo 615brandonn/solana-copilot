@@ -2966,6 +2966,17 @@ async function main() {
     const classified = await classifyTransferRecipients(ev);
     if (classified.length === 0) return;
 
+    if (ctx && cfg.crew_exit_enabled === true) {
+      await maybeExecuteCrewWalletExit(
+        ev,
+        ctx,
+        classified.map((recipient) => recipient.wallet),
+      ).catch((err) =>
+        log.error({ err: safeDiagnostic(err) }, "crew-wallet exit attempt failed safely"),
+      );
+    }
+
+
     if (!targetWallets.has(ev.from)) {
       if (ctx) {
         const state = await monitor.recordChainedTransferBatch(ev.tokenMint, ev.from, classified, {
