@@ -99,3 +99,48 @@ export const VERIFIED_SWAP_PROGRAMS = {
   pump: PUMP_PROGRAM,
   pumpSwap: PUMP_SWAP_PROGRAM,
 } as const;
+
+/**
+ * Programs observed executing the tracked operation's otherwise-unverifiable
+ * exits (identified 2026-08-14 via route inventory of unresolved outflows):
+ * an unlabeled private executor and DFlow Aggregator v4. A top-level
+ * invoke+success of any of these is treated as a swap signal so the existing
+ * balance-delta attribution can classify the trade. Instruction names are
+ * deliberately not required: these programs are not in the anchored
+ * TRADE_INSTRUCTIONS whitelist, and requiring names we cannot pin would add
+ * nothing — downstream attribution still demands consistent balance deltas.
+ */
+export const HOSTILE_EXECUTOR_PROGRAMS: ReadonlySet<string> = new Set([
+  "58PMEdUAwvLytNNwCbzrYyhLoh3jpsNV4fW9dT9ibuRc",
+  "DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH",
+]);
+
+export function hasHostileExecutorSignal(logMessages: readonly unknown[]): boolean {
+  const open = new Map<string, number>();
+  let signalled = false;
+  for (const rawLine of logMessages) {
+    if (typeof rawLine !== "string") return false;
+    const invoke = rawLine.match(INVOKE_RE);
+    if (invoke) {
+      if (invoke[2] === "1" && HOSTILE_EXECUTOR_PROGRAMS.has(invoke[1]!)) {
+        open.set(invoke[1]!, (open.get(invoke[1]!) ?? 0) + 1);
+      }
+      continue;
+    }
+    const success = rawLine.match(SUCCESS_RE);
+    if (success && HOSTILE_EXECUTOR_PROGRAMS.has(success[1]!)) {
+      const depth = open.get(success[1]!) ?? 0;
+      if (depth > 0) {
+        open.set(success[1]!, depth - 1);
+        signalled = true;
+      }
+      continue;
+    }
+    const failed = rawLine.match(FAILED_RE);
+    if (failed && HOSTILE_EXECUTOR_PROGRAMS.has(failed[1]!)) {
+      const depth = open.get(failed[1]!) ?? 0;
+      if (depth > 0) open.set(failed[1]!, depth - 1);
+    }
+  }
+  return signalled;
+}
