@@ -49,6 +49,9 @@ export type BotConfig = ConvictionConfig & {
   fixedBuyUsd: number;
   /** Observation-only custody tracing. Never enables Entries or trading. */
   custodyJourneyEnabled: boolean;
+  crewExitEnabled: boolean;
+  crewExitPct: number;
+  crewExitMinMints: number;
   coordinatedModeEnabled: boolean;
   coordinatedFixedBuyUsd: number;
   coordinatedTargetWalletCount: number;
@@ -157,6 +160,9 @@ export const DEFAULT_CONFIG: BotConfig = {
   jitoTipSol: 0.001,
   fixedBuyUsd: 25,
   custodyJourneyEnabled: false,
+  crewExitEnabled: false,
+  crewExitPct: 100,
+  crewExitMinMints: 4,
   coordinatedModeEnabled: false,
   coordinatedFixedBuyUsd: 25,
   coordinatedTargetWalletCount: 2,

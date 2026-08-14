@@ -143,4 +143,8 @@ export type BotConfigRow = {
   large_buy_scanner_min_buy_usd?: number;
   large_buy_scanner_multiplier?: number;
   large_buy_scanner_history_window?: number;
+  // Crew-wallet exit trigger (defensive; derived from custody observer data)
+  crew_exit_enabled?: boolean;
+  crew_exit_pct?: number;
+  crew_exit_min_mints?: number;
 };

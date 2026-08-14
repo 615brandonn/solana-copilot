@@ -313,6 +313,25 @@ async function main() {
     },
     rpcCursorStore,
   );
+  // Crew-wallet registry: reused downstream wallets identified by the custody
+  // observer (view public.crew_wallets). Refreshed on a timer; read-only.
+  let crewWallets = new Set<string>();
+  async function refreshCrewWallets(minMints: number) {
+    const { data, error } = await (db as any)
+      .from("crew_wallets")
+      .select("wallet,mint_count")
+      .gte("mint_count", minMints);
+    if (error) {
+      log.warn({ err: safeDiagnostic(error.message) }, "crew wallet refresh failed; keeping prior set");
+      return;
+    }
+    crewWallets = new Set(
+      (Array.isArray(data) ? data : [])
+        .map((row: { wallet?: string }) => String(row.wallet ?? "").trim())
+        .filter(Boolean),
+    );
+    log.info({ count: crewWallets.size, minMints }, "crew wallet registry refreshed");
+  }
   const monitor: FollowerMonitor = new FollowerMonitor(feed, poller);
   const followerBalanceReconciler = new FollowerBalanceReconciler(
     cfg.user_id,
@@ -1253,6 +1272,12 @@ async function main() {
       log.error({ err: safeDiagnostic(err) }, "durable entry claim reconciliation failed"),
     );
   }, 60_000);
+  await refreshCrewWallets(cfg.crew_exit_min_mints ?? 4).catch(() => {});
+  setInterval(() => {
+    if (cfg.crew_exit_enabled !== true) return;
+    void refreshCrewWallets(cfg.crew_exit_min_mints ?? 4);
+  }, 60_000);
+
 
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
   setInterval(() => {
@@ -2941,6 +2966,17 @@ async function main() {
     const classified = await classifyTransferRecipients(ev);
     if (classified.length === 0) return;
 
+    if (ctx && cfg.crew_exit_enabled === true) {
+      await maybeExecuteCrewWalletExit(
+        ev,
+        ctx,
+        classified.map((recipient) => recipient.wallet),
+      ).catch((err) =>
+        log.error({ err: safeDiagnostic(err) }, "crew-wallet exit attempt failed safely"),
+      );
+    }
+
+
     if (!targetWallets.has(ev.from)) {
       if (ctx) {
         const state = await monitor.recordChainedTransferBatch(ev.tokenMint, ev.from, classified, {
@@ -3155,6 +3191,58 @@ async function main() {
       "high-risk linked target custody-transfer response (deposit is not proof of sale)",
       {},
       tradeLockHeld,
+    );
+  }
+
+  async function maybeExecuteCrewWalletExit(
+    ev: TransferEvent,
+    ctx: { positionId: string; tokenMint: string; targetWallet: string },
+    recipientWallets: string[],
+  ) {
+    if (cfg.crew_exit_enabled !== true || crewWallets.size === 0) return;
+    if (!isFreshAutomaticAction(ev, 120_000)) return;
+    const crewHit = recipientWallets.find((wallet) => crewWallets.has(wallet));
+    if (!crewHit) return;
+    const monitoringGate = currentEntryMonitoringGate();
+    if (monitoringGate.blocked) {
+      log.warn(
+        { positionId: ctx.positionId, reasons: monitoringGate.reasons },
+        "crew-wallet auto-exit blocked by monitoring safety gate",
+      );
+      recordStrategyDecision(
+        ev,
+        "tracked",
+        `crew-wallet auto-exit blocked: ${monitoringGate.reasons.join("; ")}`,
+        { position_id: ctx.positionId },
+      );
+      return;
+    }
+    const { data: pos, error } = await db
+      .from("positions")
+      .select("id,token_mint,amount_remaining,decimals,entry_slot")
+      .eq("id", ctx.positionId)
+      .is("closed_at", null)
+      .maybeSingle();
+    if (error) throw new Error(`crew exit position lookup failed: ${safeDiagnostic(error)}`);
+    if (
+      !pos ||
+      (Number(pos.entry_slot ?? 0) > 0 && ev.slot > 0 && ev.slot < Number(pos.entry_slot))
+    ) {
+      return;
+    }
+    log.info(
+      { positionId: ctx.positionId, mint: ctx.tokenMint, crewWallet: crewHit, txSig: ev.txSig },
+      "held token transferred to reused exit-desk wallet — firing crew exit",
+    );
+    await executeClaimedPercentageExit(
+      pos.id,
+      pos.token_mint,
+      Number(pos.amount_remaining),
+      Number(pos.decimals ?? 0),
+      Number(cfg.crew_exit_pct ?? 100),
+      "crew_wallet",
+      ev,
+      `supply moved to reused exit-desk wallet ${crewHit.slice(0, 8)}…`,
     );
   }
 

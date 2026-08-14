@@ -81,6 +81,9 @@ export function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row
     jitoTipSol: row.jito_tip_sol,
     fixedBuyUsd: row.fixed_buy_usd,
     custodyJourneyEnabled: row.custody_journey_enabled ?? false,
+    crewExitEnabled: row.crew_exit_enabled ?? false,
+    crewExitPct: Number(row.crew_exit_pct ?? 100),
+    crewExitMinMints: Number(row.crew_exit_min_mints ?? 4),
     convictionModeEnabled:
       row.conviction_mode_enabled ?? DEFAULT_CONVICTION_CONFIG.convictionModeEnabled,
     convictionTradingMode:
@@ -253,6 +256,9 @@ export function configToRow(
     jito_tip_sol: cfg.jitoTipSol,
     fixed_buy_usd: cfg.fixedBuyUsd,
     custody_journey_enabled: cfg.custodyJourneyEnabled,
+    crew_exit_enabled: cfg.crewExitEnabled,
+    crew_exit_pct: cfg.crewExitPct,
+    crew_exit_min_mints: cfg.crewExitMinMints,
     conviction_mode_enabled: cfg.convictionModeEnabled,
     conviction_trading_mode: cfg.convictionTradingMode,
     conviction_rapid_follow_enabled: cfg.convictionRapidFollowEnabled,

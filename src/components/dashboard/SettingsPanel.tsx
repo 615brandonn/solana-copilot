@@ -121,6 +121,33 @@ export function SettingsPanel({ cfg, onChange }: Props) {
             aria-label="Enable observation-only Custody Journey monitoring"
           />
         </SettingRow>
+        <SettingRow
+          label="Crew-wallet exit"
+          hint="Sells when a held token is transferred to a wallet the custody observer has seen reused across multiple tokens (the operation's exit desk). Fires on the transfer itself, before any sell is visible."
+        >
+          <Switch
+            checked={cfg.crewExitEnabled}
+            onCheckedChange={(value) => onChange({ crewExitEnabled: value })}
+            aria-label="Enable crew-wallet exit trigger"
+          />
+        </SettingRow>
+        <SettingRow label="Crew exit sell %">
+          <NumInput
+            value={cfg.crewExitPct}
+            onChange={(n) => onChange({ crewExitPct: n })}
+            suffix="%"
+            min={1}
+            max={100}
+          />
+        </SettingRow>
+        <SettingRow label="Min tokens seen to count as crew">
+          <NumInput
+            value={cfg.crewExitMinMints}
+            onChange={(n) => onChange({ crewExitMinMints: n })}
+            min={2}
+            max={20}
+          />
+        </SettingRow>
         <div className="rounded-xl border border-border/70 bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
           Observation only · maximum 8 transfer hops · maximum 250 actively watched wallets per
           journey. Entries and trading controls are independent.
