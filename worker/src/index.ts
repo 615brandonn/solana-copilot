@@ -313,6 +313,25 @@ async function main() {
     },
     rpcCursorStore,
   );
+  // Crew-wallet registry: reused downstream wallets identified by the custody
+  // observer (view public.crew_wallets). Refreshed on a timer; read-only.
+  let crewWallets = new Set<string>();
+  async function refreshCrewWallets(minMints: number) {
+    const { data, error } = await (db as any)
+      .from("crew_wallets")
+      .select("wallet,mint_count")
+      .gte("mint_count", minMints);
+    if (error) {
+      log.warn({ err: safeDiagnostic(error.message) }, "crew wallet refresh failed; keeping prior set");
+      return;
+    }
+    crewWallets = new Set(
+      (Array.isArray(data) ? data : [])
+        .map((row: { wallet?: string }) => String(row.wallet ?? "").trim())
+        .filter(Boolean),
+    );
+    log.info({ count: crewWallets.size, minMints }, "crew wallet registry refreshed");
+  }
   const monitor: FollowerMonitor = new FollowerMonitor(feed, poller);
   const followerBalanceReconciler = new FollowerBalanceReconciler(
     cfg.user_id,
