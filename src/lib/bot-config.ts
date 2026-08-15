@@ -97,6 +97,9 @@ export type BotConfig = ConvictionConfig & {
   takeProfitSellPct: number; // portion to sell e.g. 50
   stopLossEnabled: boolean;
   stopLossPct: number; // e.g. 30 = -30%
+  trailingStopEnabled: boolean;
+  trailingStopPct: number;
+  trailingActivationPct: number;
   proportionalFollowerSells: boolean;
   followerSellerExitEnabled: boolean;
   followerSellerExitCount: number;
@@ -209,6 +212,9 @@ export const DEFAULT_CONFIG: BotConfig = {
   takeProfitSellPct: 50,
   stopLossEnabled: true,
   stopLossPct: 30,
+  trailingStopEnabled: false,
+  trailingStopPct: 35,
+  trailingActivationPct: 50,
   proportionalFollowerSells: true,
   followerSellerExitEnabled: false,
   followerSellerExitCount: 1,

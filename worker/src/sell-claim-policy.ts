@@ -9,7 +9,8 @@ export type SellTriggerKind =
   | "target_inactivity"
   | "distinct_follower"
   | "proportional_follower"
-  | "crew_wallet";
+  | "crew_wallet"
+  | "trailing_stop";
 
 export type DurableSellIdentity = {
   sourceTxSig: string;
@@ -21,7 +22,7 @@ export function periodicSellIdentity(
   positionId: string,
   triggerKind: Extract<
     SellTriggerKind,
-    "take_profit" | "stop_loss" | "target_inactivity" | "distinct_follower"
+    "take_profit" | "stop_loss" | "target_inactivity" | "distinct_follower" | "trailing_stop"
   >,
   variant = "default",
 ): DurableSellIdentity {

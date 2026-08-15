@@ -1289,8 +1289,11 @@ async function main() {
     );
   }, 30_000);
 
+  const positionPeakPrice = new Map<string, number>();
+
   async function checkTpSl() {
-    if (!cfg.take_profit_enabled && !cfg.stop_loss_enabled) return;
+    if (!cfg.take_profit_enabled && !cfg.stop_loss_enabled && cfg.trailing_stop_enabled !== true)
+      return;
     const { data: positions } = await db
       .from("positions")
       .select(
@@ -1305,6 +1308,40 @@ async function main() {
       const price = await priceUsd(pos.token_mint);
       if (!price || price <= 0) continue;
       const gainPct = ((price - entry) / entry) * 100;
+
+      const prevPeak = positionPeakPrice.get(pos.id) ?? price;
+      const peak = price > prevPeak ? price : prevPeak;
+      positionPeakPrice.set(pos.id, peak);
+      if (cfg.trailing_stop_enabled === true) {
+        const peakGainPct = ((peak - entry) / entry) * 100;
+        const dropFromPeakPct = peak > 0 ? ((peak - price) / peak) * 100 : 0;
+        if (
+          peakGainPct >= Math.abs(Number(cfg.trailing_activation_pct ?? 50)) &&
+          dropFromPeakPct >= Math.abs(Number(cfg.trailing_stop_pct ?? 35))
+        ) {
+          log.info(
+            {
+              positionId: pos.id,
+              peakGainPct: peakGainPct.toFixed(1),
+              dropFromPeakPct: dropFromPeakPct.toFixed(1),
+            },
+            "trailing-stop triggered — winner pulled back from peak",
+          );
+          await executeClaimedPercentageExit(
+            pos.id,
+            pos.token_mint,
+            remaining,
+            Number(pos.decimals ?? 0),
+            100,
+            "trailing_stop",
+            undefined,
+            `trailing-stop ${dropFromPeakPct.toFixed(1)}% off peak (peak +${peakGainPct.toFixed(0)}%)`,
+            periodicSellIdentity(pos.id, "trailing_stop"),
+          );
+          positionPeakPrice.delete(pos.id);
+          continue;
+        }
+      }
 
       if (cfg.stop_loss_enabled && gainPct <= -Math.abs(cfg.stop_loss_pct)) {
         const decimals = Number(pos.decimals ?? 0);
@@ -1352,7 +1389,13 @@ async function main() {
         );
       }
     }
+
+    const openIds = new Set((positions ?? []).map((p) => p.id));
+    for (const id of positionPeakPrice.keys()) {
+      if (!openIds.has(id)) positionPeakPrice.delete(id);
+    }
   }
+
 
   async function checkConfiguredPositionExits() {
     const { data: positions, error } = await db
