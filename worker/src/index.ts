@@ -1292,19 +1292,63 @@ async function main() {
   const positionPeakPrice = new Map<string, number>();
 
   async function checkTpSl() {
-    if (!cfg.take_profit_enabled && !cfg.stop_loss_enabled && cfg.trailing_stop_enabled !== true)
+    if (
+      !cfg.take_profit_enabled &&
+      !cfg.stop_loss_enabled &&
+      cfg.trailing_stop_enabled !== true &&
+      cfg.mirror_custody_sell_exit_enabled !== true
+    )
       return;
     const { data: positions } = await db
       .from("positions")
       .select(
-        "id,token_mint,entry_price_usd,amount_tokens,amount_remaining,decimals,tp_taken,mirrored_sold_fraction,entry_mode",
+        "id,token_mint,entry_price_usd,amount_tokens,amount_remaining,decimals,tp_taken,mirrored_sold_fraction,entry_mode,opened_at",
       )
       .eq("user_id", cfg.user_id)
       .is("closed_at", null);
+
+    let mirrorSoldAt: Map<string, string> | null = null;
+    if (cfg.mirror_custody_sell_exit_enabled === true && (positions?.length ?? 0) > 0) {
+      const openMints = Array.from(new Set((positions ?? []).map((p) => p.token_mint)));
+      const { data: soldRows } = await db
+        .from("custody_sell_watch")
+        .select("token_mint,sold_detected_at")
+        .eq("status", "sold")
+        .in("token_mint", openMints);
+      mirrorSoldAt = new Map<string, string>();
+      for (const s of soldRows ?? []) {
+        const mint = (s as { token_mint: string }).token_mint;
+        const at = String((s as { sold_detected_at: string | null }).sold_detected_at ?? "");
+        const prev = mirrorSoldAt.get(mint);
+        if (!prev || at > prev) mirrorSoldAt.set(mint, at);
+      }
+    }
     for (const pos of positions ?? []) {
       const remaining = Number(pos.amount_remaining);
       const entry = Number(pos.entry_price_usd);
       if (remaining <= 0 || entry <= 0) continue;
+
+      if (cfg.mirror_custody_sell_exit_enabled === true && mirrorSoldAt) {
+        const soldAt = mirrorSoldAt.get(pos.token_mint);
+        if (soldAt && (!pos.opened_at || soldAt > String(pos.opened_at))) {
+          log.warn(
+            { positionId: pos.id, tokenMint: pos.token_mint },
+            "target hidden custody sell detected — mirroring exit",
+          );
+          await executeClaimedPercentageExit(
+            pos.id,
+            pos.token_mint,
+            remaining,
+            Number(pos.decimals ?? 0),
+            Math.abs(Number(cfg.mirror_custody_sell_exit_pct ?? 100)) || 100,
+            "mirror_custody_sell",
+            undefined,
+            "mirrored target hidden custody sell (detector)",
+            periodicSellIdentity(pos.id, "mirror_custody_sell"),
+          );
+          continue;
+        }
+      }
       const price = await priceUsd(pos.token_mint);
       if (!price || price <= 0) continue;
       const gainPct = ((price - entry) / entry) * 100;
