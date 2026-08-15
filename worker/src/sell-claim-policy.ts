@@ -23,7 +23,7 @@ export function periodicSellIdentity(
   positionId: string,
   triggerKind: Extract<
     SellTriggerKind,
-    "take_profit" | "stop_loss" | "target_inactivity" | "distinct_follower" | "trailing_stop"
+    "take_profit" | "stop_loss" | "target_inactivity" | "distinct_follower" | "trailing_stop" | "mirror_custody_sell"
   >,
   variant = "default",
 ): DurableSellIdentity {
