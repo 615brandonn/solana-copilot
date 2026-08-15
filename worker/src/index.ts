@@ -1389,7 +1389,13 @@ async function main() {
         );
       }
     }
+
+    const openIds = new Set((positions ?? []).map((p) => p.id));
+    for (const id of positionPeakPrice.keys()) {
+      if (!openIds.has(id)) positionPeakPrice.delete(id);
+    }
   }
+
 
   async function checkConfiguredPositionExits() {
     const { data: positions, error } = await db
