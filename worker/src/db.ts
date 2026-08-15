@@ -119,6 +119,9 @@ export type BotConfigRow = {
   take_profit_sell_pct: number;
   stop_loss_enabled: boolean;
   stop_loss_pct: number;
+  trailing_stop_enabled?: boolean;
+  trailing_stop_pct?: number;
+  trailing_activation_pct?: number;
   proportional_follower_sells: boolean;
   follower_seller_exit_enabled: boolean;
   follower_seller_exit_count: number;

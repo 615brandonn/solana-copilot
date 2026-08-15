@@ -692,6 +692,39 @@ export function SettingsPanel({ cfg, onChange }: Props) {
             </SettingRow>
           )}
           <SettingRow
+            label="Trailing stop"
+            hint="Let winners run: sell when the price falls from its peak by the drop %, but only after the position is up by the activation %. Mirrors the target's ride-until-momentum-stalls behavior."
+          >
+            <Switch
+              checked={cfg.trailingStopEnabled}
+              onCheckedChange={(v) => onChange({ trailingStopEnabled: v })}
+            />
+          </SettingRow>
+          {cfg.trailingStopEnabled && (
+            <SettingRow
+              label="Trailing settings"
+              hint="Arm after +activation% gain, then sell on a drop% pullback from the peak."
+            >
+              <div className="flex items-center gap-2 mono text-xs">
+                <span className="text-muted-foreground">arm at +</span>
+                <NumInput
+                  value={cfg.trailingActivationPct}
+                  onChange={(n) => onChange({ trailingActivationPct: n })}
+                  suffix="%"
+                  min={1}
+                />
+                <span className="text-muted-foreground">drop</span>
+                <NumInput
+                  value={cfg.trailingStopPct}
+                  onChange={(n) => onChange({ trailingStopPct: n })}
+                  suffix="%"
+                  min={1}
+                  max={95}
+                />
+              </div>
+            </SettingRow>
+          )}
+          <SettingRow
             label="Proportional follower sells"
             hint="Mirror follower-wallet exits proportionally. If followers dump 30% of their combined supply, your bot sells 30%."
           >
