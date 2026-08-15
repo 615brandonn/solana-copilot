@@ -10,7 +10,8 @@ export type SellTriggerKind =
   | "distinct_follower"
   | "proportional_follower"
   | "crew_wallet"
-  | "trailing_stop";
+  | "trailing_stop"
+  | "mirror_custody_sell";
 
 export type DurableSellIdentity = {
   sourceTxSig: string;
