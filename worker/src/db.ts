@@ -122,6 +122,8 @@ export type BotConfigRow = {
   trailing_stop_enabled?: boolean;
   trailing_stop_pct?: number;
   trailing_activation_pct?: number;
+  mirror_custody_sell_exit_enabled?: boolean;
+  mirror_custody_sell_exit_pct?: number;
   proportional_follower_sells: boolean;
   follower_seller_exit_enabled: boolean;
   follower_seller_exit_count: number;
