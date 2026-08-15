@@ -1289,8 +1289,11 @@ async function main() {
     );
   }, 30_000);
 
+  const positionPeakPrice = new Map<string, number>();
+
   async function checkTpSl() {
-    if (!cfg.take_profit_enabled && !cfg.stop_loss_enabled) return;
+    if (!cfg.take_profit_enabled && !cfg.stop_loss_enabled && cfg.trailing_stop_enabled !== true)
+      return;
     const { data: positions } = await db
       .from("positions")
       .select(
