@@ -3112,6 +3112,11 @@ async function main() {
       return;
     }
 
+    // Accumulate the target's USDC commitment for this mint (conviction signal).
+    if (targetBuyUsd !== undefined) {
+      addTargetConvictionUsd(event.tokenMint, targetBuyUsd, event.timestampMs);
+    }
+
     if (entryStrategy === "regular") {
       await tryCopyBuy(event, "target copy buy", {
         entryMode: "regular",
