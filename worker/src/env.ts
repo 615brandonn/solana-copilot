@@ -34,6 +34,17 @@ const Env = z.object({
   DFLOW_BASE_URL: z.string().url().default("https://quote-api.dflow.net"),
   DFLOW_API_KEY: z.string().min(1).optional(),
 
+  // USDC-conviction gate/sizing for coordinated entries (env-flagged, default off).
+  // Gates out low-conviction spray and sizes up when the target has committed more
+  // real USDC to a mint. Off unless USDC_CONVICTION_ENABLED is set.
+  USDC_CONVICTION_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
+  USDC_CONVICTION_MIN_USD: z.coerce.number().default(150),
+  USDC_CONVICTION_MAX_BUY_USD: z.coerce.number().default(40),
+  USDC_CONVICTION_REF_USD: z.coerce.number().default(500),
+
   // Single user this bot instance manages (matches the dashboard user)
   HELIX_USER_ID: z.string().uuid().default("00000000-0000-0000-0000-000000000000"),
 
