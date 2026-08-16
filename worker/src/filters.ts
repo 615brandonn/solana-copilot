@@ -8,6 +8,7 @@ export type TokenMeta = {
   symbol?: string;
   marketCapUsd?: number;
   liquidityUsd?: number;
+  volumeH24Usd?: number;
   pairCreatedAtMs?: number;
   isPumpFun: boolean;
   socials: { website?: string; twitter?: string; telegram?: string };
