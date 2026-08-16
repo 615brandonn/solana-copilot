@@ -117,6 +117,7 @@ async function main(): Promise<void> {
   const poller = new RpcBackfillPoller(rpc, handle, cursorStore, 1_200, true, {
     onUnresolvedOutflow: handleUnresolvedOutflow,
     allowEarlierAnchorRewind: true,
+    pollConcurrency: 32,
   });
   registry = new CustodyWatchRegistry(poller);
 
