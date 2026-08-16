@@ -60,6 +60,8 @@ export type RpcBackfillPollerOptions = {
   onUnresolvedOutflow?: (event: UnresolvedOutflowEvent) => Promise<void> | void;
   /** Custody-only: replay an older range when a new mint attribution predates this wallet cursor. */
   allowEarlierAnchorRewind?: boolean;
+  /** Wallets polled per batch. Defaults to 8, the trading poller's baseline. */
+  pollConcurrency?: number;
 };
 
 export type RpcWatchOptions = {
@@ -212,8 +214,9 @@ export class RpcBackfillPoller {
     this.lastPollAt = Date.now();
     try {
       const entries = Array.from(this.watched.entries());
-      for (let offset = 0; offset < entries.length; offset += 8) {
-        const batch = entries.slice(offset, offset + 8);
+      const concurrency = Math.max(1, Math.trunc(Number(this.options.pollConcurrency ?? 8)));
+      for (let offset = 0; offset < entries.length; offset += concurrency) {
+        const batch = entries.slice(offset, offset + concurrency);
         const results = await Promise.allSettled(
           batch.map(([wallet, options]) => this.pollWallet(wallet, options)),
         );
