@@ -350,6 +350,27 @@ async function main() {
     });
   };
   const coordinatedBuys = new CoordinatedBuyTracker();
+
+  // Cumulative USDC the target has committed to each mint over a rolling window
+  // (his real conviction). Used by the USDC-conviction gate/sizing when enabled.
+  const CONVICTION_WINDOW_MS = 2 * 60 * 60_000;
+  const targetConvictionUsd = new Map<string, Array<{ usd: number; at: number }>>();
+  function addTargetConvictionUsd(mint: string, usd: number, atMs: number) {
+    if (!(usd > 0)) return;
+    const arr = targetConvictionUsd.get(mint) ?? [];
+    arr.push({ usd, at: atMs });
+    const cutoff = atMs - CONVICTION_WINDOW_MS;
+    targetConvictionUsd.set(
+      mint,
+      arr.filter((e) => e.at >= cutoff),
+    );
+  }
+  function targetConvictionUsdFor(mint: string, nowMs: number): number {
+    const arr = targetConvictionUsd.get(mint);
+    if (!arr) return 0;
+    const cutoff = nowMs - CONVICTION_WINDOW_MS;
+    return arr.reduce((s, e) => (e.at >= cutoff ? s + e.usd : s), 0);
+  }
   // Every buy and sell for the same mint shares this queue. This prevents a
   // scale-in from racing an exit and attaching newly bought tokens to a
   // position that was closed while the buy was being built.
