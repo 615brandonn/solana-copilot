@@ -4061,7 +4061,7 @@ async function main() {
       // USDC-conviction gate + sizing (env-flagged, coordinated entries only):
       // skip coins the target has barely committed to, and size up as his
       // committed USDC rises. Leaves behaviour unchanged when the flag is off.
-      if (env.USDC_CONVICTION_ENABLED && options.entryMode === "coordinated") {
+      if (env.USDC_CONVICTION_ENABLED && !env.REVIVAL_ONLY_MODE && options.entryMode === "coordinated") {
         const hisUsd = targetConvictionUsdFor(event.tokenMint, Date.now());
         const minUsd = Number(env.USDC_CONVICTION_MIN_USD);
         if (hisUsd < minUsd) {
