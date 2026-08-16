@@ -23,6 +23,17 @@ const Env = z.object({
   PRICE_API_URL: z.string().url().default("https://api.jup.ag/price/v3"),
   JUPITER_API_KEY: z.string().min(1).optional(),
 
+  // DFlow aggregator (the venue Alien fills through). When DFLOW_ENABLED is
+  // true the executor tries DFlow FIRST and falls back to the full Jupiter →
+  // Pump.fun chain on any failure, so leaving it off changes nothing. The
+  // public quote-api requires a key (email hello@dflow.net); dev is rate-limited.
+  DFLOW_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
+  DFLOW_BASE_URL: z.string().url().default("https://quote-api.dflow.net"),
+  DFLOW_API_KEY: z.string().min(1).optional(),
+
   // Single user this bot instance manages (matches the dashboard user)
   HELIX_USER_ID: z.string().uuid().default("00000000-0000-0000-0000-000000000000"),
 

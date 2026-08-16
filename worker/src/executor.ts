@@ -198,6 +198,126 @@ async function fetchJupiterSwap(
   return swap;
 }
 
+// --- DFlow aggregator route (Jupiter-compatible quote/swap shape) ------------
+// DFlow is the venue the tracked operator fills through. It returns a base64
+// swapTransaction just like Jupiter v1, so we sign and submit through the exact
+// same Jito+RPC-backup path. Enabled only when env.DFLOW_ENABLED is true; any
+// failure falls back to the existing Jupiter → Pump.fun chain.
+type DflowQuote = Record<string, unknown> & { outAmount: string };
+type DflowSwap = Record<string, unknown> & { swapTransaction: string };
+const DFLOW_QUOTE_TIMEOUT_MS = 10_000;
+const DFLOW_BUILD_TIMEOUT_MS = 10_000;
+
+function dflowHeaders(): Record<string, string> {
+  return env.DFLOW_API_KEY ? { "x-api-key": env.DFLOW_API_KEY } : {};
+}
+
+async function fetchDflowQuote(input: ExecuteInput): Promise<DflowQuote> {
+  const url = new URL(`${env.DFLOW_BASE_URL}/quote`);
+  url.searchParams.set("inputMint", input.inputMint);
+  url.searchParams.set("outputMint", input.outputMint);
+  url.searchParams.set("amount", String(input.amountLamports));
+  url.searchParams.set("slippageBps", String(input.slippageBps));
+  const quote = await readJsonOrThrow<DflowQuote>(
+    await fetch(url, {
+      headers: dflowHeaders(),
+      signal: AbortSignal.timeout(DFLOW_QUOTE_TIMEOUT_MS),
+    }),
+    "DFlow quote",
+  );
+  if (!quote?.outAmount) throw new Error("DFlow quote did not include outAmount");
+  return quote;
+}
+
+async function fetchDflowSwap(quote: DflowQuote, signer: Keypair): Promise<DflowSwap> {
+  const swap = await readJsonOrThrow<DflowSwap>(
+    await fetch(`${env.DFLOW_BASE_URL}/swap`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...dflowHeaders() },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: signer.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: "auto",
+      }),
+      signal: AbortSignal.timeout(DFLOW_BUILD_TIMEOUT_MS),
+    }),
+    "DFlow swap",
+  );
+  if (!swap?.swapTransaction) throw new Error("DFlow swap did not return a transaction");
+  return swap;
+}
+
+async function executeDflowSwap(
+  input: ExecuteInput,
+  signer: Keypair,
+  t0: number,
+): Promise<ExecuteResult> {
+  const quote = await fetchDflowQuote(input);
+  const swapResp = await fetchDflowSwap(quote, signer);
+
+  const tx = VersionedTransaction.deserialize(Buffer.from(swapResp.swapTransaction, "base64"));
+  tx.sign([signer]);
+  const knownSig = signedTransactionSignature(tx);
+
+  const outAmountRaw = Number(quote?.outAmount ?? 0);
+  const outDecimals = Number(input.outputDecimals ?? 0);
+  const outUiAmount = outDecimals > 0 ? outAmountRaw / Math.pow(10, outDecimals) : outAmountRaw;
+
+  return submitSignedSwapTx(tx, signer, knownSig, input, t0, outUiAmount, "dflow");
+}
+
+// Shared Jito+RPC-backup submission used by the DFlow route. Mirrors the proven
+// executeJupiterSwap submission semantics: one signed transaction, same bytes
+// re-broadcast so a second attempt can never create a second trade.
+async function submitSignedSwapTx(
+  tx: VersionedTransaction,
+  signer: Keypair,
+  knownSig: string,
+  input: ExecuteInput,
+  t0: number,
+  outUiAmount: number,
+  label: string,
+): Promise<ExecuteResult> {
+  if (input.route === "jito" && JITO_TIP_ACCOUNTS.length > 0) {
+    let jitoAccepted = false;
+    let submissionMayHaveOccurred = false;
+    try {
+      await sendViaJito(tx, signer, input.jitoTipSol, t0, knownSig, input.beforeSubmit);
+      jitoAccepted = true;
+      submissionMayHaveOccurred = true;
+    } catch (err) {
+      if (!mayTryAlternateExecution(err) && !isPostSubmissionError(err)) throw err;
+      submissionMayHaveOccurred = isPostSubmissionError(err);
+    }
+    try {
+      await sendRawViaRpc(
+        tx,
+        t0,
+        `${label}-rpc-backup`,
+        knownSig,
+        submissionMayHaveOccurred ? undefined : input.beforeSubmit,
+      );
+      submissionMayHaveOccurred = true;
+    } catch (err) {
+      if (!submissionMayHaveOccurred && !isPostSubmissionError(err)) throw err;
+      submissionMayHaveOccurred ||= isPostSubmissionError(err);
+    }
+    if (!submissionMayHaveOccurred) throw new Error(`${label}: Jito and RPC failed before submission`);
+    await waitForLanding(knownSig, t0, `${label}/rpc-backup`, jitoAccepted ? "jito" : "rpc");
+    return { txSig: knownSig, latencyMs: Date.now() - t0, route: jitoAccepted ? "jito" : "rpc", outUiAmount };
+  }
+
+  try {
+    await sendRawViaRpc(tx, t0, label, knownSig, input.beforeSubmit);
+  } catch (err) {
+    if (!isPostSubmissionError(err)) throw err;
+  }
+  await waitForLanding(knownSig, t0, label, "rpc");
+  return { txSig: knownSig, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
+}
+
 export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   const t0 = Date.now();
   const decodedSecret = bs58.decode(input.signerSecret.trim());
@@ -209,6 +329,24 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   const signer = Keypair.fromSecretKey(decodedSecret);
 
   const failures: string[] = [];
+  // DFlow first when enabled; fall through to the full Jupiter → Pump.fun chain
+  // on any recoverable failure so behaviour is unchanged when it is off.
+  if (env.DFLOW_ENABLED) {
+    try {
+      return await executeDflowSwap(input, signer, t0);
+    } catch (err) {
+      if (!mayTryAlternateExecution(err)) {
+        log.error(submissionLogFields(err, input), "DFlow submission requires reconciliation; alternate routes blocked");
+        throw err;
+      }
+      failures.push(`DFlow: ${errorMessage(err)}`);
+      log.warn(
+        { err: safeDiagnostic(err), inputMint: input.inputMint, outputMint: input.outputMint },
+        "DFlow route failed — falling back to Jupiter",
+      );
+    }
+  }
+
   try {
     return await executeJupiterSwap(input, signer, t0);
   } catch (err) {
