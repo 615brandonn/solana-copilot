@@ -1648,7 +1648,10 @@ async function main() {
         inputMint: mint,
         outputMint: WSOL,
         amountLamports: sellRaw,
-        slippageBps: 500,
+        // Exits prioritize certainty of getting out over price: a stop-loss that
+        // reverts on Alien's fast dumps (Jupiter 6001) leaves the position
+        // unprotected. 15% slippage makes exits actually land during a crash.
+        slippageBps: 1500,
         route: cfg.execution_route,
         jitoTipSol: cfg.jito_tip_sol,
       });
