@@ -52,6 +52,7 @@ export async function loadTokenMeta(mint: string): Promise<TokenMeta> {
           : undefined,
       marketCapUsd: finiteNumber(pair?.marketCap ?? pair?.fdv),
       liquidityUsd: finiteNumber(pair?.liquidity?.usd),
+      volumeH24Usd: finiteNumber(pair?.volume?.h24),
       pairCreatedAtMs:
         pairCreatedAtValues.length > 0 ? Math.min(...pairCreatedAtValues) : undefined,
       isPumpFun: (pair?.dexId ?? "").toLowerCase() === "pumpfun" || mint.endsWith("pump"),
