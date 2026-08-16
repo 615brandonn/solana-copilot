@@ -2648,7 +2648,9 @@ async function main() {
           inputMint: WSOL,
           outputMint: event.tokenMint,
           amountLamports,
-          slippageBps: 300,
+          // Memecoins move fast; 3% slippage caused ~40% of coordinated buys to
+          // revert with Jupiter 6001 (slippage exceeded). 8% cuts those reverts.
+          slippageBps: 800,
           route: cfg.execution_route,
           jitoTipSol: cfg.jito_tip_sol,
           outputDecimals: event.decimals,
@@ -4138,7 +4140,9 @@ async function main() {
           inputMint: WSOL,
           outputMint: event.tokenMint,
           amountLamports,
-          slippageBps: 300,
+          // Memecoins move fast; 3% slippage caused ~40% of coordinated buys to
+          // revert with Jupiter 6001 (slippage exceeded). 8% cuts those reverts.
+          slippageBps: 800,
           route: cfg.execution_route,
           jitoTipSol: cfg.jito_tip_sol,
           outputDecimals: event.decimals,
