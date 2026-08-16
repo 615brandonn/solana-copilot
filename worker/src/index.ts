@@ -3117,6 +3117,18 @@ async function main() {
       addTargetConvictionUsd(event.tokenMint, targetBuyUsd, event.timestampMs);
     }
 
+    // Revival-only mode: on ANY target buy, route straight to an entry attempt.
+    // tryCopyBuy applies the aged+dormant revival gate (and all normal filters).
+    if (env.REVIVAL_ONLY_MODE) {
+      await tryCopyBuy(event, "revival first-signal buy", {
+        entryMode: "coordinated",
+        firstBuy,
+        targetBuyUsd,
+        coordinatedWallets: [event.wallet],
+      });
+      return;
+    }
+
     if (entryStrategy === "regular") {
       await tryCopyBuy(event, "target copy buy", {
         entryMode: "regular",
@@ -3977,6 +3989,34 @@ async function main() {
     }
 
     const meta = await loadTokenMeta(event.tokenMint);
+
+    // Revival gate: only enter aged, dormant coins (a dead coin the target is
+    // reviving), on the first signal. Applies only in revival-only mode.
+    if (env.REVIVAL_ONLY_MODE) {
+      const ageDays =
+        meta.pairCreatedAtMs !== undefined
+          ? (Date.now() - meta.pairCreatedAtMs) / 86_400_000
+          : undefined;
+      if (ageDays === undefined || ageDays < Number(env.REVIVAL_MIN_AGE_DAYS)) {
+        recordStrategyDecision(
+          event,
+          "filtered",
+          `revival: coin not aged (${ageDays === undefined ? "unknown" : ageDays.toFixed(1)}d < ${env.REVIVAL_MIN_AGE_DAYS}d)`,
+        );
+        return null;
+      }
+      if (
+        meta.volumeH24Usd !== undefined &&
+        meta.volumeH24Usd > Number(env.REVIVAL_MAX_H24_VOL_USD)
+      ) {
+        recordStrategyDecision(
+          event,
+          "filtered",
+          `revival: coin not dormant (24h vol $${Math.round(meta.volumeH24Usd)} > $${env.REVIVAL_MAX_H24_VOL_USD})`,
+        );
+        return null;
+      }
+    }
     const marketDataObservedAtMs = Date.now();
     const metaPatch: StrategyObservationPatch = {
       market_cap_usd: meta.marketCapUsd,
@@ -4061,7 +4101,7 @@ async function main() {
       // USDC-conviction gate + sizing (env-flagged, coordinated entries only):
       // skip coins the target has barely committed to, and size up as his
       // committed USDC rises. Leaves behaviour unchanged when the flag is off.
-      if (env.USDC_CONVICTION_ENABLED && options.entryMode === "coordinated") {
+      if (env.USDC_CONVICTION_ENABLED && !env.REVIVAL_ONLY_MODE && options.entryMode === "coordinated") {
         const hisUsd = targetConvictionUsdFor(event.tokenMint, Date.now());
         const minUsd = Number(env.USDC_CONVICTION_MIN_USD);
         if (hisUsd < minUsd) {
