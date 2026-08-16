@@ -1283,6 +1283,91 @@ async function main() {
   setInterval(() => {
     checkTpSl().catch((err) => log.error({ err: safeDiagnostic(err) }, "tp/sl loop failed"));
   }, 4000);
+
+  // A sell claim that ends "uncertain" (Jito submitted, transaction failed
+  // on-chain) is terminal for reclaim purposes, so the periodic exit path can
+  // never retry it and the position is left with no working stop. Resolve the
+  // ambiguity against chain state: if the funding wallet still holds the mint,
+  // the sell did not land, so the claim is safe to reopen for retry.
+  async function recoverStrandedSellClaims() {
+    if (!fundingReadiness.ready || !fundingReadiness.walletPubkey) return;
+    const staleBefore = new Date(Date.now() - 120_000).toISOString();
+    const { data: stranded, error } = await db
+      .from("sell_signal_claims")
+      .select("id,position_id,trigger_kind,status")
+      .eq("user_id", cfg.user_id)
+      .in("status", ["uncertain", "claimed"])
+      .lt("updated_at", staleBefore)
+      .limit(25);
+    if (error) {
+      log.warn({ err: safeDiagnostic(error) }, "stranded sell claim scan failed");
+      return;
+    }
+    if (!stranded || stranded.length === 0) return;
+
+    let heldByMint: Map<string, number>;
+    try {
+      const holdings = await walletTokenHoldings(rpc, fundingReadiness.walletPubkey);
+      heldByMint = new Map(holdings.map((row) => [row.token_mint, Number(row.amount) || 0]));
+    } catch (err) {
+      // Fail closed: without chain truth we must not reopen a claim that may
+      // have landed, or the same sell could be submitted twice.
+      log.warn(
+        { err: safeDiagnostic(err) },
+        "stranded sell claim recovery skipped — wallet holdings unavailable",
+      );
+      return;
+    }
+
+    for (const claim of stranded as Array<{
+      id: string;
+      position_id: string;
+      trigger_kind: string;
+      status: string;
+    }>) {
+      const { data: pos, error: posError } = await db
+        .from("positions")
+        .select("id,token_mint,amount_remaining")
+        .eq("id", claim.position_id)
+        .is("closed_at", null)
+        .maybeSingle();
+      if (posError || !pos || Number(pos.amount_remaining) <= 0) continue;
+      // Tokens gone => the prior sell landed. Leave the claim terminal.
+      if ((heldByMint.get(String(pos.token_mint)) ?? 0) <= 0) continue;
+      const { data: reopened, error: reopenError } = await db
+        .from("sell_signal_claims")
+        .update({
+          status: "failed_pre_submit",
+          error_code: "reopened by recovery: tokens still held on-chain, prior sell did not land",
+          submission_started_at: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", claim.id)
+        .in("status", ["uncertain", "claimed"])
+        .select("id")
+        .maybeSingle();
+      if (reopenError) {
+        log.warn(
+          { err: safeDiagnostic(reopenError), positionId: claim.position_id },
+          "stranded sell claim reopen failed",
+        );
+      } else if (reopened) {
+        log.warn(
+          {
+            positionId: claim.position_id,
+            triggerKind: claim.trigger_kind,
+            priorStatus: claim.status,
+          },
+          "stranded sell claim reopened — tokens still held on-chain, exit will retry",
+        );
+      }
+    }
+  }
+  setInterval(() => {
+    recoverStrandedSellClaims().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "stranded sell claim recovery loop failed"),
+    );
+  }, 60_000);
   setInterval(() => {
     checkConfiguredPositionExits().catch((err) =>
       log.error({ err: safeDiagnostic(err) }, "configured position exit loop failed"),
