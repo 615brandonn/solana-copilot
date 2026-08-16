@@ -45,6 +45,15 @@ const Env = z.object({
   USDC_CONVICTION_MAX_BUY_USD: z.coerce.number().default(40),
   USDC_CONVICTION_REF_USD: z.coerce.number().default(500),
 
+  // Revival-only mode (env-flagged, default off): buy ONLY aged, dormant coins the
+  // target re-touches, on the first signal. Ignores fresh-launch convergence entirely.
+  REVIVAL_ONLY_MODE: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
+  REVIVAL_MIN_AGE_DAYS: z.coerce.number().default(2),
+  REVIVAL_MAX_H24_VOL_USD: z.coerce.number().default(75000),
+
   // Single user this bot instance manages (matches the dashboard user)
   HELIX_USER_ID: z.string().uuid().default("00000000-0000-0000-0000-000000000000"),
 
