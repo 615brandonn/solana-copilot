@@ -3977,6 +3977,34 @@ async function main() {
     }
 
     const meta = await loadTokenMeta(event.tokenMint);
+
+    // Revival gate: only enter aged, dormant coins (a dead coin the target is
+    // reviving), on the first signal. Applies only in revival-only mode.
+    if (env.REVIVAL_ONLY_MODE) {
+      const ageDays =
+        meta.pairCreatedAtMs !== undefined
+          ? (Date.now() - meta.pairCreatedAtMs) / 86_400_000
+          : undefined;
+      if (ageDays === undefined || ageDays < Number(env.REVIVAL_MIN_AGE_DAYS)) {
+        recordStrategyDecision(
+          event,
+          "filtered",
+          `revival: coin not aged (${ageDays === undefined ? "unknown" : ageDays.toFixed(1)}d < ${env.REVIVAL_MIN_AGE_DAYS}d)`,
+        );
+        return null;
+      }
+      if (
+        meta.volumeH24Usd !== undefined &&
+        meta.volumeH24Usd > Number(env.REVIVAL_MAX_H24_VOL_USD)
+      ) {
+        recordStrategyDecision(
+          event,
+          "filtered",
+          `revival: coin not dormant (24h vol $${Math.round(meta.volumeH24Usd)} > $${env.REVIVAL_MAX_H24_VOL_USD})`,
+        );
+        return null;
+      }
+    }
     const marketDataObservedAtMs = Date.now();
     const metaPatch: StrategyObservationPatch = {
       market_cap_usd: meta.marketCapUsd,
