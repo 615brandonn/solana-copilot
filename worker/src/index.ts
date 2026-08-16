@@ -3117,6 +3117,18 @@ async function main() {
       addTargetConvictionUsd(event.tokenMint, targetBuyUsd, event.timestampMs);
     }
 
+    // Revival-only mode: on ANY target buy, route straight to an entry attempt.
+    // tryCopyBuy applies the aged+dormant revival gate (and all normal filters).
+    if (env.REVIVAL_ONLY_MODE) {
+      await tryCopyBuy(event, "revival first-signal buy", {
+        entryMode: "coordinated",
+        firstBuy,
+        targetBuyUsd,
+        coordinatedWallets: [event.wallet],
+      });
+      return;
+    }
+
     if (entryStrategy === "regular") {
       await tryCopyBuy(event, "target copy buy", {
         entryMode: "regular",
