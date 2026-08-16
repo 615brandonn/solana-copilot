@@ -4051,8 +4051,38 @@ async function main() {
         coordinatedWalletCount >= 3 && threeWalletBuyUsd > 0
           ? threeWalletBuyUsd
           : Number(cfg.coordinated_fixed_buy_usd);
-      const buyUsd =
+      let buyUsd =
         options.entryMode === "coordinated" ? coordinatedBuyUsd : Number(cfg.fixed_buy_usd);
+      // USDC-conviction gate + sizing (env-flagged, coordinated entries only):
+      // skip coins the target has barely committed to, and size up as his
+      // committed USDC rises. Leaves behaviour unchanged when the flag is off.
+      if (env.USDC_CONVICTION_ENABLED && options.entryMode === "coordinated") {
+        const hisUsd = targetConvictionUsdFor(event.tokenMint, Date.now());
+        const minUsd = Number(env.USDC_CONVICTION_MIN_USD);
+        if (hisUsd < minUsd) {
+          log.info(
+            { mint: event.tokenMint, targetUsdc: Math.round(hisUsd), minUsd },
+            "conviction gate: skipped low-conviction coin",
+          );
+          recordStrategyDecision(
+            event,
+            "filtered",
+            `conviction gate: target committed $${Math.round(hisUsd)} < $${minUsd}`,
+            { ...metaPatch, amount_usd: options.targetBuyUsd },
+          );
+          return null;
+        }
+        const maxUsd = Number(env.USDC_CONVICTION_MAX_BUY_USD);
+        const refUsd = Number(env.USDC_CONVICTION_REF_USD);
+        if (maxUsd > buyUsd && refUsd > minUsd) {
+          const t = Math.min(1, Math.max(0, (hisUsd - minUsd) / (refUsd - minUsd)));
+          buyUsd = buyUsd + (maxUsd - buyUsd) * t;
+        }
+        log.info(
+          { mint: event.tokenMint, targetUsdc: Math.round(hisUsd), sizedBuyUsd: Number(buyUsd.toFixed(2)) },
+          "conviction gate: passed",
+        );
+      }
       const amountLamports = Math.floor((buyUsd / solPrice) * 1e9);
       if (!cfg.enabled) {
         log.info(
