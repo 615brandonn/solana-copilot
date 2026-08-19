@@ -10,6 +10,11 @@ import { db, type BotConfigRow } from "./db.js";
 import { GeyserFeed, type FeedEvent, type SwapEvent, type TransferEvent } from "./geyser.js";
 import { FollowerMonitor, type ChainedTransferBatchState } from "./monitor.js";
 import { executeSwap, type ExecuteResult } from "./executor.js";
+import {
+  checkPriceSanity,
+  priceSanityConfigFrom,
+  type PriceSanityState,
+} from "./price-sanity.js";
 import { SubmissionUncertainError, isPostSubmissionError } from "./execution-safety.js";
 import {
   canReclaimEntryClaim,
