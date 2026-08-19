@@ -1461,6 +1461,9 @@ async function main() {
   }, 30_000);
 
   const positionPeakPrice = new Map<string, number>();
+  // Per-position price-tick sanity state, so one corrupted feed tick can never
+  // by itself trigger a take-profit, trailing stop, or stop-loss.
+  const positionPriceSanity = new Map<string, PriceSanityState>();
 
   async function checkTpSl() {
     if (
