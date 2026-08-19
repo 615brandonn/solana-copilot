@@ -1525,6 +1525,43 @@ async function main() {
       }
       const price = await priceUsd(pos.token_mint);
       if (!price || price <= 0) continue;
+      if (cfg.price_sanity_enabled !== false) {
+        const sanity = checkPriceSanity(
+          price,
+          entry,
+          positionPriceSanity.get(pos.id),
+          priceSanityConfigFrom(cfg),
+        );
+        positionPriceSanity.set(pos.id, sanity.state);
+        if (!sanity.accepted) {
+          log.warn(
+            {
+              positionId: pos.id,
+              tokenMint: pos.token_mint,
+              price,
+              entry,
+              entryMultiple: sanity.entryMultiple,
+              tickJump: sanity.tickJump,
+              reason: sanity.reason,
+            },
+            "price tick failed sanity gate — no exit decision this cycle",
+          );
+          continue;
+        }
+        if (sanity.confirmedOutlier) {
+          log.warn(
+            {
+              positionId: pos.id,
+              tokenMint: pos.token_mint,
+              price,
+              entry,
+              entryMultiple: sanity.entryMultiple,
+              tickJump: sanity.tickJump,
+            },
+            "extreme price confirmed by repeated ticks — treating as real",
+          );
+        }
+      }
       const gainPct = ((price - entry) / entry) * 100;
 
       const prevPeak = positionPeakPrice.get(pos.id) ?? price;
