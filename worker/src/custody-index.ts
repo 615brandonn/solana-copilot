@@ -22,6 +22,8 @@ const rpc = new Connection(env.RPC_URL, { commitment: "confirmed" });
 type CustodyConfig = {
   enabled: boolean;
   targetWallets: Set<string>;
+  degradedBacklogFraction: number;
+  degradedSweepStaleMinutes: number;
 };
 
 function validWallet(value: unknown): string | null {
@@ -36,7 +38,9 @@ function validWallet(value: unknown): string | null {
 async function loadCustodyConfig(): Promise<CustodyConfig> {
   const { data, error } = await db
     .from("bot_config")
-    .select("target_wallet,additional_target_wallets,custody_journey_enabled")
+    .select(
+      "target_wallet,additional_target_wallets,custody_journey_enabled,custody_degraded_backlog_fraction,custody_degraded_sweep_stale_minutes",
+    )
     .eq("user_id", env.HELIX_USER_ID)
     .maybeSingle();
   if (error) throw new Error(`custody config load failed: ${safeDiagnostic(error)}`);
@@ -46,9 +50,15 @@ async function loadCustodyConfig(): Promise<CustodyConfig> {
   ]
     .map(validWallet)
     .filter((wallet): wallet is string => wallet !== null);
+  const fractionRaw = Number(data?.custody_degraded_backlog_fraction);
+  const staleRaw = Number(data?.custody_degraded_sweep_stale_minutes);
   return {
     enabled: data?.custody_journey_enabled === true,
     targetWallets: new Set(targets),
+    degradedBacklogFraction: Number.isFinite(fractionRaw)
+      ? Math.min(1, Math.max(0, fractionRaw))
+      : 0.25,
+    degradedSweepStaleMinutes: Number.isFinite(staleRaw) && staleRaw > 0 ? staleRaw : 240,
   };
 }
 
