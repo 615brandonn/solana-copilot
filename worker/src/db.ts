@@ -152,5 +152,8 @@ export type BotConfigRow = {
   // Crew-wallet exit trigger (defensive; derived from custody observer data)
   crew_exit_enabled?: boolean;
   crew_exit_pct?: number;
+  fanout_exit_enabled?: boolean;
+  fanout_min_age_minutes?: number;
+  fanout_abandon_threshold?: number;
   crew_exit_min_mints?: number;
 };

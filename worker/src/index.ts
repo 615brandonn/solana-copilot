@@ -1389,6 +1389,71 @@ async function main() {
       log.error({ err: safeDiagnostic(err) }, "stranded sell claim recovery loop failed"),
     );
   }, 60_000);
+
+  // Fan-out abandonment exit. The custody observer records how many custody
+  // wallets the target spreads a coin across. On his own data, coins that
+  // stayed at <=3 wallets never became a campaign (0 of 1,252), and every coin
+  // he did work exceeded 3 wallets within 90 minutes. So a position past the
+  // age threshold whose coin is still at/below the threshold is abandoned:
+  // exit it rather than hold dead weight. Reads the `position_fanout` view.
+  async function checkFanoutAbandonExits() {
+    if (!cfg.fanout_exit_enabled) return;
+    const minAgeMin = Number(cfg.fanout_min_age_minutes ?? 90);
+    const threshold = Number(cfg.fanout_abandon_threshold ?? 3);
+    if (!Number.isFinite(minAgeMin) || !Number.isFinite(threshold)) return;
+
+    const { data: rows, error } = await db
+      .from("position_fanout")
+      .select("position_id,token_mint,age_min,fanout")
+      .is("closed_at", null)
+      .gte("age_min", minAgeMin)
+      .lte("fanout", threshold)
+      .limit(10);
+    if (error) {
+      log.warn({ err: safeDiagnostic(error) }, "fan-out abandonment scan failed");
+      return;
+    }
+    if (!rows || rows.length === 0) return;
+
+    for (const row of rows as Array<{
+      position_id: string;
+      token_mint: string;
+      age_min: number;
+      fanout: number;
+    }>) {
+      const { data: pos, error: posError } = await db
+        .from("positions")
+        .select("id,token_mint,amount_remaining,decimals")
+        .eq("id", row.position_id)
+        .is("closed_at", null)
+        .maybeSingle();
+      if (posError || !pos || Number(pos.amount_remaining) <= 0) continue;
+
+      log.warn(
+        { positionId: pos.id, mint: pos.token_mint, fanout: row.fanout, ageMin: row.age_min },
+        "fan-out abandonment exit — target spread this coin across too few custody wallets",
+      );
+      await executeClaimedPercentageExit(
+        pos.id,
+        pos.token_mint,
+        Number(pos.amount_remaining),
+        Number(pos.decimals ?? 0),
+        100,
+        "target_inactivity",
+        undefined,
+        `fan-out abandoned (${row.fanout} custody wallets after ${Math.round(row.age_min)}m)`,
+        {
+          ...periodicSellIdentity(pos.id, "target_inactivity", "fanout"),
+          markCoordinatedExit: true,
+        },
+      );
+    }
+  }
+  setInterval(() => {
+    checkFanoutAbandonExits().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "fan-out abandonment loop failed"),
+    );
+  }, 60_000);
   setInterval(() => {
     checkConfiguredPositionExits().catch((err) =>
       log.error({ err: safeDiagnostic(err) }, "configured position exit loop failed"),
