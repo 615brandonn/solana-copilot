@@ -70,6 +70,10 @@ async function main(): Promise<void> {
   let lastError: string | null = null;
   let pollerStarted = false;
   let decodedEventCount = 0;
+  // Backlog progress signal for the heartbeat's degraded flag: sweeps can take
+  // hours, so we track when the backlog last shrank rather than poll recency.
+  let lastBacklogCount = Number.POSITIVE_INFINITY;
+  let lastBacklogProgressAt = Date.now();
   let schedulePendingReplay = () => undefined;
 
   // Assigned after the feed/poller callbacks close over it to break their
