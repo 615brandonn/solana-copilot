@@ -3117,11 +3117,17 @@ async function main() {
       addTargetConvictionUsd(event.tokenMint, targetBuyUsd, event.timestampMs);
     }
 
-    // Revival mode no longer enters on the first signal: it falls through to the
-    // coordinated convergence path below (requires coordinated_target_wallet_count
-    // wallets). The aged + dormant revival gate still runs inside tryCopyBuy, so
-    // revival mode buys ONLY revived dead coins — just at convergence, not on the
-    // first wallet.
+    // Revival-only mode: on ANY target buy, route straight to an entry attempt.
+    // tryCopyBuy applies the aged+dormant revival gate (and all normal filters).
+    if (env.REVIVAL_ONLY_MODE) {
+      await tryCopyBuy(event, "revival first-signal buy", {
+        entryMode: "coordinated",
+        firstBuy,
+        targetBuyUsd,
+        coordinatedWallets: [event.wallet],
+      });
+      return;
+    }
 
     if (entryStrategy === "regular") {
       await tryCopyBuy(event, "target copy buy", {
