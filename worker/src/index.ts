@@ -1481,6 +1481,17 @@ async function main() {
       .eq("user_id", cfg.user_id)
       .is("closed_at", null);
 
+    // Prune per-position caches for closed positions (these otherwise grow for
+    // the whole life of the process).
+    const openIds = new Set((positions ?? []).map((p) => p.id));
+    for (const id of positionPeakPrice.keys()) {
+      if (!openIds.has(id)) positionPeakPrice.delete(id);
+    }
+    for (const id of positionPriceSanity.keys()) {
+      if (!openIds.has(id)) positionPriceSanity.delete(id);
+    }
+
+
     let mirrorSoldAt: Map<string, string> | null = null;
     if (cfg.mirror_custody_sell_exit_enabled === true && (positions?.length ?? 0) > 0) {
       const openMints = Array.from(new Set((positions ?? []).map((p) => p.token_mint)));
