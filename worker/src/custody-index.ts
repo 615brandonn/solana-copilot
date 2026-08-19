@@ -269,11 +269,21 @@ async function main(): Promise<void> {
       .eq("status", "active");
     if (countError) throw new Error(`custody journey count failed: ${safeDiagnostic(countError)}`);
     const now = Date.now();
-    const rpcSuccessStale = !fallback.lastSuccessAt || now - fallback.lastSuccessAt > 30_000;
-    const rpcPollStale = !fallback.lastPollAt || now - fallback.lastPollAt > 30_000;
+    // Degraded must mean genuine failure, not work-in-progress: a full sweep of
+    // the watch list legitimately takes hours, so a non-empty backlog or a poll
+    // older than 30s says nothing. Progress is "the backlog shrank recently".
+    const backlog = Number(fallback.backlogWalletCount ?? 0);
+    if (backlog === 0 || backlog < lastBacklogCount) lastBacklogProgressAt = now;
+    lastBacklogCount = backlog;
+    const staleWindowMs = currentConfig.degradedSweepStaleMinutes * 60_000;
+    const noProgressMs = now - lastBacklogProgressAt;
+    const pollerDead = !fallback.lastSuccessAt || now - fallback.lastSuccessAt > 5 * 60_000;
+    const sweepStalled = backlog > 0 && noProgressMs > staleWindowMs;
+    const backlogUnbounded =
+      backlog > currentConfig.degradedBacklogFraction * registry.watchedWalletCount() &&
+      noProgressMs > staleWindowMs;
     const degraded =
-      currentConfig.enabled &&
-      (!pollerStarted || rpcSuccessStale || rpcPollStale || fallback.backlogWalletCount > 0);
+      currentConfig.enabled && (!pollerStarted || pollerDead || sweepStalled || backlogUnbounded);
     const { error } = await db.from("custody_worker_heartbeat").upsert(
       {
         user_id: env.HELIX_USER_ID,
