@@ -156,4 +156,9 @@ export type BotConfigRow = {
   fanout_min_age_minutes?: number;
   fanout_abandon_threshold?: number;
   crew_exit_min_mints?: number;
+  // Price-tick sanity gate (one bad feed tick must never move money).
+  price_sanity_enabled?: boolean;
+  price_sanity_max_entry_multiple?: number;
+  price_sanity_max_tick_jump?: number;
+  price_sanity_confirm_ticks?: number;
 };

@@ -10,6 +10,11 @@ import { db, type BotConfigRow } from "./db.js";
 import { GeyserFeed, type FeedEvent, type SwapEvent, type TransferEvent } from "./geyser.js";
 import { FollowerMonitor, type ChainedTransferBatchState } from "./monitor.js";
 import { executeSwap, type ExecuteResult } from "./executor.js";
+import {
+  checkPriceSanity,
+  priceSanityConfigFrom,
+  type PriceSanityState,
+} from "./price-sanity.js";
 import { SubmissionUncertainError, isPostSubmissionError } from "./execution-safety.js";
 import {
   canReclaimEntryClaim,
@@ -1461,6 +1466,9 @@ async function main() {
   }, 30_000);
 
   const positionPeakPrice = new Map<string, number>();
+  // Per-position price-tick sanity state, so one corrupted feed tick can never
+  // by itself trigger a take-profit, trailing stop, or stop-loss.
+  const positionPriceSanity = new Map<string, PriceSanityState>();
 
   async function checkTpSl() {
     if (
@@ -1477,6 +1485,17 @@ async function main() {
       )
       .eq("user_id", cfg.user_id)
       .is("closed_at", null);
+
+    // Prune per-position caches for closed positions (these otherwise grow for
+    // the whole life of the process).
+    const openIds = new Set((positions ?? []).map((p) => p.id));
+    for (const id of positionPeakPrice.keys()) {
+      if (!openIds.has(id)) positionPeakPrice.delete(id);
+    }
+    for (const id of positionPriceSanity.keys()) {
+      if (!openIds.has(id)) positionPriceSanity.delete(id);
+    }
+
 
     let mirrorSoldAt: Map<string, string> | null = null;
     if (cfg.mirror_custody_sell_exit_enabled === true && (positions?.length ?? 0) > 0) {
@@ -1522,6 +1541,43 @@ async function main() {
       }
       const price = await priceUsd(pos.token_mint);
       if (!price || price <= 0) continue;
+      if (cfg.price_sanity_enabled !== false) {
+        const sanity = checkPriceSanity(
+          price,
+          entry,
+          positionPriceSanity.get(pos.id),
+          priceSanityConfigFrom(cfg),
+        );
+        positionPriceSanity.set(pos.id, sanity.state);
+        if (!sanity.accepted) {
+          log.warn(
+            {
+              positionId: pos.id,
+              tokenMint: pos.token_mint,
+              price,
+              entry,
+              entryMultiple: sanity.entryMultiple,
+              tickJump: sanity.tickJump,
+              reason: sanity.reason,
+            },
+            "price tick failed sanity gate — no exit decision this cycle",
+          );
+          continue;
+        }
+        if (sanity.confirmedOutlier) {
+          log.warn(
+            {
+              positionId: pos.id,
+              tokenMint: pos.token_mint,
+              price,
+              entry,
+              entryMultiple: sanity.entryMultiple,
+              tickJump: sanity.tickJump,
+            },
+            "extreme price confirmed by repeated ticks — treating as real",
+          );
+        }
+      }
       const gainPct = ((price - entry) / entry) * 100;
 
       const prevPeak = positionPeakPrice.get(pos.id) ?? price;
@@ -1605,10 +1661,6 @@ async function main() {
       }
     }
 
-    const openIds = new Set((positions ?? []).map((p) => p.id));
-    for (const id of positionPeakPrice.keys()) {
-      if (!openIds.has(id)) positionPeakPrice.delete(id);
-    }
   }
 
 

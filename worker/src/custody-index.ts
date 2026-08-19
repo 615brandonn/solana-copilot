@@ -22,6 +22,8 @@ const rpc = new Connection(env.RPC_URL, { commitment: "confirmed" });
 type CustodyConfig = {
   enabled: boolean;
   targetWallets: Set<string>;
+  degradedBacklogFraction: number;
+  degradedSweepStaleMinutes: number;
 };
 
 function validWallet(value: unknown): string | null {
@@ -36,7 +38,9 @@ function validWallet(value: unknown): string | null {
 async function loadCustodyConfig(): Promise<CustodyConfig> {
   const { data, error } = await db
     .from("bot_config")
-    .select("target_wallet,additional_target_wallets,custody_journey_enabled")
+    .select(
+      "target_wallet,additional_target_wallets,custody_journey_enabled,custody_degraded_backlog_fraction,custody_degraded_sweep_stale_minutes",
+    )
     .eq("user_id", env.HELIX_USER_ID)
     .maybeSingle();
   if (error) throw new Error(`custody config load failed: ${safeDiagnostic(error)}`);
@@ -46,9 +50,15 @@ async function loadCustodyConfig(): Promise<CustodyConfig> {
   ]
     .map(validWallet)
     .filter((wallet): wallet is string => wallet !== null);
+  const fractionRaw = Number(data?.custody_degraded_backlog_fraction);
+  const staleRaw = Number(data?.custody_degraded_sweep_stale_minutes);
   return {
     enabled: data?.custody_journey_enabled === true,
     targetWallets: new Set(targets),
+    degradedBacklogFraction: Number.isFinite(fractionRaw)
+      ? Math.min(1, Math.max(0, fractionRaw))
+      : 0.25,
+    degradedSweepStaleMinutes: Number.isFinite(staleRaw) && staleRaw > 0 ? staleRaw : 240,
   };
 }
 
@@ -60,6 +70,10 @@ async function main(): Promise<void> {
   let lastError: string | null = null;
   let pollerStarted = false;
   let decodedEventCount = 0;
+  // Backlog progress signal for the heartbeat's degraded flag: sweeps can take
+  // hours, so we track when the backlog last shrank rather than poll recency.
+  let lastBacklogCount = Number.POSITIVE_INFINITY;
+  let lastBacklogProgressAt = Date.now();
   let schedulePendingReplay = () => undefined;
 
   // Assigned after the feed/poller callbacks close over it to break their
@@ -259,11 +273,21 @@ async function main(): Promise<void> {
       .eq("status", "active");
     if (countError) throw new Error(`custody journey count failed: ${safeDiagnostic(countError)}`);
     const now = Date.now();
-    const rpcSuccessStale = !fallback.lastSuccessAt || now - fallback.lastSuccessAt > 30_000;
-    const rpcPollStale = !fallback.lastPollAt || now - fallback.lastPollAt > 30_000;
+    // Degraded must mean genuine failure, not work-in-progress: a full sweep of
+    // the watch list legitimately takes hours, so a non-empty backlog or a poll
+    // older than 30s says nothing. Progress is "the backlog shrank recently".
+    const backlog = Number(fallback.backlogWalletCount ?? 0);
+    if (backlog === 0 || backlog < lastBacklogCount) lastBacklogProgressAt = now;
+    lastBacklogCount = backlog;
+    const staleWindowMs = currentConfig.degradedSweepStaleMinutes * 60_000;
+    const noProgressMs = now - lastBacklogProgressAt;
+    const pollerDead = !fallback.lastSuccessAt || now - fallback.lastSuccessAt > 5 * 60_000;
+    const sweepStalled = backlog > 0 && noProgressMs > staleWindowMs;
+    const backlogUnbounded =
+      backlog > currentConfig.degradedBacklogFraction * registry.watchedWalletCount() &&
+      noProgressMs > staleWindowMs;
     const degraded =
-      currentConfig.enabled &&
-      (!pollerStarted || rpcSuccessStale || rpcPollStale || fallback.backlogWalletCount > 0);
+      currentConfig.enabled && (!pollerStarted || pollerDead || sweepStalled || backlogUnbounded);
     const { error } = await db.from("custody_worker_heartbeat").upsert(
       {
         user_id: env.HELIX_USER_ID,
