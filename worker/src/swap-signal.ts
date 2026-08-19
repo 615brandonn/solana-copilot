@@ -113,6 +113,10 @@ export const VERIFIED_SWAP_PROGRAMS = {
 export const HOSTILE_EXECUTOR_PROGRAMS: ReadonlySet<string> = new Set([
   "58PMEdUAwvLytNNwCbzrYyhLoh3jpsNV4fW9dT9ibuRc",
   "DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH",
+  // Second private executor observed in traced custody sells (2026-08-19)
+  "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u",
+  // Third program observed in the same sell path
+  "99vQwtBwYtrqqD9YSXbdum3KBdxPAVxYTaQ3cfnJSrN2",
 ]);
 
 export function hasHostileExecutorSignal(logMessages: readonly unknown[]): boolean {
