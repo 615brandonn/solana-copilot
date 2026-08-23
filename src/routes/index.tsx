@@ -22,6 +22,7 @@ import { StrategyLab } from "@/components/dashboard/StrategyLab";
 import { ConvictionDashboard } from "@/components/dashboard/ConvictionDashboard";
 import { PositionFollowers } from "@/components/dashboard/PositionFollowers";
 import { CustodyJourneyDashboard } from "@/components/dashboard/CustodyJourneyDashboard";
+import { RevivalCampaignDashboard } from "@/components/dashboard/RevivalCampaignDashboard";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -303,6 +304,11 @@ function Dashboard() {
         <CustodyJourneyDashboard
           enabled={cfg.custodyJourneyEnabled}
           onToggleEnabled={(value) => update({ custodyJourneyEnabled: value })}
+        />
+        <RevivalCampaignDashboard
+          enabled={cfg.revivalTrackerEnabled}
+          marketCapMinUsd={cfg.revivalMarketCapMinUsd}
+          marketCapMaxUsd={cfg.revivalMarketCapMaxUsd}
         />
 
         <footer className="mt-10 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-6 text-[11px] text-muted-foreground">

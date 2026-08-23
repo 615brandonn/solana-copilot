@@ -15,6 +15,9 @@ export const BotConfigSchema = z
     jitoTipSol: z.number().finite().min(0).max(1),
     fixedBuyUsd: z.number().finite().positive().max(1_000_000),
     custodyJourneyEnabled: z.boolean(),
+    revivalTrackerEnabled: z.boolean(),
+    revivalMarketCapMinUsd: z.number().finite().min(0).max(1_000_000_000),
+    revivalMarketCapMaxUsd: z.number().finite().min(0).max(1_000_000_000),
     crewExitEnabled: z.boolean(),
     crewExitPct: z.number().min(1).max(100),
     crewExitMinMints: z.number().int().min(2).max(20),
@@ -120,6 +123,10 @@ export const BotConfigSchema = z
   .refine((config) => config.mcMinUsd <= config.mcMaxUsd, {
     message: "Market-cap minimum cannot exceed maximum",
     path: ["mcMaxUsd"],
+  })
+  .refine((config) => config.revivalMarketCapMinUsd <= config.revivalMarketCapMaxUsd, {
+    message: "Revival seed market-cap minimum cannot exceed maximum",
+    path: ["revivalMarketCapMaxUsd"],
   })
   .refine((config) => config.coordinatedMcMinUsd <= config.coordinatedMcMaxUsd, {
     message: "Coordinated market-cap minimum cannot exceed maximum",

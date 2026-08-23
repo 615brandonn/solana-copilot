@@ -1,5 +1,14 @@
 export type ConvictionTradingMode = "shadow" | "live";
 
+export type RevivalTrackerConfig = {
+  /** Independent observation-only campaign collector. It has no Live mode. */
+  revivalTrackerEnabled: boolean;
+  /** Inclusive seed-admission floor; active campaigns remain tracked outside it. */
+  revivalMarketCapMinUsd: number;
+  /** Inclusive seed-admission ceiling; active campaigns remain tracked above it. */
+  revivalMarketCapMaxUsd: number;
+};
+
 export type ConvictionConfig = {
   convictionModeEnabled: boolean;
   convictionTradingMode: ConvictionTradingMode;
@@ -39,80 +48,81 @@ export type ConvictionConfig = {
   convictionTierBuyAmountsUsd: number[];
 };
 
-export type BotConfig = ConvictionConfig & {
-  enabled: boolean;
-  targetWallet: string;
-  additionalTargetWallets: string[];
-  fundingPrivateKey: string; // client-side only; encrypted before persistence
-  executionRoute: "jito" | "rpc";
-  jitoTipSol: number;
-  fixedBuyUsd: number;
-  /** Observation-only custody tracing. Never enables Entries or trading. */
-  custodyJourneyEnabled: boolean;
-  crewExitEnabled: boolean;
-  crewExitPct: number;
-  crewExitMinMints: number;
-  coordinatedModeEnabled: boolean;
-  coordinatedFixedBuyUsd: number;
-  coordinatedThreeWalletBuyUsd: number;
-  coordinatedTargetWalletCount: number;
-  coordinatedWindowSeconds: number;
-  coordinatedMcMinUsd: number;
-  coordinatedMcMaxUsd: number;
-  coordinatedCoinAgeMinMinutes: number;
-  coordinatedCoinAgeMaxMinutes: number;
-  coordinatedTargetBuyMinUsd: number;
-  coordinatedTargetBuyMaxUsd: number;
-  coordinatedFirstBuyOnly: boolean;
-  coordinatedOncePerToken: boolean;
-  coordinatedFollowerSellCount: number;
-  coordinatedFollowerSellPct: number;
-  coordinatedInactivityHours: number;
-  networkScalingEnabled: boolean;
-  starterPositionPct: number;
-  maxPositionPct: number;
-  newEntryReservePct: number;
-  targetCopyRatioPct: number;
-  minScaleBuyUsd: number;
-  minTargetBuyUsd: number;
-  mcMinUsd: number;
-  mcMaxUsd: number;
-  liqMinUsd: number;
-  liqMaxUsd: number;
-  tokenAgeFilterEnabled: boolean;
-  tokenAgeMinMinutes: number;
-  tokenAgeMaxMinutes: number;
-  pumpFunOnly: boolean;
-  requireSocials: boolean;
-  require24hUptrend: boolean;
-  largeBuyScannerEnabled: boolean;
-  largeBuyScannerMaxMcUsd: number;
-  largeBuyScannerMinBuyUsd: number;
-  largeBuyScannerMultiplier: number;
-  largeBuyScannerHistoryWindow: number;
-  onlyFirstBuyEver: boolean;
-  onlyOncePerToken: boolean;
-  takeProfitEnabled: boolean;
-  takeProfitPct: number; // gain% trigger e.g. 100
-  takeProfitSellPct: number; // portion to sell e.g. 50
-  stopLossEnabled: boolean;
-  stopLossPct: number; // e.g. 30 = -30%
-  trailingStopEnabled: boolean;
-  trailingStopPct: number;
-  trailingActivationPct: number;
-  proportionalFollowerSells: boolean;
-  followerSellerExitEnabled: boolean;
-  followerSellerExitCount: number;
-  followerSellerExitPct: number;
-  targetInactivityExitEnabled: boolean;
-  targetInactivityHours: number;
-  directTargetSellExitMode: "off" | "proportional" | "fixed_pct" | "full";
-  directTargetSellExitPct: number;
-  terminalOutflowExitEnabled: boolean;
-  terminalOutflowExitPct: number;
-  targetTerminalOutflowExitEnabled: boolean;
-  targetTerminalOutflowExitPct: number;
-};
+export type BotConfig = ConvictionConfig &
+  RevivalTrackerConfig & {
+    enabled: boolean;
+    targetWallet: string;
+    additionalTargetWallets: string[];
+    fundingPrivateKey: string; // client-side only; encrypted before persistence
+    executionRoute: "jito" | "rpc";
+    jitoTipSol: number;
+    fixedBuyUsd: number;
+    /** Observation-only custody tracing. Never enables Entries or trading. */
+    custodyJourneyEnabled: boolean;
+    crewExitEnabled: boolean;
+    crewExitPct: number;
+    crewExitMinMints: number;
+    coordinatedModeEnabled: boolean;
+    coordinatedFixedBuyUsd: number;
+    coordinatedThreeWalletBuyUsd: number;
+    coordinatedTargetWalletCount: number;
+    coordinatedWindowSeconds: number;
+    coordinatedMcMinUsd: number;
+    coordinatedMcMaxUsd: number;
+    coordinatedCoinAgeMinMinutes: number;
+    coordinatedCoinAgeMaxMinutes: number;
+    coordinatedTargetBuyMinUsd: number;
+    coordinatedTargetBuyMaxUsd: number;
+    coordinatedFirstBuyOnly: boolean;
+    coordinatedOncePerToken: boolean;
+    coordinatedFollowerSellCount: number;
+    coordinatedFollowerSellPct: number;
+    coordinatedInactivityHours: number;
+    networkScalingEnabled: boolean;
+    starterPositionPct: number;
+    maxPositionPct: number;
+    newEntryReservePct: number;
+    targetCopyRatioPct: number;
+    minScaleBuyUsd: number;
+    minTargetBuyUsd: number;
+    mcMinUsd: number;
+    mcMaxUsd: number;
+    liqMinUsd: number;
+    liqMaxUsd: number;
+    tokenAgeFilterEnabled: boolean;
+    tokenAgeMinMinutes: number;
+    tokenAgeMaxMinutes: number;
+    pumpFunOnly: boolean;
+    requireSocials: boolean;
+    require24hUptrend: boolean;
+    largeBuyScannerEnabled: boolean;
+    largeBuyScannerMaxMcUsd: number;
+    largeBuyScannerMinBuyUsd: number;
+    largeBuyScannerMultiplier: number;
+    largeBuyScannerHistoryWindow: number;
+    onlyFirstBuyEver: boolean;
+    onlyOncePerToken: boolean;
+    takeProfitEnabled: boolean;
+    takeProfitPct: number; // gain% trigger e.g. 100
+    takeProfitSellPct: number; // portion to sell e.g. 50
+    stopLossEnabled: boolean;
+    stopLossPct: number; // e.g. 30 = -30%
+    trailingStopEnabled: boolean;
+    trailingStopPct: number;
+    trailingActivationPct: number;
+    proportionalFollowerSells: boolean;
+    followerSellerExitEnabled: boolean;
+    followerSellerExitCount: number;
+    followerSellerExitPct: number;
+    targetInactivityExitEnabled: boolean;
+    targetInactivityHours: number;
+    directTargetSellExitMode: "off" | "proportional" | "fixed_pct" | "full";
+    directTargetSellExitPct: number;
+    terminalOutflowExitEnabled: boolean;
+    terminalOutflowExitPct: number;
+    targetTerminalOutflowExitEnabled: boolean;
+    targetTerminalOutflowExitPct: number;
+  };
 
 /** Safe installation defaults: Conviction is disabled and cannot submit live buys. */
 export const DEFAULT_CONVICTION_CONFIG: ConvictionConfig = {
@@ -164,6 +174,9 @@ export const DEFAULT_CONFIG: BotConfig = {
   jitoTipSol: 0.001,
   fixedBuyUsd: 25,
   custodyJourneyEnabled: false,
+  revivalTrackerEnabled: false,
+  revivalMarketCapMinUsd: 2_000,
+  revivalMarketCapMaxUsd: 15_000,
   crewExitEnabled: false,
   crewExitPct: 100,
   crewExitMinMints: 4,

@@ -353,7 +353,10 @@ test("worker config and doctor gate the isolated custody schema", () => {
   assert.match(dashboardServer, /custody_journey_enabled: cfg\.custodyJourneyEnabled/);
   assert.match(settingsPanel, /checked=\{cfg\.custodyJourneyEnabled\}/);
   assert.match(settingsPanel, /observation only/i);
-  assert.match(dashboardRoute, /CustodyJourneyDashboard enabled=\{cfg\.custodyJourneyEnabled\}/);
+  assert.match(
+    dashboardRoute,
+    /CustodyJourneyDashboard[\s\S]*?enabled=\{cfg\.custodyJourneyEnabled\}/,
+  );
   assert.ok(custodyDoctorSource.length > 0, "custody doctor schema gate is missing");
   for (const table of [
     "custody_journeys",
