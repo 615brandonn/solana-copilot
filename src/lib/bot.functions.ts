@@ -41,6 +41,14 @@ import {
   rowToConfig,
   saveFundingKeyRecord,
 } from "./bot.server";
+import {
+  buildRevivalDashboard,
+  revivalCampaignSummary,
+  type RevivalCampaignDetail,
+  type RevivalDashboardSummary,
+  type RevivalDetailRow,
+  type RevivalDashboardData,
+} from "./revival";
 
 export const getBotConfig = createServerFn({ method: "GET" }).handler(async () => {
   const db = adminClient();
@@ -175,6 +183,187 @@ export const getWorkerStatus = createServerFn({ method: "GET" }).handler(async (
     identityMismatch: false,
   };
 });
+
+function revivalReadError(error: { code?: string; message?: string }): never {
+  if (
+    error.code === "42P01" ||
+    error.code === "42703" ||
+    error.code === "PGRST204" ||
+    error.code === "PGRST205"
+  ) {
+    throw new Error(
+      "Revival storage is missing or outdated. Run supabase/revival-campaign-migration.sql; trading is unaffected.",
+    );
+  }
+  throw new Error("Revival data is temporarily unavailable; trading is unaffected.");
+}
+
+export const getRevivalDashboard = createServerFn({ method: "GET" }).handler(
+  async (): Promise<RevivalDashboardData> => {
+    const db = adminClient();
+    const userId = currentUserId();
+    const [
+      campaigns,
+      heartbeat,
+      totalCount,
+      activeCount,
+      entryReadyCount,
+      ignitionCount,
+      distributionCount,
+      closedCount,
+      invalidatedCount,
+      coverageGapCount,
+    ] = await Promise.all([
+      db
+        .from("revival_campaigns")
+        .select("*")
+        .eq("user_id", userId)
+        .order("last_available_at", { ascending: false })
+        .limit(250),
+      db.from("revival_worker_heartbeat").select("*").eq("user_id", userId).maybeSingle(),
+      db
+        .from("revival_campaigns")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId),
+      db
+        .from("revival_campaigns")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .is("closed_at", null),
+      db
+        .from("revival_campaigns")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .is("closed_at", null)
+        .eq("state", "ENTRY_READY"),
+      db
+        .from("revival_campaigns")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .is("closed_at", null)
+        .eq("state", "RETAIL_IGNITION"),
+      db
+        .from("revival_campaigns")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .is("closed_at", null)
+        .eq("state", "DISTRIBUTION_RISK"),
+      db
+        .from("revival_campaigns")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("state", "CLOSED"),
+      db
+        .from("revival_campaigns")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("state", "INVALIDATED"),
+      db
+        .from("revival_campaigns")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .is("closed_at", null)
+        .or("coverage_status.neq.COMPLETE,state.eq.COVERAGE_GAP"),
+    ]);
+    for (const result of [
+      campaigns,
+      heartbeat,
+      totalCount,
+      activeCount,
+      entryReadyCount,
+      ignitionCount,
+      distributionCount,
+      closedCount,
+      invalidatedCount,
+      coverageGapCount,
+    ]) {
+      if (result.error) revivalReadError(result.error);
+    }
+    const summary: RevivalDashboardSummary = {
+      active: activeCount.count ?? 0,
+      entryReady: entryReadyCount.count ?? 0,
+      ignition: ignitionCount.count ?? 0,
+      distributionRisk: distributionCount.count ?? 0,
+      closed: closedCount.count ?? 0,
+      invalidated: invalidatedCount.count ?? 0,
+      coverageGaps: coverageGapCount.count ?? 0,
+    };
+    return buildRevivalDashboard(
+      (campaigns.data ?? []) as Array<Record<string, unknown>>,
+      (heartbeat.data as Record<string, unknown> | null) ?? null,
+      Date.now(),
+      summary,
+      totalCount.count ?? 0,
+    );
+  },
+);
+
+const RevivalCampaignDetailInputSchema = z.object({
+  campaignId: z.string().uuid(),
+});
+
+export const getRevivalCampaignDetail = createServerFn({ method: "POST" })
+  .validator((data) => RevivalCampaignDetailInputSchema.parse(data))
+  .handler(async ({ data }): Promise<RevivalCampaignDetail> => {
+    const db = adminClient();
+    const userId = currentUserId();
+    const campaignResult = await db
+      .from("revival_campaigns")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("id", data.campaignId)
+      .maybeSingle();
+    if (campaignResult.error) revivalReadError(campaignResult.error);
+    if (!campaignResult.data) throw new Error("Revival campaign was not found.");
+    const campaignRow = campaignResult.data as Record<string, unknown>;
+    const [events, transitions, snapshots, actions, outcome] = await Promise.all([
+      db
+        .from("revival_events")
+        .select("*")
+        .eq("user_id", userId)
+        .eq("campaign_id", data.campaignId)
+        .order("available_at", { ascending: true })
+        .order("event_at", { ascending: true })
+        .limit(5_000),
+      db
+        .from("revival_transitions")
+        .select("*")
+        .eq("user_id", userId)
+        .eq("campaign_id", data.campaignId)
+        .order("to_state_version", { ascending: true }),
+      db
+        .from("revival_market_snapshots")
+        .select("*")
+        .eq("user_id", userId)
+        .eq("campaign_id", data.campaignId)
+        .order("available_at", { ascending: true })
+        .limit(5_000),
+      db
+        .from("revival_shadow_actions")
+        .select("*")
+        .eq("user_id", userId)
+        .eq("campaign_id", data.campaignId)
+        .order("decision_at", { ascending: true }),
+      db
+        .from("revival_outcomes")
+        .select("*")
+        .eq("user_id", userId)
+        .eq("campaign_id", data.campaignId)
+        .maybeSingle(),
+    ]);
+    const failed = [events, transitions, snapshots, actions, outcome].find(
+      (result) => result.error,
+    );
+    if (failed?.error) revivalReadError(failed.error);
+    return {
+      campaign: revivalCampaignSummary(campaignRow),
+      events: (events.data ?? []) as unknown as RevivalDetailRow[],
+      transitions: (transitions.data ?? []) as unknown as RevivalDetailRow[],
+      marketSnapshots: (snapshots.data ?? []) as unknown as RevivalDetailRow[],
+      shadowActions: (actions.data ?? []) as unknown as RevivalDetailRow[],
+      outcome: (outcome.data as unknown as RevivalDetailRow | null) ?? null,
+    };
+  });
 
 export const getTrades = createServerFn({ method: "GET" }).handler(async () => {
   const db = adminClient();

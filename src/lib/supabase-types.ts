@@ -20,6 +20,9 @@ export type BotConfigRow = {
   jito_tip_sol: number;
   fixed_buy_usd: number;
   custody_journey_enabled: boolean;
+  revival_tracker_enabled: boolean;
+  revival_market_cap_min_usd: number;
+  revival_market_cap_max_usd: number;
   crew_exit_enabled?: boolean;
   crew_exit_pct?: number;
   crew_exit_min_mints?: number;

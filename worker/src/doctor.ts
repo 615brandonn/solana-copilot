@@ -544,6 +544,128 @@ async function checkCustodyJourneySchema(cfg: BotConfigRow): Promise<boolean> {
   return true;
 }
 
+async function checkRevivalTrackerSchema(cfg: BotConfigRow): Promise<boolean> {
+  const minMarketCap = Number(cfg.revival_market_cap_min_usd);
+  const maxMarketCap = Number(cfg.revival_market_cap_max_usd);
+  if (
+    typeof cfg.revival_tracker_enabled !== "boolean" ||
+    !Number.isFinite(minMarketCap) ||
+    !Number.isFinite(maxMarketCap) ||
+    minMarketCap < 0 ||
+    maxMarketCap < minMarketCap
+  ) {
+    fail(
+      "Revival Campaign migration",
+      "missing or invalid Revival tracker settings — run supabase/revival-campaign-migration.sql",
+    );
+    return false;
+  }
+
+  const checks = await Promise.all([
+    db
+      .from("revival_strategy_versions")
+      .select(
+        "id,user_id,version_number,strategy_key,role,algorithm_version,config_hash,config,created_at,activated_at,retired_at",
+      )
+      .limit(1),
+    db
+      .from("revival_campaigns")
+      .select(
+        "id,user_id,strategy_version_id,campaign_key,campaign_number,token_mint,symbol,state,state_version,eligibility_status,eligibility_reason,seed_event_key,seed_tx_sig,seed_slot,seed_tx_index,seeded_at,seed_available_at,eligibility_deadline_at,last_event_key,last_event_at,last_available_at,closed_at,close_reason,seed_market_cap_usd,latest_market_cap_usd,seed_price_usd,latest_price_usd,peak_price_usd,trough_price_usd,historical_peak_price_usd,historical_peak_market_cap_usd,drawdown_pct,baseline_volume_h1_usd,latest_volume_h1_usd,baseline_buy_count_h1,latest_buy_count_h1,seed_active_boosts,latest_active_boosts,last_market_observed_at,target_gross_buys_usd,target_gross_sells_usd,target_net_commitment_usd,target_buy_count,target_sell_count,target_wallets,unique_target_wallet_count,accumulation_score,ignition_score,distribution_score,ignition_streak,market_data_reliable,target_attribution_reliable,custody_evidence_reliable,coverage_status,entry_ready_at,ignited_at,distribution_risk_at,mfe_pct,mae_pct,config_snapshot,engine_version,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("revival_events")
+      .select(
+        "id,user_id,strategy_version_id,campaign_id,event_key,request_fingerprint,event_type,source,tx_sig,slot,tx_index,event_at,available_at,actor_wallet,token_mint,amount_tokens,amount_usd,price_usd,market_cap_usd,liquidity_usd,classification_reliable,market_data_reliable,historical,metadata,conflict_count,last_conflict_at,created_at",
+      )
+      .limit(1),
+    db
+      .from("revival_transitions")
+      .select(
+        "id,user_id,strategy_version_id,campaign_id,transition_key,trigger_kind,trigger_key,from_state,to_state,from_state_version,to_state_version,reasons,metrics,occurred_at,available_at,recorded_at",
+      )
+      .limit(1),
+    db
+      .from("revival_market_snapshots")
+      .select(
+        "id,user_id,strategy_version_id,campaign_id,snapshot_key,request_fingerprint,provider,pair_address,dex_id,market_at,available_at,price_usd,market_cap_usd,fdv_usd,valuation_kind,liquidity_usd,volume_m5_usd,volume_h1_usd,volume_h6_usd,volume_h24_usd,buys_m5,sells_m5,buys_h1,sells_h1,buys_h24,sells_h24,active_boosts,reliable,metadata,conflict_count,last_conflict_at,created_at",
+      )
+      .limit(1),
+    db
+      .from("revival_shadow_actions")
+      .select(
+        "id,user_id,strategy_version_id,campaign_id,action_key,variant_key,mode,state,state_version,action_type,decision_at,available_at,source_event_key,executable,reason,metadata,created_at",
+      )
+      .limit(1),
+    db
+      .from("revival_outcomes")
+      .select(
+        "id,user_id,campaign_id,strategy_version_id,variant_key,outcome_key,status,resolution_reason,entry_at,ignition_at,distribution_at,closed_at,entry_price_usd,close_price_usd,gross_entry_usd,gross_proceeds_usd,fees_usd,net_pnl_usd,pnl_pct,mfe_pct,mae_pct,holding_seconds,winner,coverage_status,market_data_reliable,target_attribution_reliable,metadata,resolved_at",
+      )
+      .limit(1),
+    db
+      .from("revival_rpc_wallet_cursors")
+      .select(
+        "user_id,wallet,start_slot,last_processed_signature,last_processed_slot,last_block_time,backlog_detected,last_success_at,last_error,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("revival_worker_heartbeat")
+      .select(
+        "user_id,started_at,updated_at,enabled,target_wallet_count,initialized,event_count,active_campaign_count,pending_market_data_count,last_event_at,last_market_snapshot_at,rpc_last_poll_at,rpc_last_success_at,rpc_backlog_wallet_count,degraded,last_error_code",
+      )
+      .limit(1),
+  ]);
+  const schemaError = checks.find((result) => result.error)?.error;
+  if (schemaError) {
+    fail(
+      "Revival Campaign schema",
+      `${safeDiagnostic(schemaError.message)} — run supabase/revival-campaign-migration.sql`,
+    );
+    return false;
+  }
+
+  const heartbeat = await db
+    .from("revival_worker_heartbeat")
+    .select("updated_at,enabled,degraded,rpc_backlog_wallet_count,last_error_code")
+    .eq("user_id", cfg.user_id)
+    .maybeSingle();
+  if (heartbeat.error) {
+    warn("Revival Campaign observer health", {
+      available: false,
+      hasError: true,
+    });
+  } else if (cfg.revival_tracker_enabled) {
+    const updatedAt = Date.parse(String(heartbeat.data?.updated_at ?? ""));
+    const stale = !Number.isFinite(updatedAt) || Date.now() - updatedAt > 60_000;
+    const backlog = Number(heartbeat.data?.rpc_backlog_wallet_count ?? 0);
+    if (!heartbeat.data || heartbeat.data.enabled !== true || stale || heartbeat.data.degraded) {
+      warn("Revival Campaign observer health", {
+        heartbeatPresent: Boolean(heartbeat.data),
+        enabled: heartbeat.data?.enabled === true,
+        stale,
+        degraded: heartbeat.data?.degraded === true,
+        rpcBacklogWalletCount: Number.isFinite(backlog) ? backlog : 0,
+        hasLastError: Boolean(heartbeat.data?.last_error_code),
+      });
+    } else {
+      pass("Revival Campaign observer health", {
+        heartbeatFresh: true,
+        rpcBacklogWalletCount: backlog,
+      });
+    }
+  }
+
+  pass(
+    "Revival Campaign schema",
+    cfg.revival_tracker_enabled
+      ? `SHADOW schema ready; inclusive seed MC $${minMarketCap}-$${maxMarketCap}; no transaction capability`
+      : `OFF; storage ready with seed MC $${minMarketCap}-$${maxMarketCap}`,
+  );
+  return true;
+}
+
 async function checkSellCoverageSchema(cfg: BotConfigRow): Promise<boolean> {
   const requiredConfigFields: Array<keyof BotConfigRow> = [
     "direct_target_sell_exit_mode",
@@ -1036,6 +1158,15 @@ async function main() {
 
   if (!(await checkConvictionModeSchema(cfg, targets.length))) return;
   if (!(await checkCustodyJourneySchema(cfg))) return;
+  if (env.REVIVAL_ONLY_MODE) {
+    fail(
+      "Legacy REVIVAL_ONLY_MODE",
+      "ON — this is a separate money-moving entry route; turn it OFF for shadow-only Revival collection",
+    );
+  } else {
+    pass("Legacy REVIVAL_ONLY_MODE", "OFF — Revival Campaign collection remains observation-only");
+  }
+  if (!(await checkRevivalTrackerSchema(cfg))) return;
 
   if (
     cfg.follower_seller_exit_enabled === undefined ||
@@ -1098,6 +1229,15 @@ async function main() {
     observation_only: true,
     max_hops: 8,
     max_active_wallets_per_journey: 250,
+  });
+
+  line("Revival Campaign tracker", {
+    revival_tracker_enabled: cfg.revival_tracker_enabled,
+    mode: "shadow_only",
+    legacy_revival_only_mode_live_entry_enabled: env.REVIVAL_ONLY_MODE,
+    seed_market_cap_min_usd: cfg.revival_market_cap_min_usd,
+    seed_market_cap_max_usd: cfg.revival_market_cap_max_usd,
+    first_target_buy_can_trade: false,
   });
 
   line("Conviction Mode settings", {
