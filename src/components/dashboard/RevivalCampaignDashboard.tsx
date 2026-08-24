@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Activity, AlertTriangle, Radar, ShieldCheck } from "lucide-react";
+import { Activity, AlertTriangle, ExternalLink, Radar, ShieldCheck } from "lucide-react";
 import { getRevivalCampaignDetail, getRevivalDashboard } from "@/lib/bot.functions";
 import type {
   RevivalCampaignDetail,
@@ -25,6 +25,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { SectionCard } from "./SettingRow";
+import { solscanTokenUrl } from "./revival-solscan";
 
 function usd(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
@@ -64,6 +65,35 @@ function stateClass(state: RevivalCampaignState) {
   if (state === "INVALIDATED" || state === "CLOSED")
     return "border-border/70 bg-muted/30 text-muted-foreground";
   return "border-cyan-400/35 bg-cyan-400/10 text-cyan-300";
+}
+
+function TokenMintLink({ tokenMint }: { tokenMint: string }) {
+  const href = solscanTokenUrl(tokenMint);
+  const label = short(tokenMint);
+
+  if (!href) {
+    return (
+      <span className="font-mono text-[10px] text-muted-foreground" title={tokenMint}>
+        {label}
+      </span>
+    );
+  }
+
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="inline-flex items-center gap-1 font-mono text-[10px] text-cyan-300 hover:underline"
+      title={`Open ${tokenMint} on Solscan`}
+      aria-label={`Open token contract ${tokenMint} on Solscan`}
+      onClick={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      {label}
+      <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
+    </a>
+  );
 }
 
 function Metric({ label, value }: { label: string; value: string | number }) {
@@ -362,9 +392,10 @@ export function RevivalCampaignDashboard({
                       }}
                     >
                       <TableCell>
-                        <div className="font-mono text-xs">
-                          {campaign.symbol || short(campaign.tokenMint)}
-                        </div>
+                        {campaign.symbol ? (
+                          <div className="font-mono text-xs">{campaign.symbol}</div>
+                        ) : null}
+                        <TokenMintLink tokenMint={campaign.tokenMint} />
                         <span
                           className={`mt-1 inline-flex rounded-full border px-2 py-0.5 text-[9px] ${stateClass(campaign.state)}`}
                         >
