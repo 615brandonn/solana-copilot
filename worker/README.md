@@ -107,19 +107,31 @@ safety gates to pass immediately before the shared executor is called.
 
 With global Entries OFF, apply the current
 `supabase/custody-journey-migration.sql` and then
-`supabase/supply-accumulation-entry-migration.sql`. Run `npm test`,
-`npm run build`, and `npm run doctor` before restarting the worker. The migration
-is additive and leaves the strategy OFF. Enable Custody Journey before enabling
-this exclusive automatic entry route; it turns off the Conviction and Coordinated
-toggles.
+`supabase/supply-accumulation-entry-migration.sql`, followed by
+`supabase/supply-accumulation-scale-buys-migration.sql`. Run `npm test`,
+`npm run build`, and `npm run doctor` before restarting the worker. The
+migrations are additive and leave the strategy and every scale tier OFF. Enable
+Custody Journey before enabling this exclusive automatic entry route; it turns
+off the Conviction and Coordinated toggles.
 
 The strategy aggregates raw verified buys minus raw verified sells across all
 configured market-maker roots inside a 30–3,600 second rolling window. Its
 threshold is constrained to 10–20% of authoritative raw total supply, defaults
-to 10%, and cannot be lowered to the 3% test-buy range. The dedicated entry size
-defaults to $20. Current and estimated post-fill market cap must both remain
-strictly below the configured ceiling, which is capped at $15,000; missing or
+to 10%, and cannot be lowered to the 3% test-buy range. The dedicated initial
+entry size defaults to $20. Market cap must be at least the configurable $2,000
+default floor, while current and estimated post-fill market cap must both remain
+strictly below the configurable ceiling capped at $15,000; missing or
 conflicting supply, attribution, Pump.fun, or valuation evidence blocks entry.
+
+Optional second, third, and fourth buys default OFF, with 12%, 15%, and 18%
+thresholds and $10 sizes. Enabled tiers must be contiguous, strictly increasing,
+and backed by later fresh verified target buys. Each uses a separate replay-safe
+claim plus the same final custody, raw-supply, and current/projected cap checks.
+The database rejects ambiguous multiple-open-position state instead of adding a
+global positions index that could alter unrelated strategies. Any lifetime sell
+claim or sell trade permanently seals scaling. Atomic receipt persistence
+changes only the same position's amount and cost basis; its ID, original entry
+signature/slot, and every exit rule remain unchanged.
 
 `supply_accumulation_events` and `supply_accumulation_state` preserve raw integer
 evidence across restart and duplicate Geyser/RPC delivery. The service-only

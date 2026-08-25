@@ -93,7 +93,20 @@ activity across the primary and every additional configured market-maker root.
 Inside a configurable 30–3,600 second window, it adds raw verified buy amounts,
 subtracts raw verified sells, and compares the result with authoritative raw
 total supply. The threshold is restricted to 10–20% and defaults to 10%; a 3%
-cluster share can never authorize a buy. The dedicated buy size defaults to $20.
+cluster share can never authorize a buy. The dedicated initial buy size defaults
+to $20. The configurable market-cap floor defaults to $2,000 and the strict
+ceiling remains adjustable up to $15,000.
+
+Optional second, third, and fourth buys install OFF. Their default verified net
+supply thresholds are 12%, 15%, and 18%, and each default buy is $10. Enabled
+tiers must be contiguous and strictly increase from the initial threshold. Each
+tier requires a later fresh verified target buy, a separate durable claim, and
+the same final custody, supply, and current/projected market-cap checks. A tier
+can execute only against the one exact, untouched initial position. Any exit
+claim (including one that failed before submission) or recorded sell seals the
+position against every later scale buy. Scaling updates amount and cost basis
+atomically while preserving the original position ID, entry signature, entry
+slot, and every existing exit rule.
 
 Every entry requires reliable same-token supply and attribution evidence plus a
 strict current and estimated post-fill market cap below the configured ceiling,
@@ -117,10 +130,15 @@ eligible for automatic crash recovery.
 
 Existing deployments must leave global Entries OFF, apply the current
 `supabase/custody-journey-migration.sql` first, then run the additive
-`supabase/supply-accumulation-entry-migration.sql`, deploy the matching worker,
-and pass `cd worker && npm run doctor`. The migration installs the strategy OFF;
-enable Custody Journey and then enable this strategy explicitly in Settings only
-after validation. Enabling it turns off the Conviction and Coordinated toggles.
+`supabase/supply-accumulation-entry-migration.sql` and then
+`supabase/supply-accumulation-scale-buys-migration.sql`, deploy the matching
+worker, and pass `cd worker && npm run doctor`. The scale migration does not add
+a repository-wide unique index to `positions`, because that would change
+unrelated entry strategies; its service-only plan instead rejects any user/mint
+that does not have exactly one open position. Both migrations install the
+strategy and every scale tier OFF; enable Custody Journey and then enable this
+strategy explicitly in Settings only after validation. Enabling it turns off
+the Conviction and Coordinated toggles.
 
 ### Optional Custody Journey observer
 

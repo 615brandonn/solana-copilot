@@ -33,8 +33,11 @@ export type SupplyAccumulationState = {
   directSettlementSeen: boolean;
   thresholdPct: number;
   thresholdReached: boolean;
+  minMarketCapUsd: number;
   maxMarketCapUsd: number;
+  aboveMarketCapFloor: boolean;
   underMarketCap: boolean;
+  withinMarketCapRange: boolean;
   entryReady: boolean;
 };
 
@@ -164,13 +167,16 @@ export function parseSupplyAccumulationState(value: unknown): SupplyAccumulation
     directSettlementSeen: requiredBoolean(row, "directSettlementSeen"),
     thresholdPct: requiredNumber(row, "thresholdPct"),
     thresholdReached: requiredBoolean(row, "thresholdReached"),
+    minMarketCapUsd: requiredNumber(row, "minMarketCapUsd"),
     maxMarketCapUsd: requiredNumber(row, "maxMarketCapUsd"),
+    aboveMarketCapFloor: requiredBoolean(row, "aboveMarketCapFloor"),
     underMarketCap: requiredBoolean(row, "underMarketCap"),
+    withinMarketCapRange: requiredBoolean(row, "withinMarketCapRange"),
     entryReady: requiredBoolean(row, "entryReady"),
   };
 }
 
-function supplyEventKey(event: SwapEvent): string {
+export function supplyEventKey(event: SwapEvent): string {
   const transaction = event.txSig || `slot-${event.slot}`;
   return ["supply", event.side, transaction, event.wallet, event.tokenMint].join(":");
 }

@@ -70,9 +70,17 @@ import {
 } from "./pump-fun-supply.js";
 import {
   SupplyAccumulationStore,
+  supplyEventKey,
   type SupplyAccumulationState,
   type VerifiedSupplySell,
 } from "./supply-accumulation-store.js";
+import { SUPPLY_SCALE_ACTION_DEADLINE_MS } from "./supply-accumulation-scale-policy.js";
+import {
+  SupplyAccumulationScaleStore,
+  type SupplyScaleClaim,
+  type SupplyScalePlan,
+  type SupplyScalePreparedAttempt,
+} from "./supply-accumulation-scale-store.js";
 import { evaluateConvictionLiveExecutionGate } from "./conviction-execution-policy.js";
 import {
   ConvictionRuntime,
@@ -339,10 +347,36 @@ function supplyAccumulationConfigFingerprint(config: BotConfigRow): string {
     enabled: config.supply_accumulation_mode_enabled === true,
     thresholdPct: Number(config.supply_accumulation_threshold_pct ?? 10),
     buyUsd: Number(config.supply_accumulation_buy_usd ?? 20),
+    minMarketCapUsd: Number(config.supply_accumulation_min_market_cap_usd ?? 2_000),
     maxMarketCapUsd: Number(config.supply_accumulation_max_market_cap_usd ?? 15_000),
     windowSeconds: Number(config.supply_accumulation_window_seconds ?? 600),
+    scales: [2, 3, 4].map((tier) => ({
+      tier,
+      enabled: config[`supply_accumulation_scale_${tier}_enabled` as keyof BotConfigRow] === true,
+      thresholdPct: Number(
+        config[`supply_accumulation_scale_${tier}_threshold_pct` as keyof BotConfigRow] ??
+          (tier === 2 ? 12 : tier === 3 ? 15 : 18),
+      ),
+      buyUsd: Number(
+        config[`supply_accumulation_scale_${tier}_buy_usd` as keyof BotConfigRow] ?? 10,
+      ),
+    })),
     targets: configuredTargetWallets(config).sort(),
   });
+}
+
+function maximumConfiguredSupplyBuyUsd(config: BotConfigRow): number {
+  const amounts = [Number(config.supply_accumulation_buy_usd ?? 20)];
+  if (config.supply_accumulation_scale_2_enabled === true) {
+    amounts.push(Number(config.supply_accumulation_scale_2_buy_usd ?? 10));
+  }
+  if (config.supply_accumulation_scale_3_enabled === true) {
+    amounts.push(Number(config.supply_accumulation_scale_3_buy_usd ?? 10));
+  }
+  if (config.supply_accumulation_scale_4_enabled === true) {
+    amounts.push(Number(config.supply_accumulation_scale_4_buy_usd ?? 10));
+  }
+  return Math.max(...amounts.filter((amount) => Number.isFinite(amount) && amount > 0), 0);
 }
 
 async function main() {
@@ -354,7 +388,7 @@ async function main() {
   let fundingReadiness = await checkFundingWalletReadiness(
     cfg.user_id,
     automaticEntryStrategy(cfg) === "supply_accumulation"
-      ? Number(cfg.supply_accumulation_buy_usd ?? 20)
+      ? maximumConfiguredSupplyBuyUsd(cfg)
       : cfg.fixed_buy_usd,
   );
 
@@ -410,6 +444,7 @@ async function main() {
   };
   const coordinatedBuys = new CoordinatedBuyTracker();
   const supplyAccumulationStore = new SupplyAccumulationStore(db, cfg.user_id);
+  const supplyAccumulationScaleStore = new SupplyAccumulationScaleStore(db, cfg.user_id);
 
   // Cumulative USDC the target has committed to each mint over a rolling window
   // (his real conviction). Used by the USDC-conviction gate/sizing when enabled.
@@ -451,6 +486,10 @@ async function main() {
   const targetFirstBuyAccounting = new RecentAsyncResultCache<boolean>();
   const uncertainEntryMints = new Set<string>();
   const supplyEntryPositionCache = new Map<string, boolean>();
+  const positionPeakPrice = new Map<string, number>();
+  // Per-position price-tick sanity state. A scale fill explicitly clears both
+  // caches so stale pre-scale peaks/ticks cannot trigger an inherited exit.
+  const positionPriceSanity = new Map<string, PriceSanityState>();
   const pendingEntrySells = new Map<string, Array<{ event: SwapEvent; bufferedAt: number }>>();
   const PENDING_ENTRY_SELL_TTL_MS = 2 * 60_000;
   const PENDING_ENTRY_SELLS_PER_MINT = 100;
@@ -844,6 +883,7 @@ async function main() {
                 user_id: cfg.user_id,
                 token_mint: claim.token_mint,
                 entry_price_usd: entryPriceUsd,
+                bot_cost_basis_usd: nominalBuyUsd,
                 amount_tokens: receipt.amountUi,
                 amount_remaining: receipt.amountUi,
                 decimals: tokenDecimals,
@@ -1086,6 +1126,258 @@ async function main() {
       return resolved;
     } finally {
       reconcilingEntryClaims = false;
+    }
+  }
+
+  let reconcilingSupplyScaleClaims = false;
+
+  type SupplyScalePostApplyRepair = {
+    id: string;
+    positionId: string;
+    tokenMint: string;
+    sourceSlot: string;
+    botTxSig: string;
+  };
+
+  async function completeSupplyScalePostApplyRepair(
+    repair: SupplyScalePostApplyRepair,
+  ): Promise<void> {
+    const sourceSlot = Number(repair.sourceSlot);
+    if (!Number.isSafeInteger(sourceSlot) || sourceSlot <= 0) {
+      throw new Error("persisted Supply scale repair has an invalid source slot");
+    }
+    // Hold the mint observation lane through both durable sell replay and the
+    // repair CAS. Every sell already seen by the hot feed is registered in this
+    // queue synchronously, so it must persist ahead of this checkpoint.
+    await supplyObservationQueue.run(repair.tokenMint, async () => {
+      supplyEntryPositionCache.set(repair.positionId, true);
+      positionPeakPrice.delete(repair.positionId);
+      positionPriceSanity.delete(repair.positionId);
+      await processDurableSupplySells(repair.positionId, repair.tokenMint, sourceSlot, true);
+
+      // This CAS is the durable completion boundary. A crash anywhere above
+      // leaves the persisted claim discoverable for startup/periodic repair.
+      await supplyAccumulationScaleStore.markPostApplyRepaired(repair.id, repair.botTxSig);
+    });
+    schedulePendingEntrySellDrain(repair.tokenMint);
+  }
+
+  async function applyRecoveredSupplyScaleClaim(claim: SupplyScaleClaim): Promise<boolean> {
+    if (!claim.botTxSig) return false;
+    let landed = claim;
+    if (claim.status !== "landed") {
+      const attempt = preparedSupplyScaleAttempt(claim);
+      if (!attempt) return false;
+      const receipt = await exactSupplyScaleReceipt(
+        claim.botTxSig,
+        claim.tokenMint,
+        claim.tokenDecimals,
+      );
+      if (!receipt) return false;
+      landed = await supplyAccumulationScaleStore.markLanded(
+        claim.id,
+        attempt,
+        receipt.amountRaw,
+        receipt.decimals,
+      );
+    }
+    if (!landed.receivedAmountRaw) return false;
+    const applied = await supplyAccumulationScaleStore.applyBuy(
+      landed.id,
+      landed.botTxSig ?? claim.botTxSig,
+      landed.receivedAmountRaw,
+      landed.tokenDecimals,
+      "rpc",
+      null,
+    );
+    if (!applied.applied && !applied.replay) return false;
+
+    await completeSupplyScalePostApplyRepair({
+      id: landed.id,
+      positionId: landed.positionId,
+      tokenMint: landed.tokenMint,
+      sourceSlot: landed.sourceSlot,
+      botTxSig: landed.botTxSig ?? claim.botTxSig,
+    });
+    return true;
+  }
+
+  async function reconcileUnresolvedSupplyScaleClaims(): Promise<number> {
+    if (reconcilingSupplyScaleClaims) return 0;
+    reconcilingSupplyScaleClaims = true;
+    try {
+      const claims = await supplyAccumulationScaleStore.loadUnresolvedClaims();
+      let resolved = 0;
+      for (const claim of claims) {
+        uncertainEntryMints.add(claim.tokenMint);
+        try {
+          await tradeExecutionQueue.run(claim.tokenMint, async () => {
+            if (claim.status === "claimed") {
+              const claimedAt = Date.parse(claim.createdAt);
+              if (Number.isFinite(claimedAt) && Date.now() - claimedAt >= 120_000) {
+                await supplyAccumulationScaleStore.markFailure(claim.id, {
+                  status: "failed_pre_submit",
+                  expectedStatus: "claimed",
+                  errorCode: "worker-restarted-before-prepared-scale-signature",
+                });
+                uncertainEntryMints.delete(claim.tokenMint);
+                resolved += 1;
+              }
+              return;
+            }
+
+            if (claim.status === "landed") {
+              if (await applyRecoveredSupplyScaleClaim(claim)) {
+                uncertainEntryMints.delete(claim.tokenMint);
+                resolved += 1;
+              }
+              return;
+            }
+            if (claim.status !== "submitted" && claim.status !== "uncertain") return;
+
+            const attempt = preparedSupplyScaleAttempt(claim);
+            if (!attempt) return;
+            const statuses = await solanaRpcWithTimeout(
+              rpc.getSignatureStatuses([attempt.botTxSig], {
+                searchTransactionHistory: true,
+              }),
+              15_000,
+            );
+            let status = statuses.value[0];
+            if (!status) {
+              const lastValidBlockHeight = Number(attempt.lastValidBlockHeight);
+              if (!Number.isSafeInteger(lastValidBlockHeight) || lastValidBlockHeight <= 0) {
+                throw new Error("prepared Supply scale claim has an invalid block-height expiry");
+              }
+              const finalizedBlockHeight = await solanaRpcWithTimeout(
+                rpc.getBlockHeight("finalized"),
+                15_000,
+              );
+              if (finalizedBlockHeight > lastValidBlockHeight) {
+                // Recheck after reading finalized height. Only an exact
+                // history-enabled null after expiry proves this signed attempt
+                // never landed and may release the shared position-action lock.
+                const finalStatuses = await solanaRpcWithTimeout(
+                  rpc.getSignatureStatuses([attempt.botTxSig], {
+                    searchTransactionHistory: true,
+                  }),
+                  15_000,
+                );
+                status = finalStatuses.value[0];
+                if (!status) {
+                  await supplyAccumulationScaleStore.markFailure(claim.id, {
+                    status: "failed_pre_submit",
+                    expectedStatus: claim.status,
+                    errorCode: "prepared-scale-signature-expired-without-chain-record",
+                    attempt,
+                  });
+                  uncertainEntryMints.delete(claim.tokenMint);
+                  resolved += 1;
+                  return;
+                }
+              }
+            }
+            if (status?.err && status.confirmationStatus === "finalized") {
+              await supplyAccumulationScaleStore.markFailure(claim.id, {
+                status: "failed_pre_submit",
+                expectedStatus: claim.status,
+                errorCode: "prepared-scale-transaction-failed-on-chain",
+                attempt,
+              });
+              uncertainEntryMints.delete(claim.tokenMint);
+              resolved += 1;
+              return;
+            }
+            // A processed/confirmed failure may still disappear with its fork.
+            // Keep the signed attempt quarantined until finalized chain truth
+            // proves that it cannot later land and duplicate a reclaimed buy.
+            if (status?.err) {
+              if (claim.status === "submitted") {
+                await supplyAccumulationScaleStore.markFailure(claim.id, {
+                  status: "uncertain",
+                  expectedStatus: "submitted",
+                  errorCode: "scale-transaction-failure-not-yet-finalized",
+                  attempt,
+                });
+              }
+              return;
+            }
+            if (
+              status?.confirmationStatus === "confirmed" ||
+              status?.confirmationStatus === "finalized"
+            ) {
+              if (await applyRecoveredSupplyScaleClaim(claim)) {
+                uncertainEntryMints.delete(claim.tokenMint);
+                resolved += 1;
+              }
+              return;
+            }
+            if (status && claim.status === "submitted") {
+              await supplyAccumulationScaleStore.markFailure(claim.id, {
+                status: "uncertain",
+                expectedStatus: "submitted",
+                errorCode: "scale-submission-finality-unresolved-after-restart",
+                attempt,
+              });
+            }
+          });
+        } catch (err) {
+          uncertainEntryMints.add(claim.tokenMint);
+          log.warn(
+            { err: safeDiagnostic(err), mint: claim.tokenMint, claimId: claim.id },
+            "Supply scale reconciliation deferred — mint remains quarantined",
+          );
+        }
+      }
+      if (claims.length > 0) {
+        log.warn(
+          {
+            unresolvedSupplyScaleClaimCount: claims.length - resolved,
+            resolvedSupplyScaleClaimCount: resolved,
+          },
+          "durable Supply scale claims reconciled",
+        );
+      }
+
+      const pendingRepairs = await supplyAccumulationScaleStore.loadPendingPostApplyRepairs();
+      let repaired = 0;
+      for (const claim of pendingRepairs) {
+        uncertainEntryMints.add(claim.tokenMint);
+        try {
+          await tradeExecutionQueue.run(claim.tokenMint, async () => {
+            if (!claim.botTxSig) {
+              throw new Error("persisted Supply scale repair is missing its transaction signature");
+            }
+            await completeSupplyScalePostApplyRepair({
+              id: claim.id,
+              positionId: claim.positionId,
+              tokenMint: claim.tokenMint,
+              sourceSlot: claim.sourceSlot,
+              botTxSig: claim.botTxSig,
+            });
+            uncertainEntryMints.delete(claim.tokenMint);
+            repaired += 1;
+          });
+        } catch (err) {
+          uncertainEntryMints.add(claim.tokenMint);
+          log.warn(
+            { err: safeDiagnostic(err), mint: claim.tokenMint, claimId: claim.id },
+            "Supply scale post-apply repair deferred — mint remains quarantined",
+          );
+        }
+      }
+      if (pendingRepairs.length > 0) {
+        log.warn(
+          {
+            pendingSupplyScaleRepairCount: pendingRepairs.length - repaired,
+            completedSupplyScaleRepairCount: repaired,
+          },
+          "durable Supply scale post-apply repairs reconciled",
+        );
+      }
+      return resolved + repaired;
+    } finally {
+      reconcilingSupplyScaleClaims = false;
     }
   }
 
@@ -1524,6 +1816,12 @@ async function main() {
   }
   await monitor.reconcileFollowersFromDatabase();
 
+  // A scale claim always belongs to an already-open Supply position. Restore
+  // that position's original monitor context before applying a landed scale so
+  // any durable target sell discovered during recovery can execute against the
+  // combined position immediately instead of being dropped before hydration.
+  await reconcileUnresolvedSupplyScaleClaims();
+
   // On the first deployment of durable cursors, recover transfers made since
   // the oldest still-open entry instead of silently baselining every target at
   // the current head. Historical buys are action-gated, while transfers can
@@ -1778,7 +2076,7 @@ async function main() {
   setInterval(() => {
     const configuredBuyUsd =
       automaticEntryStrategy(cfg) === "supply_accumulation"
-        ? Number(cfg.supply_accumulation_buy_usd ?? 20)
+        ? maximumConfiguredSupplyBuyUsd(cfg)
         : cfg.fixed_buy_usd;
     checkFundingWalletReadiness(cfg.user_id, configuredBuyUsd)
       .then((next) => {
@@ -1797,6 +2095,9 @@ async function main() {
   setInterval(() => {
     reconcileUnresolvedEntryClaims().catch((err) =>
       log.error({ err: safeDiagnostic(err) }, "durable entry claim reconciliation failed"),
+    );
+    reconcileUnresolvedSupplyScaleClaims().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "durable Supply scale reconciliation failed"),
     );
   }, 60_000);
   await refreshCrewWallets(cfg.crew_exit_min_mints ?? 4).catch(() => {});
@@ -1879,11 +2180,6 @@ async function main() {
       log.error({ err: safeDiagnostic(err) }, "configured position exit loop failed"),
     );
   }, 30_000);
-
-  const positionPeakPrice = new Map<string, number>();
-  // Per-position price-tick sanity state, so one corrupted feed tick can never
-  // by itself trigger a take-profit, trailing stop, or stop-loss.
-  const positionPriceSanity = new Map<string, PriceSanityState>();
 
   async function isSupplyEntryPosition(positionId: string): Promise<boolean> {
     const cached = supplyEntryPositionCache.get(positionId);
@@ -2623,13 +2919,8 @@ async function main() {
   }
 
   const supplyBuyBackground = new BoundedBackgroundQueue(16, 512);
-  const supplySellBackground = new BoundedBackgroundQueue(8, 256);
 
-  function scheduleSupplyBackground(
-    event: FeedEvent,
-    task: () => Promise<void>,
-    lane: "buy" | "sell" = "buy",
-  ): void {
+  function scheduleSupplyBackground(event: FeedEvent, task: () => Promise<void>): void {
     const identity = [
       event.kind,
       event.txSig,
@@ -2637,22 +2928,19 @@ async function main() {
       event.tokenMint,
       event.kind === "swap" ? event.side : "transfer",
     ].join(":");
-    const result = (lane === "sell" ? supplySellBackground : supplyBuyBackground).schedule(
-      identity,
-      async () => {
-        try {
-          await task();
-        } catch (err) {
-          recordStrategyDecision(event, "failed", safeDiagnostic(err), {
-            metadata: { entryStrategy: "supply_accumulation", background: true },
-          });
-          log.error(
-            { err: safeDiagnostic(err), mint: event.tokenMint, txSig: event.txSig },
-            "background supply-accumulation handler failed; confirmed RPC recovery remains active",
-          );
-        }
-      },
-    );
+    const result = supplyBuyBackground.schedule(identity, async () => {
+      try {
+        await task();
+      } catch (err) {
+        recordStrategyDecision(event, "failed", safeDiagnostic(err), {
+          metadata: { entryStrategy: "supply_accumulation", background: true },
+        });
+        log.error(
+          { err: safeDiagnostic(err), mint: event.tokenMint, txSig: event.txSig },
+          "background supply-accumulation handler failed; confirmed RPC recovery remains active",
+        );
+      }
+    });
     if (result === "full") {
       recordStrategyDecision(
         event,
@@ -2663,8 +2951,8 @@ async function main() {
       log.warn(
         {
           mint: event.tokenMint,
-          lane,
-          queue: lane === "sell" ? supplySellBackground.health() : supplyBuyBackground.health(),
+          lane: "buy",
+          queue: supplyBuyBackground.health(),
         },
         "supply hot-feed work deferred to confirmed RPC recovery",
       );
@@ -2703,14 +2991,22 @@ async function main() {
           if (targetWallets.has(event.wallet)) {
             if (cfg.supply_accumulation_mode_enabled === true) {
               if (event.source === "geyser") {
-                scheduleSupplyBackground(
-                  event,
-                  () =>
-                    supplyObservationQueue.run(event.tokenMint, async () => {
-                      await observeSupplyAccumulationEvent(event);
-                    }),
-                  "sell",
-                );
+                // Register the mint tail synchronously before yielding the
+                // Geyser handler. A post-scale repair checkpoint can therefore
+                // never overtake a sell this process has already observed.
+                void supplyObservationQueue
+                  .run(event.tokenMint, async () => {
+                    await observeSupplyAccumulationEvent(event);
+                  })
+                  .catch((err) => {
+                    recordStrategyDecision(event, "failed", safeDiagnostic(err), {
+                      metadata: { entryStrategy: "supply_accumulation", background: true },
+                    });
+                    log.error(
+                      { err: safeDiagnostic(err), mint: event.tokenMint, txSig: event.txSig },
+                      "background supply sell observation failed; confirmed RPC recovery remains active",
+                    );
+                  });
               } else {
                 supplyObservationPromise = supplyObservationQueue.run(event.tokenMint, async () => {
                   await observeSupplyAccumulationEvent(event);
@@ -3153,7 +3449,7 @@ async function main() {
         timeoutMs: waitForConfirmation ? 1_500 : 0,
         searchTransactionHistory: event.source === "rpc",
       });
-      if (!source || !confirmedSourceIsFresh(source, 15_000)) return null;
+      if (!source || !confirmedSourceIsFresh(source, SUPPLY_SCALE_ACTION_DEADLINE_MS)) return null;
       event.blockTimeMs = source.blockTimeMs;
 
       const [state, solPrice] = await Promise.all([
@@ -3196,18 +3492,35 @@ async function main() {
         return null;
       }
       const configuredCap = Math.min(15_000, state.maxMarketCapUsd);
+      const configuredFloor = Math.max(0, state.minMarketCapUsd);
       const maxSpendLamports = maximumSpendWithSlippageLamports(BigInt(amountLamports), 800);
       if (maxSpendLamports === null) return null;
+      const currentViewCaps = [curves.confirmedCurve, curves.processedCurve].map((curve) =>
+        pumpFunCurrentMarketCapUsd(curve, solPrice),
+      );
+      if (
+        currentViewCaps.some((marketCap) => marketCap === undefined || marketCap < configuredFloor)
+      ) {
+        return null;
+      }
       const caps = strictestPumpFunMarketCaps(
         [curves.confirmedCurve, curves.processedCurve],
         solPrice,
         maxSpendLamports,
         configuredCap,
       );
-      // Every prior await can consume the 15-second reaction budget. Recheck
+      // Every prior await consumes the sub-minute reaction budget. Recheck
       // chain time after the final curve read, immediately before returning
       // authorization to the executor's no-more-await submission boundary.
-      if (!caps?.belowCap || !confirmedSourceIsFresh(source, 15_000)) return null;
+      if (
+        !caps?.belowCap ||
+        caps.currentMarketCapUsd < configuredFloor ||
+        !state.aboveMarketCapFloor ||
+        !state.withinMarketCapRange ||
+        !confirmedSourceIsFresh(source, SUPPLY_SCALE_ACTION_DEADLINE_MS)
+      ) {
+        return null;
+      }
 
       return {
         state,
@@ -3215,6 +3528,498 @@ async function main() {
         projectedPostBuyMarketCapUsd: caps.projectedPostBuyMarketCapUsd,
       };
     });
+  }
+
+  type SupplyScaleSubmissionValidation = {
+    plan: SupplyScalePlan;
+    state: SupplyAccumulationState;
+    currentMarketCapUsd: number;
+    projectedPostBuyMarketCapUsd: number;
+  };
+
+  async function validateSupplyScaleSubmission(
+    event: SwapEvent,
+    positionId: string,
+    sourceEventKey: string,
+    amountLamports: number,
+    claimId: string | null,
+    waitForConfirmation: boolean,
+  ): Promise<SupplyScaleSubmissionValidation | null> {
+    if (
+      !cfg.enabled ||
+      entryConfigTransitioning ||
+      automaticEntryStrategy(cfg) !== "supply_accumulation" ||
+      cfg.supply_accumulation_mode_enabled !== true ||
+      currentEntryMonitoringGate().blocked ||
+      !Number.isSafeInteger(amountLamports) ||
+      amountLamports <= 0 ||
+      !isFreshAutomaticAction(event, SUPPLY_SCALE_ACTION_DEADLINE_MS)
+    ) {
+      return null;
+    }
+
+    return supplyObservationQueue.run(event.tokenMint, async () => {
+      const source = await loadConfirmedSourceTransaction(rpc, event.txSig, {
+        expectedSlot: event.slot,
+        knownBlockTimeMs: event.source === "rpc" ? event.blockTimeMs : undefined,
+        timeoutMs: waitForConfirmation ? 1_500 : 0,
+        searchTransactionHistory: event.source === "rpc",
+      });
+      if (!source || !confirmedSourceIsFresh(source, SUPPLY_SCALE_ACTION_DEADLINE_MS)) return null;
+      event.blockTimeMs = source.blockTimeMs;
+
+      const [plan, state, solPrice] = await Promise.all([
+        supplyAccumulationScaleStore.getPlan(event.tokenMint, positionId, sourceEventKey, claimId),
+        supplyAccumulationStore.state(event.tokenMint),
+        priceUsd(WSOL),
+      ]);
+      if (
+        solPrice === undefined ||
+        !plan.ok ||
+        !plan.eligible ||
+        plan.claimId !== claimId ||
+        plan.sourceTxSig !== event.txSig ||
+        plan.sourceWallet !== event.wallet ||
+        plan.sourceSlot !== String(event.slot) ||
+        plan.tokenDecimals !== event.decimals ||
+        plan.thresholdPct === null ||
+        plan.buyUsd === null ||
+        plan.minMarketCapUsd === null ||
+        plan.maxMarketCapUsd === null ||
+        !state.ok ||
+        !state.modeEnabled ||
+        !state.dataReliable ||
+        state.payloadConflict ||
+        state.lastEventKey !== sourceEventKey ||
+        state.lastEventSlot !== String(event.slot) ||
+        state.decimals !== event.decimals ||
+        state.totalSupplyRaw === null
+      ) {
+        return null;
+      }
+
+      const curves = await loadSupplyCurveViews(event);
+      if (
+        !curves ||
+        state.totalSupplyRaw !== curves.confirmedCurve.totalSupplyRaw.toString() ||
+        !reachesSupplyThreshold(
+          BigInt(state.netAcquiredRaw),
+          curves.confirmedCurve.totalSupplyRaw,
+          plan.thresholdPct,
+        )
+      ) {
+        return null;
+      }
+      const configuredFloor = Math.max(0, plan.minMarketCapUsd);
+      const configuredCap = Math.min(15_000, plan.maxMarketCapUsd);
+      const maxSpendLamports = maximumSpendWithSlippageLamports(BigInt(amountLamports), 800);
+      if (maxSpendLamports === null) return null;
+      const currentViewCaps = [curves.confirmedCurve, curves.processedCurve].map((curve) =>
+        pumpFunCurrentMarketCapUsd(curve, solPrice),
+      );
+      if (
+        currentViewCaps.some((marketCap) => marketCap === undefined || marketCap < configuredFloor)
+      ) {
+        return null;
+      }
+      const caps = strictestPumpFunMarketCaps(
+        [curves.confirmedCurve, curves.processedCurve],
+        solPrice,
+        maxSpendLamports,
+        configuredCap,
+      );
+      if (
+        !caps?.belowCap ||
+        caps.currentMarketCapUsd < configuredFloor ||
+        !confirmedSourceIsFresh(source, SUPPLY_SCALE_ACTION_DEADLINE_MS) ||
+        !cfg.enabled ||
+        entryConfigTransitioning ||
+        automaticEntryStrategy(cfg) !== "supply_accumulation" ||
+        currentEntryMonitoringGate().blocked
+      ) {
+        return null;
+      }
+      return {
+        plan,
+        state,
+        currentMarketCapUsd: caps.currentMarketCapUsd,
+        projectedPostBuyMarketCapUsd: caps.projectedPostBuyMarketCapUsd,
+      };
+    });
+  }
+
+  function preparedSupplyScaleAttempt(claim: SupplyScaleClaim): SupplyScalePreparedAttempt | null {
+    if (!claim.botTxSig || !claim.lastValidBlockHeight || !claim.submissionStartedAt) return null;
+    return {
+      botTxSig: claim.botTxSig,
+      lastValidBlockHeight: claim.lastValidBlockHeight,
+      submissionStartedAt: claim.submissionStartedAt,
+    };
+  }
+
+  async function exactSupplyScaleReceipt(
+    txSig: string,
+    tokenMint: string,
+    tokenDecimals: number,
+  ): Promise<{ amountRaw: string; amountUi: number; decimals: number } | null> {
+    if (!fundingReadiness.walletPubkey) return null;
+    const transaction = await solanaRpcWithTimeout(
+      rpc.getTransaction(txSig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      }),
+      15_000,
+    );
+    const receipt = confirmedTokenReceiptFromTx(
+      transaction ?? undefined,
+      fundingReadiness.walletPubkey,
+      tokenMint,
+    );
+    return receipt?.decimals === tokenDecimals ? receipt : null;
+  }
+
+  async function executeSupplyScaleInLocked(
+    event: SwapEvent,
+    positionId: string,
+    sourceEventKey: string,
+  ): Promise<void> {
+    const preliminaryPlan = await supplyAccumulationScaleStore.getPlan(
+      event.tokenMint,
+      positionId,
+      sourceEventKey,
+    );
+    if (!preliminaryPlan.eligible || preliminaryPlan.buyUsd === null) {
+      recordStrategyDecision(
+        event,
+        "tracked",
+        `Supply scale observation: ${preliminaryPlan.reason}`,
+        {
+          position_id: positionId,
+          market_cap_usd: preliminaryPlan.marketCapUsd ?? undefined,
+          metadata: {
+            entryStrategy: "supply_accumulation",
+            scaleEligible: false,
+            scaleReason: preliminaryPlan.reason,
+          },
+        },
+      );
+      return;
+    }
+
+    const secret = await loadSigner(cfg.user_id);
+    if (!secret) {
+      recordStrategyDecision(event, "failed", "funding key is not available for Supply scale", {
+        position_id: positionId,
+      });
+      return;
+    }
+    const solPrice = await priceUsd(WSOL);
+    if (solPrice === undefined) {
+      recordStrategyDecision(
+        event,
+        "failed",
+        "live SOL/USD price is unavailable for Supply scale",
+        {
+          position_id: positionId,
+        },
+      );
+      return;
+    }
+    const plannedAmountLamports = Math.floor((preliminaryPlan.buyUsd / solPrice) * 1e9);
+    if (!Number.isSafeInteger(plannedAmountLamports) || plannedAmountLamports <= 0) {
+      recordStrategyDecision(event, "failed", "Supply scale buy size is invalid", {
+        position_id: positionId,
+      });
+      return;
+    }
+
+    const initialValidation = await validateSupplyScaleSubmission(
+      event,
+      positionId,
+      sourceEventKey,
+      plannedAmountLamports,
+      null,
+      true,
+    );
+    if (
+      !initialValidation ||
+      initialValidation.plan.tierNumber !== preliminaryPlan.tierNumber ||
+      initialValidation.plan.buyUsd !== preliminaryPlan.buyUsd
+    ) {
+      recordStrategyDecision(
+        event,
+        "skipped",
+        "Supply scale threshold, source, custody, or market-cap range changed before claim",
+        { position_id: positionId },
+      );
+      return;
+    }
+
+    const claimed = await supplyAccumulationScaleStore.claimBuy(
+      event.tokenMint,
+      positionId,
+      sourceEventKey,
+      BigInt(plannedAmountLamports),
+    );
+    const acquiredClaim =
+      claimed.claim?.status === "claimed" && (claimed.claimed || claimed.replay);
+    if (!acquiredClaim || !claimed.claim) {
+      recordStrategyDecision(
+        event,
+        "tracked",
+        `Supply scale claim not acquired: ${claimed.reason}`,
+        {
+          position_id: positionId,
+          metadata: {
+            entryStrategy: "supply_accumulation",
+            scaleTier: claimed.claim?.tierNumber,
+            durableReplay: claimed.replay,
+          },
+        },
+      );
+      return;
+    }
+
+    const claim = claimed.claim;
+    const amountLamports = Number(BigInt(claim.amountLamports));
+    if (
+      !Number.isSafeInteger(amountLamports) ||
+      amountLamports <= 0 ||
+      amountLamports !== plannedAmountLamports ||
+      claim.tierNumber !== initialValidation.plan.tierNumber ||
+      claim.plannedBuyUsd !== initialValidation.plan.buyUsd ||
+      claim.configFingerprint !== initialValidation.plan.configFingerprint
+    ) {
+      await supplyAccumulationScaleStore.markFailure(claim.id, {
+        status: "failed_pre_submit",
+        expectedStatus: "claimed",
+        errorCode: "claimed-scale-plan-differs-from-preclaim-validation",
+      });
+      recordStrategyDecision(event, "failed", "durable Supply scale plan changed before claim", {
+        position_id: positionId,
+      });
+      return;
+    }
+    uncertainEntryMints.add(event.tokenMint);
+    let preparedCandidate: SupplyScalePreparedAttempt | null = null;
+    let preparedAttempt: SupplyScalePreparedAttempt | null = null;
+    let executionLanded = false;
+    let landedPersisted = false;
+    try {
+      recordStrategyDecision(
+        event,
+        "copy_submitted",
+        `preparing Supply scale tier ${claim.tierNumber}`,
+        {
+          position_id: positionId,
+          market_cap_usd: initialValidation.currentMarketCapUsd,
+          metadata: {
+            entryStrategy: "supply_accumulation",
+            scaleTier: claim.tierNumber,
+            thresholdPct: claim.thresholdPct,
+            configuredBuyUsd: claim.plannedBuyUsd,
+            projectedPostBuyMarketCapUsd: initialValidation.projectedPostBuyMarketCapUsd,
+          },
+        },
+      );
+
+      const result = await executeSwap({
+        signerSecret: secret,
+        inputMint: WSOL,
+        outputMint: event.tokenMint,
+        amountLamports,
+        slippageBps: 800,
+        route: cfg.execution_route,
+        jitoTipSol: cfg.jito_tip_sol,
+        outputDecimals: event.decimals,
+        pumpFunDirectOnly: true,
+        onPrepared: async ({ txSig, lastValidBlockHeight }) => {
+          const submissionStartedAt = new Date().toISOString();
+          preparedCandidate = {
+            botTxSig: txSig,
+            lastValidBlockHeight: String(lastValidBlockHeight),
+            submissionStartedAt,
+          };
+          const submitted = await supplyAccumulationScaleStore.beginSubmission(
+            claim.id,
+            txSig,
+            String(lastValidBlockHeight),
+            submissionStartedAt,
+          );
+          preparedAttempt = preparedSupplyScaleAttempt(submitted);
+          if (!preparedAttempt) {
+            throw new Error("Supply scale prepared claim lost its exact transaction identity");
+          }
+        },
+        beforeSubmit: async () => {
+          if (!preparedAttempt) return false;
+          const finalValidation = await validateSupplyScaleSubmission(
+            event,
+            positionId,
+            sourceEventKey,
+            amountLamports,
+            claim.id,
+            false,
+          );
+          return (
+            finalValidation !== null &&
+            finalValidation.plan.tierNumber === claim.tierNumber &&
+            finalValidation.plan.buyUsd === claim.plannedBuyUsd &&
+            finalValidation.plan.configFingerprint === claim.configFingerprint &&
+            cfg.enabled === true &&
+            !entryConfigTransitioning &&
+            automaticEntryStrategy(cfg) === "supply_accumulation" &&
+            !currentEntryMonitoringGate().blocked &&
+            isFreshAutomaticAction(event, SUPPLY_SCALE_ACTION_DEADLINE_MS)
+          );
+        },
+      });
+      executionLanded = true;
+      const landedAttempt = preparedAttempt as SupplyScalePreparedAttempt | null;
+      if (!landedAttempt || result.txSig !== landedAttempt.botTxSig) {
+        throw new Error("landed Supply scale signature differs from its prepared claim");
+      }
+      const receipt = await exactSupplyScaleReceipt(
+        result.txSig,
+        event.tokenMint,
+        claim.tokenDecimals,
+      );
+      if (!receipt) {
+        throw new Error("landed Supply scale exact token receipt is unavailable");
+      }
+      await supplyAccumulationScaleStore.markLanded(
+        claim.id,
+        landedAttempt,
+        receipt.amountRaw,
+        receipt.decimals,
+      );
+      landedPersisted = true;
+      const applied = await supplyAccumulationScaleStore.applyBuy(
+        claim.id,
+        result.txSig,
+        receipt.amountRaw,
+        receipt.decimals,
+        result.route,
+        result.latencyMs,
+      );
+      if (!applied.applied && !applied.replay) {
+        throw new Error(`Supply scale fill was not applied: ${applied.reason}`);
+      }
+
+      await completeSupplyScalePostApplyRepair({
+        id: claim.id,
+        positionId,
+        tokenMint: event.tokenMint,
+        sourceSlot: claim.sourceSlot,
+        botTxSig: result.txSig,
+      });
+      uncertainEntryMints.delete(event.tokenMint);
+      recordStrategyDecision(
+        event,
+        "copied",
+        `Supply scale tier ${claim.tierNumber} landed and was atomically added`,
+        {
+          position_id: positionId,
+          amount_usd: claim.plannedBuyUsd,
+          bot_tx_sig: result.txSig,
+          reaction_ms: strategyReactionMs(event, Date.now(), result.latencyMs),
+          execution_ms: result.latencyMs,
+          metadata: {
+            entryStrategy: "supply_accumulation",
+            scaleTier: claim.tierNumber,
+            receivedAmountRaw: receipt.amountRaw,
+            amountRemaining: applied.amountRemaining,
+            entryPriceUsd: applied.entryPriceUsd,
+            route: result.route,
+          },
+        },
+      );
+    } catch (err) {
+      // If the CAS response was lost, read back the exact prepared identity.
+      // The executor never sends when onPrepared throws, so a verified attempt
+      // can still be released as a proven pre-submit failure.
+      const candidateAttempt = preparedCandidate as SupplyScalePreparedAttempt | null;
+      if (!preparedAttempt && candidateAttempt) {
+        try {
+          const verified = await supplyAccumulationScaleStore.persistPrepared(
+            claim.id,
+            candidateAttempt.botTxSig,
+            candidateAttempt.lastValidBlockHeight,
+            candidateAttempt.submissionStartedAt,
+          );
+          preparedAttempt = preparedSupplyScaleAttempt(verified);
+        } catch {
+          // Another process/attempt owns the durable row. Leave it untouched.
+        }
+      }
+      try {
+        if (!landedPersisted) {
+          if (!preparedAttempt) {
+            await supplyAccumulationScaleStore.markFailure(claim.id, {
+              status: "failed_pre_submit",
+              expectedStatus: "claimed",
+              errorCode: safeDiagnostic(err),
+            });
+            uncertainEntryMints.delete(event.tokenMint);
+          } else {
+            const disposition = executionLanded
+              ? ({ status: "uncertain" } as const)
+              : entryClaimFailureDisposition(err);
+            await supplyAccumulationScaleStore.markFailure(claim.id, {
+              status:
+                disposition.status === "failed_pre_submit" ? "failed_pre_submit" : "uncertain",
+              expectedStatus: "submitted",
+              errorCode: safeDiagnostic(err),
+              attempt: preparedAttempt,
+            });
+            if (disposition.status === "failed_pre_submit") {
+              uncertainEntryMints.delete(event.tokenMint);
+            }
+          }
+        }
+      } catch (reconcileError) {
+        log.error(
+          {
+            err: safeDiagnostic(reconcileError),
+            mint: event.tokenMint,
+            claimId: claim.id,
+          },
+          "Supply scale failure could not be reconciled; mint remains quarantined",
+        );
+      }
+      log.error(
+        { err: safeDiagnostic(err), mint: event.tokenMint, claimId: claim.id },
+        landedPersisted
+          ? "Supply scale landed but atomic apply is pending durable recovery"
+          : "Supply scale execution failed safely",
+      );
+    }
+  }
+
+  async function waitForSupplyCustodyTrigger(
+    event: SwapEvent,
+    state: SupplyAccumulationState,
+  ): Promise<{ safe: boolean; reason: string }> {
+    const chainEventAt = event.blockTimeMs ?? event.timestampMs;
+    const actionDeadline = chainEventAt + SUPPLY_SCALE_ACTION_DEADLINE_MS;
+    // The independent custody observer normally lands within seconds. Give it
+    // a bounded chance to publish this exact confirmed buy without consuming
+    // the whole action budget or monopolizing background workers. Confirmed
+    // RPC replay provides a second durable opportunity if this bound expires.
+    const waitDeadline = Math.min(actionDeadline, Date.now() + 10_000);
+    for (;;) {
+      const gate = await supplyAccumulationStore.custodyDistributionGate(
+        event.tokenMint,
+        state.windowStartedAt,
+        { txSig: event.txSig, slot: event.slot, targetWallet: event.wallet },
+      );
+      if (gate.safe || gate.reason !== "trigger_buy_not_verified") return gate;
+      const remainingMs = waitDeadline - Date.now();
+      if (remainingMs <= 0 || !isFreshAutomaticAction(event, SUPPLY_SCALE_ACTION_DEADLINE_MS)) {
+        return gate;
+      }
+      await delay(Math.min(250, remainingMs));
+    }
   }
 
   async function processSupplyAccumulationTargetBuy(
@@ -3254,7 +4059,7 @@ async function main() {
       contributingWallets: state.rootWallets,
       dataReliable: state.dataReliable,
     };
-    if (!isFreshAutomaticAction(event, 15_000)) {
+    if (!isFreshAutomaticAction(event, SUPPLY_SCALE_ACTION_DEADLINE_MS)) {
       recordStrategyDecision(event, "tracked", "historical supply accumulation evidence stored", {
         market_cap_usd: state.latestMarketCapUsd ?? undefined,
         metadata: { ...metadata, actionable: false },
@@ -3273,14 +4078,62 @@ async function main() {
       );
       return;
     }
+    const custodyGate = await waitForSupplyCustodyTrigger(event, state);
+    if (!custodyGate.safe) {
+      recordStrategyDecision(
+        event,
+        "tracked",
+        `Supply custody proof is not actionable: ${custodyGate.reason}`,
+        {
+          market_cap_usd: state.latestMarketCapUsd ?? undefined,
+          metadata: { ...metadata, actionable: false, custodyReason: custodyGate.reason },
+        },
+      );
+      return;
+    }
     const resolvedFirstBuy = typeof firstBuy === "boolean" ? firstBuy : await firstBuy;
-    await tryCopyBuy(event, "market-maker supply accumulation threshold reached", {
-      entryStrategy: "supply_accumulation",
-      entryMode: "regular",
-      firstBuy: resolvedFirstBuy,
-      targetBuyUsd: undefined,
-      coordinatedWallets: state.rootWallets,
-      supplyState: state,
+    await tradeExecutionQueue.run(event.tokenMint, async () => {
+      const { data: openPositions, error: openPositionError } = await db
+        .from("positions")
+        .select("id")
+        .eq("user_id", cfg.user_id)
+        .eq("token_mint", event.tokenMint)
+        .is("closed_at", null)
+        .limit(2);
+      if (openPositionError) {
+        throw new Error(`Supply open-position lookup failed: ${safeDiagnostic(openPositionError)}`);
+      }
+      if ((openPositions?.length ?? 0) > 1) {
+        recordStrategyDecision(
+          event,
+          "failed",
+          "multiple open positions make Supply scaling ambiguous",
+          { metadata },
+        );
+        return;
+      }
+      const openPosition = openPositions?.[0];
+      if (openPosition) {
+        if (!(await isSupplyEntryPosition(openPosition.id))) {
+          recordStrategyDecision(
+            event,
+            "tracked",
+            "an open position from another strategy blocks Supply scaling",
+            { position_id: openPosition.id, metadata },
+          );
+          return;
+        }
+        await executeSupplyScaleInLocked(event, openPosition.id, supplyEventKey(event));
+        return;
+      }
+      await tryCopyBuyLocked(event, "market-maker supply accumulation threshold reached", {
+        entryStrategy: "supply_accumulation",
+        entryMode: "regular",
+        firstBuy: resolvedFirstBuy,
+        targetBuyUsd: undefined,
+        coordinatedWallets: state.rootWallets,
+        supplyState: state,
+      });
     });
   }
 
@@ -5487,6 +6340,7 @@ async function main() {
               user_id: cfg.user_id,
               token_mint: event.tokenMint,
               entry_price_usd: entryPrice,
+              ...(supplyEntry ? { bot_cost_basis_usd: buyUsd } : {}),
               amount_tokens: receivedUi,
               amount_remaining: receivedUi,
               decimals: event.decimals,

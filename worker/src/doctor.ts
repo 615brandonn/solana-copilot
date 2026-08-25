@@ -690,8 +690,18 @@ async function checkSupplyAccumulationSchema(
     "supply_accumulation_mode_enabled",
     "supply_accumulation_threshold_pct",
     "supply_accumulation_buy_usd",
+    "supply_accumulation_min_market_cap_usd",
     "supply_accumulation_max_market_cap_usd",
     "supply_accumulation_window_seconds",
+    "supply_accumulation_scale_2_enabled",
+    "supply_accumulation_scale_2_threshold_pct",
+    "supply_accumulation_scale_2_buy_usd",
+    "supply_accumulation_scale_3_enabled",
+    "supply_accumulation_scale_3_threshold_pct",
+    "supply_accumulation_scale_3_buy_usd",
+    "supply_accumulation_scale_4_enabled",
+    "supply_accumulation_scale_4_threshold_pct",
+    "supply_accumulation_scale_4_buy_usd",
   ];
   const missing = requiredConfigFields.filter(
     (field) => cfg[field] === undefined || cfg[field] === null,
@@ -699,32 +709,91 @@ async function checkSupplyAccumulationSchema(
   if (missing.length > 0) {
     fail(
       "Supply Accumulation migration",
-      `missing ${missing.length} config field(s) — run supabase/supply-accumulation-entry-migration.sql`,
+      `missing ${missing.length} config field(s) — run supabase/supply-accumulation-scale-buys-migration.sql`,
     );
     return false;
   }
 
   const threshold = Number(cfg.supply_accumulation_threshold_pct);
   const buyUsd = Number(cfg.supply_accumulation_buy_usd);
+  const minMarketCapUsd = Number(cfg.supply_accumulation_min_market_cap_usd);
   const maxMarketCapUsd = Number(cfg.supply_accumulation_max_market_cap_usd);
   const windowSeconds = Number(cfg.supply_accumulation_window_seconds);
+  const scales = [
+    {
+      tier: 2,
+      enabled: cfg.supply_accumulation_scale_2_enabled === true,
+      threshold: Number(cfg.supply_accumulation_scale_2_threshold_pct),
+      buyUsd: Number(cfg.supply_accumulation_scale_2_buy_usd),
+    },
+    {
+      tier: 3,
+      enabled: cfg.supply_accumulation_scale_3_enabled === true,
+      threshold: Number(cfg.supply_accumulation_scale_3_threshold_pct),
+      buyUsd: Number(cfg.supply_accumulation_scale_3_buy_usd),
+    },
+    {
+      tier: 4,
+      enabled: cfg.supply_accumulation_scale_4_enabled === true,
+      threshold: Number(cfg.supply_accumulation_scale_4_threshold_pct),
+      buyUsd: Number(cfg.supply_accumulation_scale_4_buy_usd),
+    },
+  ];
   if (
     !Number.isFinite(threshold) ||
     threshold < 10 ||
     threshold > 20 ||
     !Number.isFinite(buyUsd) ||
     buyUsd <= 0 ||
+    buyUsd > 1_000_000 ||
+    !Number.isFinite(minMarketCapUsd) ||
+    minMarketCapUsd < 0 ||
     !Number.isFinite(maxMarketCapUsd) ||
     maxMarketCapUsd <= 0 ||
     maxMarketCapUsd > 15_000 ||
+    minMarketCapUsd >= maxMarketCapUsd ||
     !Number.isInteger(windowSeconds) ||
     windowSeconds < 30 ||
-    windowSeconds > 3_600
+    windowSeconds > 3_600 ||
+    scales.some(
+      (scale) =>
+        !Number.isFinite(scale.threshold) ||
+        scale.threshold < 10 ||
+        scale.threshold > 20 ||
+        !Number.isFinite(scale.buyUsd) ||
+        scale.buyUsd <= 0 ||
+        scale.buyUsd > 1_000_000,
+    )
   ) {
     fail(
       "Supply Accumulation config",
-      "threshold, buy size, strict market-cap ceiling, or rolling window is outside its safety bounds",
+      "thresholds, buy sizes, market-cap range, or rolling window are outside safety bounds",
     );
+    return false;
+  }
+  if (
+    (scales[1].enabled && !scales[0].enabled) ||
+    (scales[2].enabled && (!scales[0].enabled || !scales[1].enabled))
+  ) {
+    fail("Supply Accumulation scales", "enabled scale tiers must be contiguous from tier 2");
+    return false;
+  }
+  let priorThreshold = threshold;
+  for (const scale of scales) {
+    if (!scale.enabled) continue;
+    if (scale.threshold <= priorThreshold) {
+      fail(
+        "Supply Accumulation scales",
+        `enabled tier ${scale.tier} threshold must exceed ${priorThreshold}%`,
+      );
+      return false;
+    }
+    priorThreshold = scale.threshold;
+  }
+  const totalConfiguredBuyUsd =
+    buyUsd + scales.reduce((total, scale) => total + (scale.enabled ? scale.buyUsd : 0), 0);
+  if (totalConfiguredBuyUsd > 1_000_000) {
+    fail("Supply Accumulation scales", "configured entry exposure exceeds $1,000,000");
     return false;
   }
   if (cfg.supply_accumulation_mode_enabled && targetCount < 1) {
@@ -756,7 +825,7 @@ async function checkSupplyAccumulationSchema(
     return false;
   }
 
-  const [events, state] = await Promise.all([
+  const [events, state, scaleClaims] = await Promise.all([
     db
       .from("supply_accumulation_events")
       .select(
@@ -766,15 +835,21 @@ async function checkSupplyAccumulationSchema(
     db
       .from("supply_accumulation_state")
       .select(
-        "user_id,token_mint,window_seconds,as_of,window_started_at,total_supply_raw,decimals,gross_buy_raw,gross_sell_raw,net_acquired_raw,net_supply_bps,buy_count,sell_count,root_wallets,last_event_key,last_event_at,last_event_slot,last_event_side,latest_market_cap_usd,valuation_slot,market_data_reliable,pump_fun_verified,classification_reliable,direct_settlement_seen,payload_conflict,data_reliable,threshold_pct,threshold_reached,max_market_cap_usd,under_market_cap,entry_ready,updated_at",
+        "user_id,token_mint,window_seconds,as_of,window_started_at,total_supply_raw,decimals,gross_buy_raw,gross_sell_raw,net_acquired_raw,net_supply_bps,buy_count,sell_count,root_wallets,last_event_key,last_event_at,last_event_slot,last_event_side,latest_market_cap_usd,valuation_slot,market_data_reliable,pump_fun_verified,classification_reliable,direct_settlement_seen,payload_conflict,data_reliable,threshold_pct,threshold_reached,min_market_cap_usd,max_market_cap_usd,above_market_cap_floor,under_market_cap,within_market_cap_range,entry_ready,updated_at",
+      )
+      .limit(1),
+    db
+      .from("supply_accumulation_scale_claims")
+      .select(
+        "id,user_id,token_mint,position_id,tier_number,status,source_event_key,source_tx_sig,source_wallet,source_slot,token_decimals,threshold_pct,planned_buy_usd,amount_lamports,config_fingerprint,bot_tx_sig,last_valid_block_height,received_amount_raw,trade_id,error_code,submission_started_at,landed_at,persisted_at,applied_at,post_apply_repaired_at,created_at,updated_at",
       )
       .limit(1),
   ]);
-  const schemaError = events.error ?? state.error;
+  const schemaError = events.error ?? state.error ?? scaleClaims.error;
   if (schemaError) {
     fail(
       "Supply Accumulation schema",
-      `${safeDiagnostic(schemaError.message)} — run supabase/supply-accumulation-entry-migration.sql`,
+      `${safeDiagnostic(schemaError.message)} — run supabase/supply-accumulation-scale-buys-migration.sql`,
     );
     return false;
   }
@@ -797,6 +872,9 @@ async function checkSupplyAccumulationSchema(
       "/rpc/record_supply_accumulation_event",
       "/rpc/get_supply_accumulation_state",
       "/rpc/check_supply_accumulation_custody_gate",
+      "/rpc/get_supply_accumulation_scale_plan",
+      "/rpc/claim_supply_accumulation_scale_buy",
+      "/rpc/apply_supply_accumulation_scale_buy",
     ].filter((path) => !paths[path]);
     if (!response.ok || missingRpc.length > 0) {
       fail("Supply Accumulation RPCs", {
@@ -813,8 +891,8 @@ async function checkSupplyAccumulationSchema(
   pass(
     "Supply Accumulation schema",
     cfg.supply_accumulation_mode_enabled
-      ? `LIVE strategy selected across ${targetCount} configured root(s); ${threshold}% net supply in ${windowSeconds}s; strict MC below $${maxMarketCapUsd}; standard position exits preserved`
-      : `OFF — replay-safe raw event/state storage ready; threshold ${threshold}%, strict MC below $${maxMarketCapUsd}`,
+      ? `LIVE strategy selected across ${targetCount} configured root(s); ${threshold}% net supply in ${windowSeconds}s; MC $${minMarketCapUsd} to strictly below $${maxMarketCapUsd}; ${scales.filter((scale) => scale.enabled).length} durable scale(s); standard position exits preserved`
+      : `OFF — replay-safe raw event/state/scale storage ready; threshold ${threshold}%, MC $${minMarketCapUsd} to strictly below $${maxMarketCapUsd}`,
   );
   return true;
 }

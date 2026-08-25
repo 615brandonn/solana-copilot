@@ -16,10 +16,24 @@ export type SupplyAccumulationConfig = {
   supplyAccumulationThresholdPct: number;
   /** Dedicated USD size for a supply-accumulation entry. */
   supplyAccumulationBuyUsd: number;
+  /** Inclusive live entry floor. */
+  supplyAccumulationMinMarketCapUsd: number;
   /** Strict live entry ceiling. Values above $15,000 are never accepted. */
   supplyAccumulationMaxMarketCapUsd: number;
   /** Rolling buy-minus-sell observation window. */
   supplyAccumulationWindowSeconds: number;
+  /** Optional second durable buy after a later verified threshold crossing. */
+  supplyAccumulationScale2Enabled: boolean;
+  supplyAccumulationScale2ThresholdPct: number;
+  supplyAccumulationScale2BuyUsd: number;
+  /** Optional third durable buy; requires scale 2. */
+  supplyAccumulationScale3Enabled: boolean;
+  supplyAccumulationScale3ThresholdPct: number;
+  supplyAccumulationScale3BuyUsd: number;
+  /** Optional fourth durable buy; requires scales 2 and 3. */
+  supplyAccumulationScale4Enabled: boolean;
+  supplyAccumulationScale4ThresholdPct: number;
+  supplyAccumulationScale4BuyUsd: number;
 };
 
 export type ConvictionConfig = {
@@ -190,8 +204,18 @@ export const DEFAULT_CONFIG: BotConfig = {
   supplyAccumulationModeEnabled: false,
   supplyAccumulationThresholdPct: 10,
   supplyAccumulationBuyUsd: 20,
+  supplyAccumulationMinMarketCapUsd: 2_000,
   supplyAccumulationMaxMarketCapUsd: 15_000,
   supplyAccumulationWindowSeconds: 600,
+  supplyAccumulationScale2Enabled: false,
+  supplyAccumulationScale2ThresholdPct: 12,
+  supplyAccumulationScale2BuyUsd: 10,
+  supplyAccumulationScale3Enabled: false,
+  supplyAccumulationScale3ThresholdPct: 15,
+  supplyAccumulationScale3BuyUsd: 10,
+  supplyAccumulationScale4Enabled: false,
+  supplyAccumulationScale4ThresholdPct: 18,
+  supplyAccumulationScale4BuyUsd: 10,
   custodyJourneyEnabled: false,
   revivalTrackerEnabled: false,
   revivalMarketCapMinUsd: 2_000,
