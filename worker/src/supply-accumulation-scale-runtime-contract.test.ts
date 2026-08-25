@@ -74,6 +74,37 @@ test("Supply initial and scale actions share one sub-60-second source deadline",
   assert.match(scale, /SUPPLY_SCALE_ACTION_DEADLINE_MS/);
 });
 
+test("the $20,000 ceiling never substitutes for active pre-graduation curve proof", () => {
+  const curveViews = section(
+    "async function loadSupplyCurveViews",
+    "async function loadCanonicalSupplyEvidence",
+  );
+  assert.match(curveViews, /commitment: "confirmed"[\s\S]*?minContextSlot: event\.slot/);
+  assert.match(curveViews, /commitment: "processed"[\s\S]*?minContextSlot: event\.slot/);
+  assert.match(
+    curveViews,
+    /confirmedCurve\.complete\s*\|\|\s*processedCurve\.complete/,
+    "a completed confirmed or processed curve must fail closed",
+  );
+
+  const initialValidation = section(
+    "async function validateSupplyAccumulationSubmission",
+    "async function processSupplyAccumulationTargetBuy",
+  );
+  const scaleValidation = section(
+    "async function validateSupplyScaleSubmission",
+    "function preparedSupplyScaleAttempt",
+  );
+  for (const validation of [initialValidation, scaleValidation]) {
+    assert.match(validation, /const configuredCap = Math\.min\(20_000,/);
+    assert.match(
+      validation,
+      /strictestPumpFunMarketCaps\(\s*\[curves\.confirmedCurve, curves\.processedCurve\]/,
+    );
+    assert.match(validation, /!caps\?\.belowCap/);
+  }
+});
+
 test("an existing Supply position is routed to scaling while initial entry remains one-position", () => {
   const processSupply = section(
     "async function processSupplyAccumulationTargetBuy",

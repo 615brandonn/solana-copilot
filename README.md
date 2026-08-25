@@ -94,8 +94,8 @@ Inside a configurable 30–3,600 second window, it adds raw verified buy amounts
 subtracts raw verified sells, and compares the result with authoritative raw
 total supply. The threshold is restricted to 10–20% and defaults to 10%; a 3%
 cluster share can never authorize a buy. The dedicated initial buy size defaults
-to $20. The configurable market-cap floor defaults to $2,000 and the strict
-ceiling remains adjustable up to $15,000.
+to $20. The configurable market-cap floor defaults to $2,000. The strict ceiling
+defaults to $20,000 and can be lowered.
 
 Optional second, third, and fourth buys install OFF. Their default verified net
 supply thresholds are 12%, 15%, and 18%, and each default buy is $10. Enabled
@@ -110,10 +110,11 @@ slot, and every existing exit rule.
 
 Every entry requires reliable same-token supply and attribution evidence plus a
 strict current and estimated post-fill market cap below the configured ceiling,
-which can never exceed $15,000. Missing, conflicting, stale, or rounded evidence
-fails closed. Landed entries are standard positions, so all existing take-profit,
-stop-loss, trailing-stop, custody, target-sell, follower-sell, and inactivity
-exits remain authoritative.
+which can never exceed $20,000. A coin at exactly the configured ceiling is
+rejected, including when that ceiling is $20,000. Missing, conflicting, stale,
+or rounded evidence fails closed. Landed entries are standard positions, so all
+existing take-profit, stop-loss, trailing-stop, custody, target-sell,
+follower-sell, and inactivity exits remain authoritative.
 
 Custody Journey must be ON for every Supply Accumulation entry. One service-only
 atomic database gate requires a fresh, non-degraded observer and RPC success,
@@ -131,14 +132,15 @@ eligible for automatic crash recovery.
 Existing deployments must leave global Entries OFF, apply the current
 `supabase/custody-journey-migration.sql` first, then run the additive
 `supabase/supply-accumulation-entry-migration.sql` and then
-`supabase/supply-accumulation-scale-buys-migration.sql`, deploy the matching
-worker, and pass `cd worker && npm run doctor`. The scale migration does not add
+`supabase/supply-accumulation-scale-buys-migration.sql`, followed by
+`supabase/supply-accumulation-20k-cap-migration.sql`. Deploy the matching worker
+and pass `cd worker && npm run doctor`. The scale migration does not add
 a repository-wide unique index to `positions`, because that would change
 unrelated entry strategies; its service-only plan instead rejects any user/mint
-that does not have exactly one open position. Both migrations install the
-strategy and every scale tier OFF; enable Custody Journey and then enable this
-strategy explicitly in Settings only after validation. Enabling it turns off
-the Conviction and Coordinated toggles.
+that does not have exactly one open position. All three Supply Accumulation
+migrations install the strategy and every scale tier OFF; enable Custody Journey
+and then enable this strategy explicitly in Settings only after validation.
+Enabling it turns off the Conviction and Coordinated toggles.
 
 ### Optional Custody Journey observer
 

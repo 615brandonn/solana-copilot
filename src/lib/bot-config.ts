@@ -18,7 +18,7 @@ export type SupplyAccumulationConfig = {
   supplyAccumulationBuyUsd: number;
   /** Inclusive live entry floor. */
   supplyAccumulationMinMarketCapUsd: number;
-  /** Strict live entry ceiling. Values above $15,000 are never accepted. */
+  /** Strict live entry ceiling. A value at or above the configured ceiling is never accepted. */
   supplyAccumulationMaxMarketCapUsd: number;
   /** Rolling buy-minus-sell observation window. */
   supplyAccumulationWindowSeconds: number;
@@ -205,7 +205,7 @@ export const DEFAULT_CONFIG: BotConfig = {
   supplyAccumulationThresholdPct: 10,
   supplyAccumulationBuyUsd: 20,
   supplyAccumulationMinMarketCapUsd: 2_000,
-  supplyAccumulationMaxMarketCapUsd: 15_000,
+  supplyAccumulationMaxMarketCapUsd: 20_000,
   supplyAccumulationWindowSeconds: 600,
   supplyAccumulationScale2Enabled: false,
   supplyAccumulationScale2ThresholdPct: 12,

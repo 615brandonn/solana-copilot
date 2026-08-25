@@ -108,11 +108,12 @@ safety gates to pass immediately before the shared executor is called.
 With global Entries OFF, apply the current
 `supabase/custody-journey-migration.sql` and then
 `supabase/supply-accumulation-entry-migration.sql`, followed by
-`supabase/supply-accumulation-scale-buys-migration.sql`. Run `npm test`,
-`npm run build`, and `npm run doctor` before restarting the worker. The
-migrations are additive and leave the strategy and every scale tier OFF. Enable
-Custody Journey before enabling this exclusive automatic entry route; it turns
-off the Conviction and Coordinated toggles.
+`supabase/supply-accumulation-scale-buys-migration.sql`, and finally
+`supabase/supply-accumulation-20k-cap-migration.sql`. Run `npm test`, `npm run
+build`, and `npm run doctor` before restarting the worker. The migrations are
+additive and leave the strategy and every scale tier OFF. Enable Custody Journey
+before enabling this exclusive automatic entry route; it turns off the
+Conviction and Coordinated toggles.
 
 The strategy aggregates raw verified buys minus raw verified sells across all
 configured market-maker roots inside a 30–3,600 second rolling window. Its
@@ -120,8 +121,10 @@ threshold is constrained to 10–20% of authoritative raw total supply, defaults
 to 10%, and cannot be lowered to the 3% test-buy range. The dedicated initial
 entry size defaults to $20. Market cap must be at least the configurable $2,000
 default floor, while current and estimated post-fill market cap must both remain
-strictly below the configurable ceiling capped at $15,000; missing or
-conflicting supply, attribution, Pump.fun, or valuation evidence blocks entry.
+strictly below the configurable ceiling, which defaults to and is capped at
+$20,000. A coin at exactly $20,000 is rejected when the ceiling is set to
+$20,000; missing or conflicting supply, attribution, Pump.fun, or valuation
+evidence blocks entry.
 
 Optional second, third, and fourth buys default OFF, with 12%, 15%, and 18%
 thresholds and $10 sizes. Enabled tiers must be contiguous, strictly increasing,

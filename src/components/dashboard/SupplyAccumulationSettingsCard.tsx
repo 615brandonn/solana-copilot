@@ -162,7 +162,7 @@ export function SupplyAccumulationSettingsCard({ cfg, onChange }: Props) {
 
       <SettingRow
         label="Market-cap range"
-        hint="The floor is inclusive. The worker strictly requires current and estimated post-fill market cap below the ceiling before every buy."
+        hint="The floor is inclusive. The worker strictly requires current and estimated post-fill market cap below the ceiling before every buy, so a $20,000 ceiling still rejects a coin at exactly $20,000."
       >
         <div className="flex items-center gap-2 font-mono text-xs">
           <NumberInput
@@ -170,7 +170,7 @@ export function SupplyAccumulationSettingsCard({ cfg, onChange }: Props) {
             onChange={(value) => onChange({ supplyAccumulationMinMarketCapUsd: value })}
             prefix="$"
             min={0}
-            max={14_999.99}
+            max={19_999.99}
             step={100}
           />
           <span className="text-muted-foreground">to</span>
@@ -179,7 +179,7 @@ export function SupplyAccumulationSettingsCard({ cfg, onChange }: Props) {
             onChange={(value) => onChange({ supplyAccumulationMaxMarketCapUsd: value })}
             prefix="$"
             min={0.01}
-            max={15_000}
+            max={20_000}
             step={100}
           />
         </div>

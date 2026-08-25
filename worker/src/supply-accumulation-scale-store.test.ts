@@ -127,7 +127,7 @@ function plan(overrides: Row = {}): Row {
     netSupplyPct: 12.5,
     marketCapUsd: 4_000,
     minMarketCapUsd: 2_000,
-    maxMarketCapUsd: 15_000,
+    maxMarketCapUsd: 20_000,
     ...overrides,
   };
 }
@@ -278,6 +278,10 @@ test("plan parser accepts progressive null evidence but requires complete eligib
     /configFingerprint/,
   );
   assert.throws(() => parseSupplyScalePlan(plan({ thresholdPct: "12" })), /thresholdPct/);
+  assert.throws(
+    () => parseSupplyScalePlan(plan({ maxMarketCapUsd: 20_000.01 })),
+    /market-cap bounds/,
+  );
   assert.throws(
     () => parseSupplyScalePlan(plan({ ok: false, eligible: true })),
     /cannot be eligible/,

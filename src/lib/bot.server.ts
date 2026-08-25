@@ -84,7 +84,7 @@ export function rowToConfig(row: Database["public"]["Tables"]["bot_config"]["Row
     supplyAccumulationThresholdPct: Number(row.supply_accumulation_threshold_pct ?? 10),
     supplyAccumulationBuyUsd: Number(row.supply_accumulation_buy_usd ?? 20),
     supplyAccumulationMinMarketCapUsd: Number(row.supply_accumulation_min_market_cap_usd ?? 2_000),
-    supplyAccumulationMaxMarketCapUsd: Number(row.supply_accumulation_max_market_cap_usd ?? 15_000),
+    supplyAccumulationMaxMarketCapUsd: Number(row.supply_accumulation_max_market_cap_usd ?? 20_000),
     supplyAccumulationWindowSeconds: Number(row.supply_accumulation_window_seconds ?? 600),
     supplyAccumulationScale2Enabled: row.supply_accumulation_scale_2_enabled ?? false,
     supplyAccumulationScale2ThresholdPct: Number(
