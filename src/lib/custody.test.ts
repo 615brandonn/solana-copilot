@@ -137,6 +137,14 @@ test("observer status is derived from the worker heartbeat, not read-query succe
   assert.equal(recovering.pendingEventCount, 3);
   assert.equal(recovering.hasObservationGap, false);
 
+  const parked = buildCustodyObserverHealth(heartbeat(), now, {
+    waiting: 328,
+    dormant: 25_631,
+  });
+  assert.equal(parked.status, "live");
+  assert.equal(parked.waitingDependencyCount, 328);
+  assert.equal(parked.dormantEvidenceCount, 25_631);
+
   const boundary = buildCustodyObserverHealth(heartbeat(), now, { expired: 2, terminal: 1 });
   assert.equal(boundary.status, "degraded");
   assert.equal(boundary.hasObservationGap, true);

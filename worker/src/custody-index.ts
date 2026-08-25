@@ -128,52 +128,150 @@ async function main(): Promise<void> {
   // Custody includes the activation-head signature so a buy at the exact
   // enable/start boundary cannot fall between cursor creation and polling.
   // The trading worker retains the poller's legacy baseline behavior.
-  const poller = new RpcBackfillPoller(rpc, handle, cursorStore, 1_200, true, {
+  const poller = new RpcBackfillPoller(rpc, handle, cursorStore, 750, true, {
     onUnresolvedOutflow: handleUnresolvedOutflow,
     allowEarlierAnchorRewind: true,
-    pollConcurrency: 32,
+    pollConcurrency: 16,
+    maxWalletsPerPoll: 16,
+    deferInitialCursorHydration: true,
+    recoveryConcurrency: 4,
+    signaturePagesPerTurn: 2,
+    recoveryChunkSize: 250,
   });
   registry = new CustodyWatchRegistry(poller);
 
-  const reconcileActiveWatches = async () => {
-    const rows = await store.loadActiveWatches();
-    runtime.reconcileActiveWatches(rows);
-    await registry.reconcileJourneyWatches(rows);
-    return rows;
+  let activeWatchReconcile: ReturnType<typeof store.loadActiveWatches> | null = null;
+  const reconcileActiveWatches = (): ReturnType<typeof store.loadActiveWatches> => {
+    if (activeWatchReconcile) return activeWatchReconcile;
+    activeWatchReconcile = (async () => {
+      const rows = await store.loadActiveWatches();
+      runtime.reconcileActiveWatches(rows);
+      await registry.reconcileJourneyWatches(rows);
+      return rows;
+    })().finally(() => {
+      activeWatchReconcile = null;
+    });
+    return activeWatchReconcile;
   };
 
+  const PENDING_REPLAY_BATCH_SIZE = 25;
+  const PENDING_REPLAY_MAX_BURST = 250;
+  const PENDING_REPLAY_DEBOUNCE_MS = 1_000;
+  const PENDING_REPLAY_IDLE_MS = 5 * 60_000;
+  const PENDING_REPLAY_ERROR_BASE_MS = 15_000;
   let replayingPending = false;
+  let pendingReplayRequested = false;
+  let pendingReplayFailures = 0;
+  let pendingReplayTimer: NodeJS.Timeout | undefined;
+  let pendingReplayScheduledAt = Number.POSITIVE_INFINITY;
+
+  const armPendingReplay = (delayMs: number) => {
+    if (!currentConfig.enabled) return;
+    const boundedDelay = Math.max(0, Math.trunc(delayMs));
+    const scheduledAt = Date.now() + boundedDelay;
+    if (pendingReplayTimer && pendingReplayScheduledAt <= scheduledAt) return;
+    if (pendingReplayTimer) clearTimeout(pendingReplayTimer);
+    pendingReplayScheduledAt = scheduledAt;
+    pendingReplayTimer = setTimeout(() => {
+      pendingReplayTimer = undefined;
+      pendingReplayScheduledAt = Number.POSITIVE_INFINITY;
+      void replayPending();
+    }, boundedDelay);
+  };
+
+  const cancelPendingReplay = () => {
+    if (pendingReplayTimer) clearTimeout(pendingReplayTimer);
+    pendingReplayTimer = undefined;
+    pendingReplayScheduledAt = Number.POSITIVE_INFINITY;
+    pendingReplayRequested = false;
+  };
+
   const replayPending = async () => {
-    if (replayingPending || !currentConfig.enabled) return;
+    if (!currentConfig.enabled) return;
+    if (replayingPending) {
+      pendingReplayRequested = true;
+      return;
+    }
     replayingPending = true;
+    pendingReplayRequested = false;
+    let nextDelayMs = PENDING_REPLAY_IDLE_MS;
+    let processedCount = 0;
+    let appliedCount = 0;
+    let pendingCount = 0;
+    let expiredCount = 0;
+    let terminalCount = 0;
     try {
-      const replay = await store.replayPending(100);
-      for (const item of replay.results) {
-        if (item.status !== "applied" || !item.journeyId) continue;
-        await registry.apply(item, item.slot);
+      while (processedCount < PENDING_REPLAY_MAX_BURST) {
+        const replay = await store.replayPending(PENDING_REPLAY_BATCH_SIZE);
+        processedCount += replay.processedCount;
+        appliedCount += replay.appliedCount;
+        pendingCount += replay.pendingCount;
+        expiredCount += replay.expiredCount;
+        terminalCount += replay.terminalCount;
+
+        for (const item of replay.results) {
+          if (item.status !== "applied" || !item.journeyId) continue;
+          await registry.apply(item, item.slot);
+        }
+
+        const progress = replay.appliedCount + replay.expiredCount + replay.terminalCount;
+        if (progress === 0 || replay.processedCount < PENDING_REPLAY_BATCH_SIZE) break;
+        if (processedCount >= PENDING_REPLAY_MAX_BURST) {
+          nextDelayMs = PENDING_REPLAY_DEBOUNCE_MS;
+          break;
+        }
+        // Yield between productive batches so live confirmed-RPC observations
+        // are never monopolized by historical inbox maintenance.
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
       }
-      if (replay.appliedCount > 0) await reconcileActiveWatches();
-      if (replay.processedCount > 0) {
-        log.info(
-          {
-            processed: replay.processedCount,
-            applied: replay.appliedCount,
-            pending: replay.pendingCount,
-            expired: replay.expiredCount,
-            terminal: replay.terminalCount,
-          },
-          "custody out-of-order observations replayed",
-        );
+
+      // Registry updates above are incremental. Refresh the complete durable
+      // scope once per productive burst, not once per 25-row batch.
+      if (appliedCount > 0) await reconcileActiveWatches();
+      const resolvedCount = appliedCount + expiredCount + terminalCount;
+      if (processedCount > 0) {
+        const fields = {
+          processed: processedCount,
+          applied: appliedCount,
+          pending: pendingCount,
+          expired: expiredCount,
+          terminal: terminalCount,
+        };
+        if (resolvedCount > 0) {
+          log.info(fields, "custody out-of-order observations replayed");
+        } else {
+          log.debug(fields, "custody pending replay found no newly resolvable observations");
+        }
       }
+      pendingReplayFailures = 0;
     } catch (error) {
       lastError = safeDiagnostic(error);
       log.warn({ error: lastError }, "custody pending replay failed; durable inbox will retry");
+      pendingReplayFailures += 1;
+      nextDelayMs = Math.min(
+        PENDING_REPLAY_IDLE_MS,
+        PENDING_REPLAY_ERROR_BASE_MS * 2 ** Math.min(4, pendingReplayFailures - 1),
+      );
     } finally {
       replayingPending = false;
+      if (currentConfig.enabled) {
+        armPendingReplay(
+          pendingReplayFailures > 0
+            ? nextDelayMs
+            : pendingReplayRequested
+              ? PENDING_REPLAY_DEBOUNCE_MS
+              : nextDelayMs,
+        );
+      }
     }
   };
   schedulePendingReplay = () => {
-    queueMicrotask(() => void replayPending());
+    if (!currentConfig.enabled) return;
+    if (replayingPending) {
+      pendingReplayRequested = true;
+      return;
+    }
+    armPendingReplay(PENDING_REPLAY_DEBOUNCE_MS);
   };
 
   const ensureFeedStarted = () => {
@@ -186,7 +284,9 @@ async function main(): Promise<void> {
   const enable = async (config: CustodyConfig) => {
     await reconcileActiveWatches();
     await registry.setTargets(config.targetWallets);
+    await poller.hydrateWatchedCursors();
     ensureFeedStarted();
+    schedulePendingReplay();
     log.info(
       {
         targetCount: config.targetWallets.size,
@@ -197,12 +297,15 @@ async function main(): Promise<void> {
   };
 
   const disable = async () => {
+    cancelPendingReplay();
     await registry.clear();
     runtime.reconcileActiveWatches([]);
     log.info("Custody Journey disabled; durable cursors and history preserved");
   };
 
-  if (currentConfig.enabled) await enable(currentConfig);
+  if (currentConfig.enabled) {
+    await enable(currentConfig);
+  }
 
   let refreshing = false;
   setInterval(() => {
@@ -221,6 +324,7 @@ async function main(): Promise<void> {
           await enable(next);
           if (targetsChanged) runtime.clearClassificationCache();
           currentConfig = next;
+          schedulePendingReplay();
         } else if (next.enabled) {
           currentConfig = next;
           ensureFeedStarted();
@@ -244,14 +348,12 @@ async function main(): Promise<void> {
       lastError = safeDiagnostic(error);
       log.warn({ error: lastError }, "custody subscription reconciliation failed");
     });
-  }, 15_000);
+  }, 60_000);
 
+  let custodyLearningRunning = false;
   setInterval(() => {
-    void replayPending();
-  }, 2_000);
-
-  setInterval(() => {
-    if (!currentConfig.enabled) return;
+    if (!currentConfig.enabled || custodyLearningRunning) return;
+    custodyLearningRunning = true;
     refreshCustodyWalletLearning(db, env.HELIX_USER_ID)
       .then((updated) => {
         if (updated > 0) log.info({ updated }, "custody wallet behavior profiles learned");
@@ -261,7 +363,10 @@ async function main(): Promise<void> {
           { error: safeDiagnostic(error) },
           "custody learning refresh failed; observations and trading are unaffected",
         ),
-      );
+      )
+      .finally(() => {
+        custodyLearningRunning = false;
+      });
   }, 5 * 60_000);
 
   async function writeHeartbeat() {
@@ -277,7 +382,14 @@ async function main(): Promise<void> {
     // the watch list legitimately takes hours, so a non-empty backlog or a poll
     // older than 30s says nothing. Progress is "the backlog shrank recently".
     const backlog = Number(fallback.backlogWalletCount ?? 0);
-    if (backlog === 0 || backlog < lastBacklogCount) lastBacklogProgressAt = now;
+    const recoveryProgressAt = Number(fallback.lastRecoveryProgressAt ?? 0);
+    if (
+      backlog === 0 ||
+      backlog < lastBacklogCount ||
+      (Number.isFinite(recoveryProgressAt) && recoveryProgressAt > lastBacklogProgressAt)
+    ) {
+      lastBacklogProgressAt = now;
+    }
     lastBacklogCount = backlog;
     const staleWindowMs = currentConfig.degradedSweepStaleMinutes * 60_000;
     const noProgressMs = now - lastBacklogProgressAt;
