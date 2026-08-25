@@ -8140,3 +8140,16 @@ grant execute on function public.check_supply_accumulation_custody_gate(
 -- sell-claim data. It only widens the sell-claim CHECK to match existing worker
 -- exit kinds. Runtime entries use the existing regular-position contract.
 -- SUPPLY_ACCUMULATION_CANONICAL_MIRROR_END
+
+-- REVIVAL_HYDRATION_INDEX_CANONICAL_MIRROR_BEGIN
+-- Revival Campaign tracker: bounded startup hydration index.
+-- Additive and safe to rerun. This index supports the observer's per-version
+-- UUID keyset scan without changing or deleting any evidence.
+
+create index if not exists revival_events_hydration_idx
+  on public.revival_events (user_id, strategy_version_id, id);
+
+create index if not exists revival_events_projection_repair_idx
+  on public.revival_events (user_id, strategy_version_id, id)
+  where campaign_id is null;
+-- REVIVAL_HYDRATION_INDEX_CANONICAL_MIRROR_END

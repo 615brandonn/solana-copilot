@@ -10,6 +10,12 @@ import { db, type BotConfigRow } from "./db.js";
 import { GeyserFeed, type FeedEvent, type SwapEvent, type TransferEvent } from "./geyser.js";
 import { FollowerMonitor, type ChainedTransferBatchState } from "./monitor.js";
 import { executeSwap, type ExecuteResult } from "./executor.js";
+import {
+  exactRawAmount,
+  rawAmountToUiNumber,
+  remainingUiAfterExactExit,
+  uiAmountToRawFloor,
+} from "./exit-sizing.js";
 import { confirmedTokenReceiptFromTx } from "./execution-accounting.js";
 import { BoundedBackgroundQueue } from "./bounded-background-queue.js";
 import { checkPriceSanity, priceSanityConfigFrom, type PriceSanityState } from "./price-sanity.js";
@@ -1804,91 +1810,6 @@ async function main() {
     checkTpSl().catch((err) => log.error({ err: safeDiagnostic(err) }, "tp/sl loop failed"));
   }, 4000);
 
-  // A sell claim that ends "uncertain" (Jito submitted, transaction failed
-  // on-chain) is terminal for reclaim purposes, so the periodic exit path can
-  // never retry it and the position is left with no working stop. Resolve the
-  // ambiguity against chain state: if the funding wallet still holds the mint,
-  // the sell did not land, so the claim is safe to reopen for retry.
-  async function recoverStrandedSellClaims() {
-    if (!fundingReadiness.ready || !fundingReadiness.walletPubkey) return;
-    const staleBefore = new Date(Date.now() - 120_000).toISOString();
-    const { data: stranded, error } = await db
-      .from("sell_signal_claims")
-      .select("id,position_id,trigger_kind,status")
-      .eq("user_id", cfg.user_id)
-      .in("status", ["uncertain", "claimed"])
-      .lt("updated_at", staleBefore)
-      .limit(25);
-    if (error) {
-      log.warn({ err: safeDiagnostic(error) }, "stranded sell claim scan failed");
-      return;
-    }
-    if (!stranded || stranded.length === 0) return;
-
-    let heldByMint: Map<string, number>;
-    try {
-      const holdings = await walletTokenHoldings(rpc, fundingReadiness.walletPubkey);
-      heldByMint = new Map(holdings.map((row) => [row.token_mint, Number(row.amount) || 0]));
-    } catch (err) {
-      // Fail closed: without chain truth we must not reopen a claim that may
-      // have landed, or the same sell could be submitted twice.
-      log.warn(
-        { err: safeDiagnostic(err) },
-        "stranded sell claim recovery skipped — wallet holdings unavailable",
-      );
-      return;
-    }
-
-    for (const claim of stranded as Array<{
-      id: string;
-      position_id: string;
-      trigger_kind: string;
-      status: string;
-    }>) {
-      const { data: pos, error: posError } = await db
-        .from("positions")
-        .select("id,token_mint,amount_remaining")
-        .eq("id", claim.position_id)
-        .is("closed_at", null)
-        .maybeSingle();
-      if (posError || !pos || Number(pos.amount_remaining) <= 0) continue;
-      // Tokens gone => the prior sell landed. Leave the claim terminal.
-      if ((heldByMint.get(String(pos.token_mint)) ?? 0) <= 0) continue;
-      const { data: reopened, error: reopenError } = await db
-        .from("sell_signal_claims")
-        .update({
-          status: "failed_pre_submit",
-          error_code: "reopened by recovery: tokens still held on-chain, prior sell did not land",
-          submission_started_at: null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", claim.id)
-        .in("status", ["uncertain", "claimed"])
-        .select("id")
-        .maybeSingle();
-      if (reopenError) {
-        log.warn(
-          { err: safeDiagnostic(reopenError), positionId: claim.position_id },
-          "stranded sell claim reopen failed",
-        );
-      } else if (reopened) {
-        log.warn(
-          {
-            positionId: claim.position_id,
-            triggerKind: claim.trigger_kind,
-            priorStatus: claim.status,
-          },
-          "stranded sell claim reopened — tokens still held on-chain, exit will retry",
-        );
-      }
-    }
-  }
-  setInterval(() => {
-    recoverStrandedSellClaims().catch((err) =>
-      log.error({ err: safeDiagnostic(err) }, "stranded sell claim recovery loop failed"),
-    );
-  }, 60_000);
-
   // Fan-out abandonment exit. The custody observer records how many custody
   // wallets the target spreads a coin across. On his own data, coins that
   // stayed at <=3 wallets never became a campaign (0 of 1,252), and every coin
@@ -2292,8 +2213,8 @@ async function main() {
   async function executeExitSell(
     positionId: string,
     mint: string,
-    sellRaw: number,
-    sellUi: number,
+    sellRaw: bigint,
+    decimals: number,
     reason: string,
     markTpTaken = false,
     markCoordinatedExit = false,
@@ -2304,6 +2225,8 @@ async function main() {
     if (exitsInFlight.has(positionId)) return null;
     exitsInFlight.add(positionId);
     let landedResult: ExecuteResult | undefined;
+    let executedSellRaw: bigint | undefined;
+    let liveBalanceRaw: bigint | undefined;
     try {
       const secret = await loadSigner(cfg.user_id);
       if (!secret) {
@@ -2344,8 +2267,27 @@ async function main() {
         route: cfg.execution_route,
         jitoTipSol: cfg.jito_tip_sol,
         pumpFunDirectFirst,
+        inputDecimals: decimals,
+        onInputAmountCapped: ({
+          amountRaw,
+          liveBalanceRaw: resolvedLiveBalanceRaw,
+          decimals: resolvedDecimals,
+        }) => {
+          if (resolvedDecimals !== decimals) {
+            throw new Error("executor returned inconsistent exit token decimals");
+          }
+          executedSellRaw = exactRawAmount(amountRaw, "capped exit amount");
+          liveBalanceRaw = exactRawAmount(resolvedLiveBalanceRaw, "live wallet balance");
+          if (executedSellRaw > liveBalanceRaw) {
+            throw new Error("executor returned an exit amount above the verified live balance");
+          }
+        },
       });
       landedResult = result;
+      if (executedSellRaw === undefined || liveBalanceRaw === undefined || executedSellRaw <= 0n) {
+        throw new Error("executor did not return a valid capped exit amount");
+      }
+      const executedSellUi = rawAmountToUiNumber(executedSellRaw, decimals);
       if (strategyEvent) {
         recordStrategyDecision(strategyEvent, "mirrored", "event-triggered exit landed", {
           position_id: positionId,
@@ -2366,7 +2308,12 @@ async function main() {
           .maybeSingle(),
       );
       if (!cur) throw new Error(`position ${positionId} disappeared after exit transaction landed`);
-      const newRemaining = Math.max(0, Number(cur.amount_remaining) - sellUi);
+      const newRemaining = remainingUiAfterExactExit(
+        cur.amount_remaining,
+        executedSellRaw,
+        liveBalanceRaw,
+        decimals,
+      ).remainingUi;
       const closed = isFlatPosition(newRemaining);
       const update: {
         amount_remaining: number;
@@ -2409,7 +2356,7 @@ async function main() {
         exitPriceUsd = null;
       }
       const entryPriceUsd = Number(cur.entry_price_usd ?? 0);
-      const exitAmountUsd = exitPriceUsd !== null ? sellUi * exitPriceUsd : null;
+      const exitAmountUsd = exitPriceUsd !== null ? executedSellUi * exitPriceUsd : null;
       const exitPnlPct =
         exitPriceUsd !== null && entryPriceUsd > 0
           ? ((exitPriceUsd - entryPriceUsd) / entryPriceUsd) * 100
@@ -2420,7 +2367,7 @@ async function main() {
           position_id: positionId,
           side: "sell",
           token_mint: mint,
-          amount_tokens: sellUi,
+          amount_tokens: executedSellUi,
           amount_usd: exitAmountUsd,
           price_usd: exitPriceUsd,
           pnl_pct: exitPnlPct,
@@ -2508,7 +2455,7 @@ async function main() {
       if (claimError?.code === "23505") {
         const { data: existingClaim, error: existingClaimError } = await db
           .from("sell_signal_claims")
-          .select("id,status")
+          .select("id,status,error_code,bot_tx_sig,landed_at")
           .eq("position_id", positionId)
           .eq("source_tx_sig", sourceTxSig)
           .eq("source_wallet", sourceWallet)
@@ -2527,11 +2474,27 @@ async function main() {
           }
           return null;
         }
+        const priorFailure = safeDiagnostic(
+          existingClaim.error_code ?? "failed_pre_submit without recorded error",
+        );
+        log.warn(
+          {
+            claimId: existingClaim.id,
+            positionId,
+            triggerKind,
+            priorFailure,
+            clearedBotTxSig: existingClaim.bot_tx_sig ?? null,
+            clearedLandedAt: existingClaim.landed_at ?? null,
+          },
+          "retrying proven pre-submit sell failure and clearing stale landing identity",
+        );
         const { data: reclaimed, error: reclaimError } = await db
           .from("sell_signal_claims")
           .update({
             status: "claimed",
-            error_code: null,
+            error_code: `retrying failed_pre_submit; prior error: ${priorFailure}`,
+            bot_tx_sig: null,
+            landed_at: null,
             requested_sell_pct: normalizedPct,
             requested_sell_amount: requestedSellAmount,
             submission_started_at: null,
@@ -2595,8 +2558,17 @@ async function main() {
           : currentRemaining * (normalizedPct / 100),
       );
       const currentDecimals = Number(currentPosition.decimals ?? decimals);
-      const sellRaw = Math.floor(sellUi * Math.pow(10, currentDecimals));
-      if (sellRaw <= 0 || sellUi <= 0) {
+      let sellRaw: bigint;
+      try {
+        sellRaw = uiAmountToRawFloor(sellUi, currentDecimals);
+      } catch (err) {
+        await updateClaim({
+          status: "failed_pre_submit",
+          error_code: safeDiagnostic(err),
+        });
+        throw err;
+      }
+      if (sellRaw <= 0n || sellUi <= 0) {
         await updateClaim({ status: "failed_pre_submit", error_code: "no-executable-amount" });
         return null;
       }
@@ -2611,7 +2583,7 @@ async function main() {
           positionId,
           mint,
           sellRaw,
-          sellUi,
+          currentDecimals,
           reason,
           Boolean(options.markTpTaken),
           Boolean(options.markCoordinatedExit),

@@ -190,8 +190,9 @@ point-in-time market cap is inclusively between $2,000 and $15,000. Once
 admitted, they remain sampled above $15,000 so ignition, MFE/MAE, distribution,
 and the eventual price-proxy outcome are not truncated.
 
-Run `supabase/revival-campaign-migration.sql`, build the worker, and start the
-collector separately:
+Run `supabase/revival-campaign-migration.sql` followed by the additive
+`supabase/revival-hydration-index-migration.sql`, build the worker, and start
+the collector separately:
 
 ```bash
 cd worker

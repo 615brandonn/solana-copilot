@@ -1,5 +1,9 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { revivalConfigHash, revivalEventFingerprint } from "./revival-engine.js";
+import {
+  compareRevivalEventOrder,
+  revivalConfigHash,
+  revivalEventFingerprint,
+} from "./revival-engine.js";
 import {
   revivalCampaignDbRow,
   revivalEventDbRow,
@@ -209,71 +213,115 @@ export function createSupabaseRevivalStore(client: LooseClient, userId: string):
     async loadEvents(tokenMint?: string): Promise<RevivalEvent[]> {
       const output: RevivalEvent[] = [];
       const pageSize = 1_000;
-      for (let offset = 0; ; offset += pageSize) {
-        let query = client
-          .from("revival_events")
-          .select("*,strategy_version:revival_strategy_versions!inner(algorithm_version)")
-          .eq("user_id", userId)
-          .eq("strategy_version.algorithm_version", REVIVAL_ENGINE_VERSION)
-          .order("available_at", { ascending: true })
-          .order("event_at", { ascending: true })
-          .order("event_key", { ascending: true })
-          .range(offset, offset + pageSize - 1);
-        if (tokenMint) query = query.eq("token_mint", tokenMint);
-        const result = await query;
-        if (result.error) {
-          throw new Error(`Revival event hydration failed: ${safeDiagnostic(result.error)}`);
-        }
-        for (const row of result.data ?? []) {
-          const parsed = revivalEventFromDbRow(row as Record<string, unknown>);
-          if (parsed) output.push(parsed);
-        }
-        if ((result.data?.length ?? 0) < pageSize) return output;
+      const versions = await client
+        .from("revival_strategy_versions")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("algorithm_version", REVIVAL_ENGINE_VERSION);
+      if (versions.error) {
+        throw new Error(`Revival strategy hydration failed: ${safeDiagnostic(versions.error)}`);
       }
+
+      // The old query joined strategy versions, globally sorted the full event
+      // ledger, and paged with OFFSET. At six-figure history that made even the
+      // first page exceed the worker's bounded database timeout. Scan each
+      // immutable strategy generation through the indexed UUID key instead.
+      // The engine performs the required causal sort after all pages load.
+      for (const version of versions.data ?? []) {
+        const strategyVersionId = text(version.id).trim();
+        if (!strategyVersionId) continue;
+        let lastId: string | null = null;
+        for (;;) {
+          let query = client
+            .from("revival_events")
+            .select("*")
+            .eq("user_id", userId)
+            .eq("strategy_version_id", strategyVersionId)
+            .order("id", { ascending: true })
+            .limit(pageSize);
+          if (lastId) query = query.gt("id", lastId);
+          if (tokenMint) query = query.eq("token_mint", tokenMint);
+          const result = await query;
+          if (result.error) {
+            throw new Error(`Revival event hydration failed: ${safeDiagnostic(result.error)}`);
+          }
+          const rows = result.data ?? [];
+          for (const row of rows) {
+            const parsed = revivalEventFromDbRow(row as Record<string, unknown>);
+            if (parsed) output.push(parsed);
+          }
+          if (rows.length < pageSize) break;
+          const nextLastId = text(rows.at(-1)?.id).trim();
+          if (!nextLastId || nextLastId === lastId) {
+            throw new Error("Revival event hydration cursor did not advance");
+          }
+          lastId = nextLastId;
+        }
+      }
+      return output.sort(compareRevivalEventOrder);
     },
 
     async loadProjectionRepairMints(): Promise<string[]> {
       const output = new Set<string>();
       const requiresCampaignAt = new Map<string, number[]>();
       const pageSize = 1_000;
-      for (let offset = 0; ; offset += pageSize) {
-        const result = await client
-          .from("revival_events")
-          .select(
-            "token_mint,event_type,classification_reliable,available_at,strategy_version:revival_strategy_versions!inner(algorithm_version)",
-          )
-          .eq("user_id", userId)
-          .eq("strategy_version.algorithm_version", REVIVAL_ENGINE_VERSION)
-          .is("campaign_id", null)
-          .order("available_at", { ascending: true })
-          .range(offset, offset + pageSize - 1);
-        if (result.error) {
-          throw new Error(`Revival repair scan failed: ${safeDiagnostic(result.error)}`);
-        }
-        for (const row of result.data ?? []) {
-          const mint = text(row.token_mint).trim();
-          if (!mint) continue;
-          // A reliable target buy can create a campaign, so it is repairable
-          // even if the process crashed before the campaign insert. Every
-          // other event needs an already-existing campaign; this excludes
-          // orphan pre-campaign market/clock observations from perpetual
-          // startup repair.
-          if (row.classification_reliable === true && row.event_type === "TARGET_BUY") {
-            output.add(mint);
-          } else if (
-            row.classification_reliable === true ||
-            row.event_type === "MARKET_SNAPSHOT" ||
-            row.event_type === "CLOCK_TICK"
-          ) {
-            const availableAt = Date.parse(String(row.available_at ?? ""));
-            if (Number.isFinite(availableAt)) {
-              const times = requiresCampaignAt.get(mint) ?? [];
-              times.push(availableAt);
-              requiresCampaignAt.set(mint, times);
+      const versions = await client
+        .from("revival_strategy_versions")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("algorithm_version", REVIVAL_ENGINE_VERSION);
+      if (versions.error) {
+        throw new Error(`Revival repair strategy scan failed: ${safeDiagnostic(versions.error)}`);
+      }
+      for (const version of versions.data ?? []) {
+        const strategyVersionId = text(version.id).trim();
+        if (!strategyVersionId) continue;
+        let lastId: string | null = null;
+        for (;;) {
+          let query = client
+            .from("revival_events")
+            .select("id,token_mint,event_type,classification_reliable,available_at")
+            .eq("user_id", userId)
+            .eq("strategy_version_id", strategyVersionId)
+            .is("campaign_id", null)
+            .order("id", { ascending: true })
+            .limit(pageSize);
+          if (lastId) query = query.gt("id", lastId);
+          const result = await query;
+          if (result.error) {
+            throw new Error(`Revival repair scan failed: ${safeDiagnostic(result.error)}`);
+          }
+          const rows = result.data ?? [];
+          for (const row of rows) {
+            const mint = text(row.token_mint).trim();
+            if (!mint) continue;
+            // A reliable target buy can create a campaign, so it is repairable
+            // even if the process crashed before the campaign insert. Every
+            // other event needs an already-existing campaign; this excludes
+            // orphan pre-campaign market/clock observations from perpetual
+            // startup repair.
+            if (row.classification_reliable === true && row.event_type === "TARGET_BUY") {
+              output.add(mint);
+            } else if (
+              row.classification_reliable === true ||
+              row.event_type === "MARKET_SNAPSHOT" ||
+              row.event_type === "CLOCK_TICK"
+            ) {
+              const availableAt = Date.parse(String(row.available_at ?? ""));
+              if (Number.isFinite(availableAt)) {
+                const times = requiresCampaignAt.get(mint) ?? [];
+                times.push(availableAt);
+                requiresCampaignAt.set(mint, times);
+              }
             }
           }
+          if (rows.length < pageSize) break;
+          const nextLastId = text(rows.at(-1)?.id).trim();
+          if (!nextLastId || nextLastId === lastId) {
+            throw new Error("Revival repair cursor did not advance");
+          }
+          lastId = nextLastId;
         }
-        if ((result.data?.length ?? 0) < pageSize) break;
       }
       const candidates = Array.from(requiresCampaignAt.keys());
       for (let offset = 0; offset < candidates.length; offset += 250) {
