@@ -5,10 +5,12 @@ import type { CustodyRecordResult } from "./custody-types.js";
 
 function harness(options: { failWatch?: boolean } = {}) {
   const order: string[] = [];
+  const watchCalls: Array<{ wallet: string; anchorSlot?: number }> = [];
   const rpcWatches = new Set<string>();
   const poller = {
-    watch(wallet: string) {
+    watch(wallet: string, watchOptions: { anchorSlot?: number } = {}) {
       order.push(`rpc-watch:${wallet}`);
+      watchCalls.push({ wallet, anchorSlot: watchOptions.anchorSlot });
       rpcWatches.add(wallet);
     },
     unwatch(wallet: string) {
@@ -19,6 +21,7 @@ function harness(options: { failWatch?: boolean } = {}) {
   void options;
   return {
     order,
+    watchCalls,
     rpcWatches,
     registry: new CustodyWatchRegistry(poller as never),
   };
@@ -73,4 +76,72 @@ test("removing a target role preserves a journey role for the same wallet", asyn
   await h.registry.setTargets([]);
   assert.equal(h.registry.isWatched("shared"), true);
   assert.equal(h.rpcWatches.has("shared"), true);
+  assert.deepEqual(h.watchCalls, [
+    { wallet: "shared", anchorSlot: undefined },
+    { wallet: "shared", anchorSlot: 10 },
+  ]);
+});
+
+test("unchanged durable reconciliation does not churn the low-level watch", async () => {
+  const h = harness();
+  const row = {
+    journeyId: "journey-a",
+    wallet: "wallet-a",
+    tokenMint: "mint-a",
+    anchorSlot: 100,
+  };
+
+  await h.registry.reconcileJourneyWatches([row]);
+  await h.registry.reconcileJourneyWatches([row]);
+  await h.registry.reconcileJourneyWatches([{ ...row, anchorSlot: 120 }]);
+
+  assert.deepEqual(h.watchCalls, [{ wallet: "wallet-a", anchorSlot: 100 }]);
+});
+
+test("reconciliation forwards only a genuinely earlier owner anchor", async () => {
+  const h = harness();
+  const base = {
+    journeyId: "journey-a",
+    wallet: "shared",
+    tokenMint: "mint-a",
+    anchorSlot: 100,
+  };
+
+  await h.registry.reconcileJourneyWatches([base]);
+  await h.registry.reconcileJourneyWatches([
+    base,
+    { ...base, journeyId: "journey-b", tokenMint: "mint-b", anchorSlot: 150 },
+  ]);
+  await h.registry.reconcileJourneyWatches([
+    base,
+    { ...base, journeyId: "journey-b", tokenMint: "mint-b", anchorSlot: 150 },
+    { ...base, journeyId: "journey-c", tokenMint: "mint-c", anchorSlot: 75 },
+  ]);
+
+  assert.deepEqual(h.watchCalls, [
+    { wallet: "shared", anchorSlot: 100 },
+    { wallet: "shared", anchorSlot: 75 },
+  ]);
+});
+
+test("an existing owner can lower its anchor exactly once", async () => {
+  const h = harness();
+  await h.registry.apply(result("journey-a", ["wallet-a"]), 100);
+  await h.registry.apply(result("journey-a", ["wallet-a"]), 125);
+  await h.registry.apply(result("journey-a", ["wallet-a"]), 80);
+  await h.registry.apply(result("journey-a", ["wallet-a"]), 80);
+
+  assert.deepEqual(h.watchCalls, [
+    { wallet: "wallet-a", anchorSlot: 100 },
+    { wallet: "wallet-a", anchorSlot: 80 },
+  ]);
+});
+
+test("an owner anchor change is a no-op when another owner already covers earlier history", async () => {
+  const h = harness();
+  await h.registry.apply(result("journey-a", ["shared"]), 50);
+  await h.registry.apply(result("journey-b", ["shared"]), 100);
+  await h.registry.apply(result("journey-b", ["shared"]), 75);
+
+  assert.deepEqual(h.watchCalls, [{ wallet: "shared", anchorSlot: 50 }]);
 });

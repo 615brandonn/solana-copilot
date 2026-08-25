@@ -21,7 +21,6 @@ import {
   planNextRpcSignaturePage,
   planRpcSignaturePages,
   sanitizeRpcCursorError,
-  takeOldestRpcRecoveryChunk,
   type RpcCursorStore,
   type RpcWalletCursor,
 } from "./rpc-cursor.js";
@@ -62,6 +61,19 @@ export type RpcBackfillPollerOptions = {
   allowEarlierAnchorRewind?: boolean;
   /** Wallets polled per batch. Defaults to 8, the trading poller's baseline. */
   pollConcurrency?: number;
+  /**
+   * Maximum wallets visited by one timer turn. A rotating slice prevents one
+   * large custody sweep from blocking fresher wallets for hours.
+   */
+  maxWalletsPerPoll?: number;
+  /** Defer pre-start one-row cursor reads so startup can bulk hydrate them. */
+  deferInitialCursorHydration?: boolean;
+  /** Maximum lanes that historical recovery may occupy. Defaults to all lanes. */
+  recoveryConcurrency?: number;
+  /** Signature-history pages discovered per wallet turn. Defaults to the full safe cap. */
+  signaturePagesPerTurn?: number;
+  /** Parsed signatures applied per wallet turn. Defaults to 5,000. */
+  recoveryChunkSize?: number;
 };
 
 export type RpcWatchOptions = {
@@ -71,9 +83,10 @@ export type RpcWatchOptions = {
 export class RpcBackfillPoller {
   private watched = new Map<string, RpcWatchOptions>();
   private timer?: NodeJS.Timeout;
-  private running = false;
   private lastPollAt?: number;
   private lastSuccessAt?: number;
+  private lastRecoveryProgressAt?: number;
+  private processedSignatureCount = 0;
   private backlogWallets = new Set<string>();
   // A newly watched wallet is fail-closed until its durable cursor has been
   // loaded. This prevents a persisted backlog from briefly disappearing from
@@ -83,6 +96,19 @@ export class RpcBackfillPoller {
   private failures = 0;
   private cursorCache = new Map<string, RpcWalletCursor>();
   private cursorSuccessPersistedAt = new Map<string, number>();
+  private pollOffset = 0;
+  private walletsInFlight = new Set<string>();
+  private walletFailureCounts = new Map<string, number>();
+  private walletRetryAt = new Map<string, number>();
+  private walletLaneInFlight = new Map<string, "live" | "recovery">();
+  private signatureDiscoveryPages = new Map<
+    string,
+    Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[]
+  >();
+  private recoveryQueues = new Map<
+    string,
+    Awaited<ReturnType<Connection["getSignaturesForAddress"]>>
+  >();
 
   constructor(
     private conn: Connection,
@@ -115,24 +141,22 @@ export class RpcBackfillPoller {
     const current = this.watched.get(wallet);
     const nextAnchor = positiveSlot(options.anchorSlot);
     const currentAnchor = positiveSlot(current?.anchorSlot);
-    // An already-continuous target watch has no activation floor. Adding
-    // another owner must not skip an unresolved target backlog.
+    // Preserve the earliest explicit activation floor. A target may have been
+    // watched without an anchor before a recovered journey proves that older
+    // history must be replayed; dropping that later anchor would skip it.
     const mergedAnchor =
       currentAnchor !== undefined && nextAnchor !== undefined
         ? Math.min(currentAnchor, nextAnchor)
-        : current
-          ? currentAnchor
-          : nextAnchor;
+        : (currentAnchor ?? nextAnchor);
     this.watched.set(wallet, {
       anchorSlot: mergedAnchor,
     });
     const cached = this.cursorCache.get(wallet);
     if (cached) {
-      const currentBoundary = cached.lastProcessedSlot ?? cached.startSlot;
       if (
         this.options.allowEarlierAnchorRewind === true &&
         nextAnchor !== undefined &&
-        nextAnchor < currentBoundary
+        nextAnchor < cached.startSlot
       ) {
         // Keep health fail-closed until pollWallet durably rewinds and begins
         // replay. Trading pollers leave this option off.
@@ -144,6 +168,7 @@ export class RpcBackfillPoller {
       return;
     }
     this.cursorHydrationPending.add(wallet);
+    if (this.options.deferInitialCursorHydration === true && !this.timer) return;
     this.hydrateCursorHealth(wallet).catch((error) =>
       log.warn(
         { wallet, error: sanitizeRpcCursorError(error) },
@@ -156,6 +181,10 @@ export class RpcBackfillPoller {
     this.watched.delete(wallet);
     this.backlogWallets.delete(wallet);
     this.cursorHydrationPending.delete(wallet);
+    this.walletFailureCounts.delete(wallet);
+    this.walletRetryAt.delete(wallet);
+    this.signatureDiscoveryPages.delete(wallet);
+    this.recoveryQueues.delete(wallet);
     // Durable cursor intentionally survives unwatch/re-watch cycles.
   }
 
@@ -176,8 +205,37 @@ export class RpcBackfillPoller {
       backlogWalletCount: unavailableWallets.size,
       detectedBacklogWalletCount: this.backlogWallets.size,
       cursorHydrationPendingCount: this.cursorHydrationPending.size,
+      lastRecoveryProgressAt: this.lastRecoveryProgressAt,
+      processedSignatureCount: this.processedSignatureCount,
+      inFlightWalletCount: this.walletsInFlight.size,
       failures: this.failures,
     };
+  }
+
+  /**
+   * Hydrates the current watch set in bounded database batches. Custody calls
+   * this before starting its large polling set so health and recovery do not
+   * depend on thousands of simultaneous one-row Supabase requests.
+   */
+  async hydrateWatchedCursors(): Promise<void> {
+    const wallets = Array.from(this.cursorHydrationPending).filter((wallet) =>
+      this.watched.has(wallet),
+    );
+    if (wallets.length === 0) return;
+    if (this.cursorStore.loadMany) {
+      const loaded = await this.cursorStore.loadMany(wallets);
+      for (const [wallet, cursor] of loaded) {
+        if (!this.watched.has(wallet)) continue;
+        this.cursorCache.set(wallet, cursor);
+        this.applyCursorHealth(wallet, cursor);
+      }
+      return;
+    }
+    for (let offset = 0; offset < wallets.length; offset += 16) {
+      await Promise.all(
+        wallets.slice(offset, offset + 16).map((wallet) => this.hydrateCursorHealth(wallet)),
+      );
+    }
   }
 
   private async hydrateCursorHealth(wallet: string) {
@@ -203,54 +261,118 @@ export class RpcBackfillPoller {
   }
 
   private applyCursorHealth(wallet: string, cursor: RpcWalletCursor) {
+    const anchorSlot = positiveSlot(this.watched.get(wallet)?.anchorSlot);
+    if (
+      this.options.allowEarlierAnchorRewind === true &&
+      anchorSlot !== undefined &&
+      anchorSlot < cursor.startSlot
+    ) {
+      this.cursorHydrationPending.add(wallet);
+      this.backlogWallets.add(wallet);
+      return;
+    }
     this.cursorHydrationPending.delete(wallet);
     if (cursor.backlogDetected) this.backlogWallets.add(wallet);
     else this.backlogWallets.delete(wallet);
   }
 
   private async poll() {
-    if (this.running) return;
-    this.running = true;
     this.lastPollAt = Date.now();
+    const allEntries = Array.from(this.watched.entries());
+    if (allEntries.length === 0) return;
+    const concurrency = Math.max(1, Math.trunc(Number(this.options.pollConcurrency ?? 8)));
+    const available = Math.max(0, concurrency - this.walletsInFlight.size);
+    if (available === 0) return;
+    const configuredLimit = Math.trunc(Number(this.options.maxWalletsPerPoll ?? available));
+    const launchLimit = Math.max(1, Math.min(available, configuredLimit || 1));
+    const now = Date.now();
+    const start = this.pollOffset % allEntries.length;
+    const configuredRecoveryConcurrency = Math.trunc(
+      Number(this.options.recoveryConcurrency ?? concurrency),
+    );
+    const recoveryConcurrency = Math.max(
+      1,
+      Math.min(concurrency, configuredRecoveryConcurrency || 1),
+    );
+    let recoveryInFlight = Array.from(this.walletLaneInFlight.values()).filter(
+      (lane) => lane === "recovery",
+    ).length;
+    let scanned = 0;
+    let launched = 0;
+    let nextPollOffset = start;
+    while (scanned < allEntries.length && launched < launchLimit) {
+      const entryIndex = (start + scanned) % allEntries.length;
+      const entry = allEntries[entryIndex];
+      scanned += 1;
+      if (!entry) continue;
+      const [wallet, options] = entry;
+      if (this.walletsInFlight.has(wallet)) continue;
+      if ((this.walletRetryAt.get(wallet) ?? 0) > now) continue;
+      const isRecovery =
+        this.backlogWallets.has(wallet) ||
+        this.cursorHydrationPending.has(wallet) ||
+        this.signatureDiscoveryPages.has(wallet) ||
+        this.recoveryQueues.has(wallet);
+      if (isRecovery && recoveryInFlight >= recoveryConcurrency) continue;
+      launched += 1;
+      this.walletsInFlight.add(wallet);
+      const lane = isRecovery ? "recovery" : "live";
+      if (isRecovery) recoveryInFlight += 1;
+      this.walletLaneInFlight.set(wallet, lane);
+      nextPollOffset = (entryIndex + 1) % allEntries.length;
+      void this.runWalletPoll(wallet, options);
+    }
+    // A saturated recovery cap may force a full scan. Advancing by the scan
+    // length would wrap to the same wallet and let the first few deep wallets
+    // monopolize every recovery turn. Rotate only past the last launched lane.
+    if (launched > 0) this.pollOffset = nextPollOffset;
+  }
+
+  private async runWalletPoll(wallet: string, options: RpcWatchOptions): Promise<void> {
     try {
-      const entries = Array.from(this.watched.entries());
-      const concurrency = Math.max(1, Math.trunc(Number(this.options.pollConcurrency ?? 8)));
-      for (let offset = 0; offset < entries.length; offset += concurrency) {
-        const batch = entries.slice(offset, offset + concurrency);
-        const results = await Promise.allSettled(
-          batch.map(([wallet, options]) => this.pollWallet(wallet, options)),
-        );
-        for (const [index, result] of results.entries()) {
-          if (result.status === "fulfilled") continue;
-          const wallet = batch[index]?.[0];
-          this.failures += 1;
-          if (wallet) {
-            const newlyBacklogged = !this.backlogWallets.has(wallet);
-            this.backlogWallets.add(wallet);
-            if (newlyBacklogged) {
-              try {
-                const cursor = await this.cursorStore.markBacklog(wallet, result.reason);
-                this.cursorCache.set(wallet, cursor);
-              } catch (cursorError) {
-                log.warn(
-                  { wallet, error: sanitizeRpcCursorError(cursorError) },
-                  "RPC fallback could not persist backlog state",
-                );
-              }
-            }
-          }
+      await this.pollWallet(wallet, options);
+      this.walletFailureCounts.delete(wallet);
+      this.walletRetryAt.delete(wallet);
+    } catch (error) {
+      if (!this.watched.has(wallet)) return;
+      this.failures += 1;
+      const failures = (this.walletFailureCounts.get(wallet) ?? 0) + 1;
+      this.walletFailureCounts.set(wallet, failures);
+      // A failed provider/database lane backs off independently. Other wallets
+      // continue on the reserved scheduler slots instead of joining a retry
+      // stampede behind one unhealthy address.
+      const baseDelayMs = Math.min(120_000, 2_000 * 2 ** Math.min(6, failures - 1));
+      const jitter = 0.9 + (stableWalletJitter(wallet) % 21) / 100;
+      this.walletRetryAt.set(wallet, Date.now() + Math.round(baseDelayMs * jitter));
+      const newlyBacklogged = !this.backlogWallets.has(wallet);
+      this.backlogWallets.add(wallet);
+      if (newlyBacklogged || this.cursorCache.get(wallet)?.backlogDetected !== true) {
+        try {
+          const cursor = await this.cursorStore.markBacklog(wallet, error);
+          this.cursorCache.set(wallet, cursor);
+        } catch (cursorError) {
           log.warn(
-            { wallet, error: sanitizeRpcCursorError(result.reason) },
-            "RPC fallback wallet poll failed",
+            { wallet, error: sanitizeRpcCursorError(cursorError) },
+            "RPC fallback could not persist backlog state",
           );
         }
       }
+      log.warn(
+        {
+          wallet,
+          retryInMs: Math.max(0, (this.walletRetryAt.get(wallet) ?? 0) - Date.now()),
+          error: sanitizeRpcCursorError(error),
+        },
+        "RPC fallback wallet poll failed",
+      );
     } finally {
-      this.running = false;
+      this.walletsInFlight.delete(wallet);
+      this.walletLaneInFlight.delete(wallet);
     }
   }
 
   private async pollWallet(wallet: string, options: RpcWatchOptions) {
+    const enforceWatchLifecycle = this.watched.has(wallet);
     let pubkey: PublicKey;
     try {
       pubkey = new PublicKey(wallet);
@@ -260,18 +382,21 @@ export class RpcBackfillPoller {
     }
 
     let cursor = this.cursorCache.get(wallet) ?? (await this.cursorStore.load(wallet));
+    if (enforceWatchLifecycle && !this.watched.has(wallet)) return;
     if (cursor) {
       const anchorSlot = positiveSlot(options.anchorSlot);
-      const currentBoundary = cursor.lastProcessedSlot ?? cursor.startSlot;
       if (
         this.options.allowEarlierAnchorRewind === true &&
         anchorSlot !== undefined &&
-        anchorSlot < currentBoundary &&
+        anchorSlot < cursor.startSlot &&
         this.cursorStore.rewind
       ) {
+        const priorStartSlot = cursor.startSlot;
         cursor = await this.cursorStore.rewind(wallet, anchorSlot);
+        this.signatureDiscoveryPages.delete(wallet);
+        this.recoveryQueues.delete(wallet);
         log.warn(
-          { wallet, anchorSlot, priorBoundarySlot: currentBoundary },
+          { wallet, anchorSlot, priorStartSlot },
           "RPC cursor rewound to cover newly discovered earlier custody attribution",
         );
       }
@@ -285,6 +410,7 @@ export class RpcBackfillPoller {
           this.conn.getSignaturesForAddress(pubkey, { limit: 1 }, "confirmed"),
           "signature head",
         );
+        if (enforceWatchLifecycle && !this.watched.has(wallet)) return;
         cursor = await this.cursorStore.ensure(wallet, head[0]?.slot ?? 0);
         this.cursorCache.set(wallet, cursor);
         if (!this.includeActivationHead) {
@@ -319,43 +445,80 @@ export class RpcBackfillPoller {
     // only initializes a missing cursor; raising an older cursor to a newer DB
     // state would skip an unprocessed recovery gap.
     const recoveryBoundary = cursor;
-    const pages: Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[] = [];
+    let recoveryQueue = this.recoveryQueues.get(wallet);
     // Find the trusted lower boundary before releasing any work. The previous
     // 5,000-signature discovery cap could leave a busy wallet permanently
     // backlogged. Once the boundary is found, transaction handling remains
     // bounded to a durable 5,000-signature chunk per poll.
-    const paging = {
-      pageSize: RPC_SIGNATURE_PAGE_SIZE,
-      maxPages: RPC_SIGNATURE_MAX_PAGES,
-    };
-    while (true) {
-      const request = planNextRpcSignaturePage(pages, recoveryBoundary, paging);
-      if (!request) break;
-      const page = await rpcReadWithTimeout(
-        this.conn.getSignaturesForAddress(pubkey, request, "confirmed"),
-        "signature page",
+    if (!recoveryQueue) {
+      const pages = this.signatureDiscoveryPages.get(wallet) ?? [];
+      const paging = {
+        pageSize: RPC_SIGNATURE_PAGE_SIZE,
+        maxPages: RPC_SIGNATURE_MAX_PAGES,
+      };
+      const configuredPageBudget = Math.trunc(
+        Number(this.options.signaturePagesPerTurn ?? RPC_SIGNATURE_MAX_PAGES),
       );
-      pages.push(page);
+      const pageBudget = Math.max(1, Math.min(RPC_SIGNATURE_MAX_PAGES, configuredPageBudget || 1));
+      let pagesReadThisTurn = 0;
+      while (pagesReadThisTurn < pageBudget) {
+        const request = planNextRpcSignaturePage(pages, recoveryBoundary, paging);
+        if (!request) break;
+        const page = await rpcReadWithTimeout(
+          this.conn.getSignaturesForAddress(pubkey, request, "confirmed"),
+          "signature page",
+        );
+        if (enforceWatchLifecycle && !this.watched.has(wallet)) {
+          this.signatureDiscoveryPages.delete(wallet);
+          return;
+        }
+        pages.push(page);
+        pagesReadThisTurn += 1;
+        const pagePlan = planRpcSignaturePages(pages, recoveryBoundary, paging);
+        if (pagePlan.complete || pagePlan.backlogDetected) break;
+      }
+
       const plan = planRpcSignaturePages(pages, recoveryBoundary, paging);
-      if (plan.complete || plan.backlogDetected) break;
+      if (!plan.complete && !plan.backlogDetected) {
+        this.signatureDiscoveryPages.set(wallet, pages);
+        this.backlogWallets.add(wallet);
+        if (!cursor.backlogDetected) {
+          cursor = await this.cursorStore.markBacklog(
+            wallet,
+            "RPC signature boundary discovery is still in progress",
+          );
+          this.cursorCache.set(wallet, cursor);
+          this.applyCursorHealth(wallet, cursor);
+        }
+        this.lastRecoveryProgressAt = Date.now();
+        this.lastSuccessAt = this.lastRecoveryProgressAt;
+        return;
+      }
+      if (plan.backlogDetected || !plan.complete) {
+        this.signatureDiscoveryPages.delete(wallet);
+        this.backlogWallets.add(wallet);
+        cursor = await this.cursorStore.markBacklog(
+          wallet,
+          plan.error ?? "RPC signature pagination backlog",
+        );
+        this.cursorCache.set(wallet, cursor);
+        this.applyCursorHealth(wallet, cursor);
+        throw new Error(plan.error ?? "RPC signature pagination backlog");
+      }
+
+      this.signatureDiscoveryPages.delete(wallet);
+      recoveryQueue = [...plan.signatures];
+      if (recoveryQueue.length > 0) this.recoveryQueues.set(wallet, recoveryQueue);
     }
 
-    const plan = planRpcSignaturePages(pages, recoveryBoundary, paging);
-    if (plan.backlogDetected || !plan.complete) {
-      this.backlogWallets.add(wallet);
-      cursor = await this.cursorStore.markBacklog(
-        wallet,
-        plan.error ?? "RPC signature pagination backlog",
-      );
-      this.cursorCache.set(wallet, cursor);
-      this.applyCursorHealth(wallet, cursor);
-      return;
-    }
+    const configuredChunkSize = Math.trunc(
+      Number(this.options.recoveryChunkSize ?? RPC_RECOVERY_CHUNK_SIZE),
+    );
+    const chunkSize = Math.max(1, Math.min(RPC_RECOVERY_CHUNK_SIZE, configuredChunkSize || 1));
+    const recoverySignatures = recoveryQueue?.slice(0, chunkSize) ?? [];
 
-    const recovery = takeOldestRpcRecoveryChunk(plan, RPC_RECOVERY_CHUNK_SIZE);
-
-    for (let offset = 0; offset < recovery.signatures.length; offset += 50) {
-      const signatureBatch = recovery.signatures.slice(offset, offset + 50);
+    for (let offset = 0; offset < recoverySignatures.length; offset += 50) {
+      const signatureBatch = recoverySignatures.slice(offset, offset + 50);
       const txs = await rpcReadWithTimeout(
         this.conn.getParsedTransactions(
           signatureBatch.map((sig) => sig.signature),
@@ -363,6 +526,8 @@ export class RpcBackfillPoller {
         ),
         "parsed transaction batch",
       );
+      if (enforceWatchLifecycle && !this.watched.has(wallet)) return;
+      let checkpoint: (typeof signatureBatch)[number] | undefined;
       for (const [index, sig] of signatureBatch.entries()) {
         const tx = txs[index];
         if (!tx) {
@@ -373,7 +538,7 @@ export class RpcBackfillPoller {
           );
           this.cursorCache.set(wallet, cursor);
           this.applyCursorHealth(wallet, cursor);
-          return;
+          throw new Error("RPC transaction was temporarily unavailable");
         }
         const decoded = decodeParsedTransactionWithCoverage(wallet, tx as any);
         const events = decoded.events;
@@ -410,33 +575,48 @@ export class RpcBackfillPoller {
             await this.options.onUnresolvedOutflow(event);
           }
         }
+        checkpoint = sig;
+      }
+      if (checkpoint) {
+        // Event persistence is idempotent by source transaction. Checkpointing
+        // once per handled batch cuts cursor database traffic by up to 50x;
+        // a crash before this write safely replays already-committed events.
+        if (enforceWatchLifecycle && !this.watched.has(wallet)) return;
         cursor = await this.cursorStore.advance(
           wallet,
-          sig.signature,
-          sig.slot,
-          sig.blockTime ?? null,
+          checkpoint.signature,
+          checkpoint.slot,
+          checkpoint.blockTime ?? null,
         );
         this.cursorCache.set(wallet, cursor);
+        this.processedSignatureCount += signatureBatch.length;
+        this.lastRecoveryProgressAt = Date.now();
+        this.lastSuccessAt = this.lastRecoveryProgressAt;
+        recoveryQueue?.splice(0, signatureBatch.length);
       }
     }
-    if (recovery.hasMore) {
+    const remainingRecovery = recoveryQueue?.length ?? 0;
+    if (remainingRecovery > 0) {
       this.backlogWallets.add(wallet);
-      cursor = await this.cursorStore.markBacklog(
-        wallet,
-        new Error("RPC recovery backlog remains after safe chunk"),
-      );
-      this.cursorCache.set(wallet, cursor);
-      this.applyCursorHealth(wallet, cursor);
+      if (!cursor.backlogDetected) {
+        cursor = await this.cursorStore.markBacklog(
+          wallet,
+          new Error("RPC recovery backlog remains after safe chunk"),
+        );
+        this.cursorCache.set(wallet, cursor);
+        this.applyCursorHealth(wallet, cursor);
+      }
       log.warn(
-        { wallet, processed: recovery.signatures.length, remaining: recovery.remainingCount },
+        { wallet, processed: recoverySignatures.length, remaining: remainingRecovery },
         "RPC fallback advanced one durable recovery chunk",
       );
       return;
     }
+    this.recoveryQueues.delete(wallet);
     const now = Date.now();
     const shouldPersistSuccess =
       cursor.backlogDetected ||
-      recovery.signatures.length > 0 ||
+      recoverySignatures.length > 0 ||
       now - (this.cursorSuccessPersistedAt.get(wallet) ?? 0) >= 5 * 60_000;
     if (shouldPersistSuccess) {
       cursor = await this.cursorStore.markSuccess(wallet);
@@ -467,6 +647,14 @@ async function rpcReadWithTimeout<T>(request: Promise<T>, label: string): Promis
 
 function positiveSlot(value: number | undefined): number | undefined {
   return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value : undefined;
+}
+
+function stableWalletJitter(wallet: string): number {
+  let hash = 0;
+  for (let index = 0; index < wallet.length; index += 1) {
+    hash = (Math.imul(hash, 31) + wallet.charCodeAt(index)) >>> 0;
+  }
+  return hash;
 }
 
 export function decodeParsedTransaction(wallet: string, tx: any): FeedEvent[] {

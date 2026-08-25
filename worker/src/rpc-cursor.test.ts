@@ -15,6 +15,7 @@ type Row = Record<string, unknown>;
 
 class MemoryQuery implements PromiseLike<{ data: unknown; error: unknown }> {
   private filters: Array<[string, unknown]> = [];
+  private inFilters: Array<[string, readonly unknown[]]> = [];
   private returnRows = false;
 
   constructor(
@@ -22,6 +23,7 @@ class MemoryQuery implements PromiseLike<{ data: unknown; error: unknown }> {
     private readonly operation: "select" | "upsert" | "update",
     private readonly values?: Row,
     private readonly options?: { ignoreDuplicates?: boolean },
+    private readonly onInFilter?: (column: string, values: readonly unknown[]) => void,
   ) {}
 
   select(): this {
@@ -34,8 +36,17 @@ class MemoryQuery implements PromiseLike<{ data: unknown; error: unknown }> {
     return this;
   }
 
+  in(column: string, values: readonly unknown[]): this {
+    this.inFilters.push([column, values]);
+    this.onInFilter?.(column, values);
+    return this;
+  }
+
   private matches(row: Row): boolean {
-    return this.filters.every(([column, value]) => row[column] === value);
+    return (
+      this.filters.every(([column, value]) => row[column] === value) &&
+      this.inFilters.every(([column, values]) => values.includes(row[column]))
+    );
   }
 
   private execute(): { data: unknown; error: unknown } {
@@ -90,11 +101,15 @@ class MemoryQuery implements PromiseLike<{ data: unknown; error: unknown }> {
 
 class MemorySupabase {
   readonly rows: Row[] = [];
+  readonly bulkWalletBatchSizes: number[] = [];
 
   from(table: string) {
     assert.equal(table, "rpc_wallet_cursors");
     return {
-      select: (_columns?: string) => new MemoryQuery(this.rows, "select"),
+      select: (_columns?: string) =>
+        new MemoryQuery(this.rows, "select", undefined, undefined, (column, values) => {
+          if (column === "wallet") this.bulkWalletBatchSizes.push(values.length);
+        }),
       upsert: (values: Row, options?: { ignoreDuplicates?: boolean }) =>
         new MemoryQuery(this.rows, "upsert", values, options),
       update: (values: Row) => new MemoryQuery(this.rows, "update", values),
@@ -149,18 +164,71 @@ test("stores independent durable cursors and ensure never resets an existing wal
 test("custody can durably rewind an existing wallet cursor to an earlier attribution anchor", async () => {
   const client = new MemorySupabase();
   const store = createSupabaseRpcCursorStore(client, "user-1");
-  await store.ensure("wallet-a", 100);
+  await store.ensure("wallet-a", 180);
   await store.advance("wallet-a", "sig-200", 200, 2_000);
 
   const rewound = await store.rewind!("wallet-a", 150);
-  assert.equal(rewound.startSlot, 100);
+  assert.equal(rewound.startSlot, 150);
   assert.equal(rewound.lastProcessedSignature, null);
   assert.equal(rewound.lastProcessedSlot, 150);
   assert.equal(rewound.lastBlockTime, null);
   assert.equal(rewound.backlogDetected, true);
 
-  const unchanged = await store.rewind!("wallet-a", 175);
-  assert.equal(unchanged.lastProcessedSlot, 150);
+  await store.advance("wallet-a", "sig-200-after-rewind", 200, 2_000);
+  const restartedStore = createSupabaseRpcCursorStore(client, "user-1");
+  const unchanged = await restartedStore.rewind!("wallet-a", 150);
+  assert.equal(unchanged.startSlot, 150);
+  assert.equal(unchanged.lastProcessedSignature, "sig-200-after-rewind");
+  assert.equal(unchanged.lastProcessedSlot, 200);
+
+  const laterAnchor = await restartedStore.rewind!("wallet-a", 175);
+  assert.equal(laterAnchor.lastProcessedSignature, "sig-200-after-rewind");
+  assert.equal(laterAnchor.lastProcessedSlot, 200);
+});
+
+test("covered anchors do not rewind and cursor bulk loading avoids per-wallet reads", async () => {
+  const client = new MemorySupabase();
+  const store = createSupabaseRpcCursorStore(client, "user-1");
+  await store.ensure("wallet-a", 100);
+  await store.ensure("wallet-b", 120);
+  await store.advance("wallet-a", "sig-200", 200, 2_000);
+
+  const covered = await store.rewind!("wallet-a", 150);
+  assert.equal(covered.startSlot, 100);
+  assert.equal(covered.lastProcessedSignature, "sig-200");
+  assert.equal(covered.lastProcessedSlot, 200);
+
+  const loaded = await store.loadMany!(["wallet-a", "wallet-b", "wallet-a"]);
+  assert.deepEqual(Array.from(loaded.keys()).sort(), ["wallet-a", "wallet-b"]);
+  assert.equal(loaded.get("wallet-a")?.lastProcessedSlot, 200);
+});
+
+test("cursor bulk loading de-duplicates wallets and uses bounded query batches", async () => {
+  const client = new MemorySupabase();
+  const now = new Date().toISOString();
+  const wallets = Array.from({ length: 501 }, (_, index) => `wallet-${index}`);
+  for (const [index, wallet] of wallets.entries()) {
+    client.rows.push({
+      user_id: "user-1",
+      wallet,
+      start_slot: index,
+      last_processed_signature: `sig-${index}`,
+      last_processed_slot: index,
+      last_block_time: index,
+      backlog_detected: false,
+      last_success_at: now,
+      last_error: null,
+      created_at: now,
+      updated_at: now,
+    });
+  }
+  const store = createSupabaseRpcCursorStore(client, "user-1");
+
+  const loaded = await store.loadMany!([...wallets, wallets[0]!, wallets[250]!]);
+
+  assert.equal(loaded.size, 501);
+  assert.deepEqual(client.bulkWalletBatchSizes, [250, 250, 1]);
+  assert.equal(loaded.get("wallet-500")?.lastProcessedSignature, "sig-500");
 });
 
 test("backlog diagnostics are sanitized and success never advances the cursor", async () => {

@@ -635,6 +635,8 @@ export const getCustodyDashboard = createServerFn({ method: "POST" })
       journeysResult,
       heartbeatResult,
       pendingEventsResult,
+      waitingEventsResult,
+      dormantEventsResult,
       expiredEventsResult,
       terminalEventsResult,
     ] = await Promise.all([
@@ -648,7 +650,19 @@ export const getCustodyDashboard = createServerFn({ method: "POST" })
         .select("id", { count: "exact", head: true })
         .eq("user_id", userId)
         .eq("status", "pending")
-        .not("journey_id", "is", null),
+        .in("queue_state", ["ready", "transient_retry"]),
+      db
+        .from("custody_pending_events")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("status", "pending")
+        .eq("queue_state", "waiting_dependency"),
+      db
+        .from("custody_pending_events")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("status", "pending")
+        .eq("queue_state", "dormant_scope"),
       db
         .from("custody_pending_events")
         .select("id", { count: "exact", head: true })
@@ -664,15 +678,21 @@ export const getCustodyDashboard = createServerFn({ method: "POST" })
     ]);
     if (journeysResult.error) custodyReadError(journeysResult.error);
     if (heartbeatResult.error) custodyReadError(heartbeatResult.error);
-    const inboxFailure = [pendingEventsResult, expiredEventsResult, terminalEventsResult].find(
-      (result) => result.error,
-    );
+    const inboxFailure = [
+      pendingEventsResult,
+      waitingEventsResult,
+      dormantEventsResult,
+      expiredEventsResult,
+      terminalEventsResult,
+    ].find((result) => result.error);
     if (inboxFailure?.error) custodyReadError(inboxFailure.error);
 
     const journeys = (journeysResult.data ?? []) as CustodyJourneyRow[];
     const heartbeat = heartbeatResult.data as CustodyWorkerHeartbeatRow | null;
     const pendingEvents = {
       pending: Number(pendingEventsResult.count ?? 0),
+      waiting: Number(waitingEventsResult.count ?? 0),
+      dormant: Number(dormantEventsResult.count ?? 0),
       expired: Number(expiredEventsResult.count ?? 0),
       terminal: Number(terminalEventsResult.count ?? 0),
     };

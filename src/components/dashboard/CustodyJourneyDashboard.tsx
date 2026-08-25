@@ -496,7 +496,10 @@ function ObserverHealthPanel({
           <div className="text-[9px] uppercase tracking-wider text-muted-foreground">
             Recovery inbox
           </div>
-          <div className="mt-1 font-mono text-xs">{health.pendingEventCount} pending</div>
+          <div className="mt-1 font-mono text-xs">{health.pendingEventCount} runnable</div>
+          <div className="mt-0.5 text-[9px] text-muted-foreground">
+            {health.waitingDependencyCount} waiting · {health.dormantEvidenceCount} dormant
+          </div>
           <div className="mt-0.5 text-[9px] text-muted-foreground">
             {health.expiredEventCount} expired · {health.terminalEventCount} terminal
           </div>

@@ -40,7 +40,7 @@ test("canonical schema includes the Strategy Lab table and RPCs", () => {
   const sellCoverageMarker =
     "-- Sell coverage schema (kept in sync with sell-coverage-migration.sql).";
   const resumeMarker = "revoke all on function public.record_strategy_observations(jsonb)";
-  const nextCanonicalMarker = "-- REVIVAL_CAMPAIGN_CANONICAL_MIRROR_BEGIN";
+  const nextCanonicalMarker = "-- CUSTODY_BACKLOG_V2_CANONICAL_MIRROR_BEGIN";
   const strategyStart = schema.indexOf(marker);
   const sellCoverageStart = schema.indexOf(sellCoverageMarker, strategyStart);
   const strategyResume = schema.indexOf(resumeMarker, sellCoverageStart);
