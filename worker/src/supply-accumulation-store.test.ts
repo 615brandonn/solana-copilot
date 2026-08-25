@@ -37,8 +37,11 @@ const state = {
   directSettlementSeen: false,
   thresholdPct: 10,
   thresholdReached: true,
+  minMarketCapUsd: 2000,
   maxMarketCapUsd: 15000,
+  aboveMarketCapFloor: true,
   underMarketCap: true,
+  withinMarketCapRange: true,
   entryReady: true,
 };
 

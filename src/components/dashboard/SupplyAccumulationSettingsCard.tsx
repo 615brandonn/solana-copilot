@@ -74,24 +74,30 @@ export function SupplyAccumulationSettingsCard({ cfg, onChange }: Props) {
             Requires Custody Journey, this strategy, and the global Entries switch. Default is OFF.
           </div>
         </div>
-        <Switch
-          checked={cfg.supplyAccumulationModeEnabled}
-          disabled={
-            !cfg.supplyAccumulationModeEnabled && (targetCount === 0 || !cfg.custodyJourneyEnabled)
-          }
-          onCheckedChange={(enabled) =>
-            onChange(
-              enabled
-                ? {
-                    supplyAccumulationModeEnabled: true,
-                    convictionModeEnabled: false,
-                    coordinatedModeEnabled: false,
-                  }
-                : { supplyAccumulationModeEnabled: false },
-            )
-          }
-          aria-label="Enable live Supply Accumulation entry strategy"
-        />
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-xs text-muted-foreground">
+            {cfg.supplyAccumulationModeEnabled ? "ON" : "OFF"}
+          </span>
+          <Switch
+            checked={cfg.supplyAccumulationModeEnabled}
+            disabled={
+              !cfg.supplyAccumulationModeEnabled &&
+              (targetCount === 0 || !cfg.custodyJourneyEnabled)
+            }
+            onCheckedChange={(enabled) =>
+              onChange(
+                enabled
+                  ? {
+                      supplyAccumulationModeEnabled: true,
+                      convictionModeEnabled: false,
+                      coordinatedModeEnabled: false,
+                    }
+                  : { supplyAccumulationModeEnabled: false },
+              )
+            }
+            aria-label="Enable live Supply Accumulation entry strategy"
+          />
+        </div>
       </div>
 
       {targetCount === 0 ? (
@@ -142,7 +148,7 @@ export function SupplyAccumulationSettingsCard({ cfg, onChange }: Props) {
 
       <SettingRow
         label="Copy-buy amount"
-        hint="Dedicated USD amount for the one replay-protected entry when the threshold is first crossed."
+        hint="Dedicated USD amount for the initial replay-protected entry when the threshold is first crossed."
       >
         <NumberInput
           value={cfg.supplyAccumulationBuyUsd}
@@ -155,18 +161,148 @@ export function SupplyAccumulationSettingsCard({ cfg, onChange }: Props) {
       </SettingRow>
 
       <SettingRow
-        label="Hard market-cap ceiling"
-        hint="Missing or stale valuation blocks entry. The worker rechecks strict current and estimated post-fill market cap before submission."
+        label="Market-cap range"
+        hint="The floor is inclusive. The worker strictly requires current and estimated post-fill market cap below the ceiling before every buy."
       >
-        <NumberInput
-          value={cfg.supplyAccumulationMaxMarketCapUsd}
-          onChange={(value) => onChange({ supplyAccumulationMaxMarketCapUsd: value })}
-          prefix="$"
-          min={1}
-          max={15_000}
-          step={100}
-        />
+        <div className="flex items-center gap-2 font-mono text-xs">
+          <NumberInput
+            value={cfg.supplyAccumulationMinMarketCapUsd}
+            onChange={(value) => onChange({ supplyAccumulationMinMarketCapUsd: value })}
+            prefix="$"
+            min={0}
+            max={14_999.99}
+            step={100}
+          />
+          <span className="text-muted-foreground">to</span>
+          <NumberInput
+            value={cfg.supplyAccumulationMaxMarketCapUsd}
+            onChange={(value) => onChange({ supplyAccumulationMaxMarketCapUsd: value })}
+            prefix="$"
+            min={0.01}
+            max={15_000}
+            step={100}
+          />
+        </div>
       </SettingRow>
+
+      <div className="mt-2 rounded-xl border border-border/70 bg-muted/20 px-4 py-3">
+        <div className="text-xs font-semibold text-foreground">Optional durable scale buys</div>
+        <div className="mt-1 text-xs text-muted-foreground">
+          Each enabled tier needs a later fresh verified buy and a strictly higher net-supply
+          threshold. Tiers execute in order and never replay after landing.
+        </div>
+      </div>
+
+      <SettingRow
+        label="Second buy"
+        hint="Optional first scale-in after the initial Supply Accumulation position is fully armed."
+      >
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Switch
+            checked={cfg.supplyAccumulationScale2Enabled}
+            onCheckedChange={(enabled) =>
+              onChange(
+                enabled
+                  ? { supplyAccumulationScale2Enabled: true }
+                  : {
+                      supplyAccumulationScale2Enabled: false,
+                      supplyAccumulationScale3Enabled: false,
+                      supplyAccumulationScale4Enabled: false,
+                    },
+              )
+            }
+            aria-label="Enable second Supply Accumulation buy"
+          />
+          <NumberInput
+            value={cfg.supplyAccumulationScale2ThresholdPct}
+            onChange={(value) => onChange({ supplyAccumulationScale2ThresholdPct: value })}
+            suffix="%"
+            min={10}
+            max={20}
+            step={0.1}
+          />
+          <NumberInput
+            value={cfg.supplyAccumulationScale2BuyUsd}
+            onChange={(value) => onChange({ supplyAccumulationScale2BuyUsd: value })}
+            prefix="$"
+            min={0.01}
+            max={1_000_000}
+            step={0.01}
+          />
+        </div>
+      </SettingRow>
+
+      <SettingRow label="Third buy" hint="Requires the second buy tier to be enabled and landed.">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Switch
+            checked={cfg.supplyAccumulationScale3Enabled}
+            disabled={!cfg.supplyAccumulationScale2Enabled}
+            onCheckedChange={(enabled) =>
+              onChange(
+                enabled
+                  ? { supplyAccumulationScale3Enabled: true }
+                  : {
+                      supplyAccumulationScale3Enabled: false,
+                      supplyAccumulationScale4Enabled: false,
+                    },
+              )
+            }
+            aria-label="Enable third Supply Accumulation buy"
+          />
+          <NumberInput
+            value={cfg.supplyAccumulationScale3ThresholdPct}
+            onChange={(value) => onChange({ supplyAccumulationScale3ThresholdPct: value })}
+            suffix="%"
+            min={10}
+            max={20}
+            step={0.1}
+          />
+          <NumberInput
+            value={cfg.supplyAccumulationScale3BuyUsd}
+            onChange={(value) => onChange({ supplyAccumulationScale3BuyUsd: value })}
+            prefix="$"
+            min={0.01}
+            max={1_000_000}
+            step={0.01}
+          />
+        </div>
+      </SettingRow>
+
+      <SettingRow
+        label="Fourth buy"
+        hint="Requires both earlier scale tiers to be enabled and landed."
+      >
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Switch
+            checked={cfg.supplyAccumulationScale4Enabled}
+            disabled={!cfg.supplyAccumulationScale2Enabled || !cfg.supplyAccumulationScale3Enabled}
+            onCheckedChange={(enabled) => onChange({ supplyAccumulationScale4Enabled: enabled })}
+            aria-label="Enable fourth Supply Accumulation buy"
+          />
+          <NumberInput
+            value={cfg.supplyAccumulationScale4ThresholdPct}
+            onChange={(value) => onChange({ supplyAccumulationScale4ThresholdPct: value })}
+            suffix="%"
+            min={10}
+            max={20}
+            step={0.1}
+          />
+          <NumberInput
+            value={cfg.supplyAccumulationScale4BuyUsd}
+            onChange={(value) => onChange({ supplyAccumulationScale4BuyUsd: value })}
+            prefix="$"
+            min={0.01}
+            max={1_000_000}
+            step={0.01}
+          />
+        </div>
+      </SettingRow>
+
+      <div className="mt-2 rounded-xl border border-border/70 bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
+        A scale buy is permanently blocked after any exit signal or sell, and while the position is
+        not untouched. Every scale uses the same standard position and preserves its original entry
+        signature, slot, and exit behavior.
+      </div>
 
       <div className="mt-2 rounded-xl border border-amber-400/30 bg-amber-400/5 px-4 py-3 text-xs text-amber-200">
         Custody Journey must be ON for every Supply Accumulation entry. Fresh observer health, the

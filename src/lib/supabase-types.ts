@@ -22,8 +22,18 @@ export type BotConfigRow = {
   supply_accumulation_mode_enabled: boolean;
   supply_accumulation_threshold_pct: number;
   supply_accumulation_buy_usd: number;
+  supply_accumulation_min_market_cap_usd: number;
   supply_accumulation_max_market_cap_usd: number;
   supply_accumulation_window_seconds: number;
+  supply_accumulation_scale_2_enabled: boolean;
+  supply_accumulation_scale_2_threshold_pct: number;
+  supply_accumulation_scale_2_buy_usd: number;
+  supply_accumulation_scale_3_enabled: boolean;
+  supply_accumulation_scale_3_threshold_pct: number;
+  supply_accumulation_scale_3_buy_usd: number;
+  supply_accumulation_scale_4_enabled: boolean;
+  supply_accumulation_scale_4_threshold_pct: number;
+  supply_accumulation_scale_4_buy_usd: number;
   custody_journey_enabled: boolean;
   revival_tracker_enabled: boolean;
   revival_market_cap_min_usd: number;
@@ -481,6 +491,36 @@ export type ConvictionTierRow = {
   metadata: Record<string, unknown>;
 };
 
+export type SupplyAccumulationScaleClaimRow = {
+  id: string;
+  user_id: string;
+  token_mint: string;
+  position_id: string;
+  tier_number: 2 | 3 | 4;
+  status: "claimed" | "submitted" | "landed" | "persisted" | "failed_pre_submit" | "uncertain";
+  source_event_key: string;
+  source_tx_sig: string;
+  source_wallet: string;
+  source_slot: string;
+  token_decimals: number;
+  threshold_pct: number;
+  planned_buy_usd: number;
+  amount_lamports: string;
+  config_fingerprint: string;
+  bot_tx_sig: string | null;
+  last_valid_block_height: string | null;
+  received_amount_raw: string | null;
+  trade_id: string | null;
+  error_code: string | null;
+  submission_started_at: string | null;
+  landed_at: string | null;
+  persisted_at: string | null;
+  applied_at: string | null;
+  post_apply_repaired_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 // Minimal Database shape for createClient<Database>
 export type Database = {
   public: {
@@ -591,6 +631,12 @@ export type Database = {
         Row: ConvictionTierRow;
         Insert: Omit<ConvictionTierRow, "id" | "created_at" | "updated_at">;
         Update: Partial<ConvictionTierRow>;
+        Relationships: [];
+      };
+      supply_accumulation_scale_claims: {
+        Row: SupplyAccumulationScaleClaimRow;
+        Insert: Omit<SupplyAccumulationScaleClaimRow, "id" | "created_at" | "updated_at">;
+        Update: Partial<SupplyAccumulationScaleClaimRow>;
         Relationships: [];
       };
     };

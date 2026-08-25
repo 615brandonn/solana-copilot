@@ -17,8 +17,18 @@ export const BotConfigSchema = z
     supplyAccumulationModeEnabled: z.boolean(),
     supplyAccumulationThresholdPct: z.number().finite().min(10).max(20),
     supplyAccumulationBuyUsd: z.number().finite().positive().max(1_000_000),
+    supplyAccumulationMinMarketCapUsd: z.number().finite().min(0).max(15_000),
     supplyAccumulationMaxMarketCapUsd: z.number().finite().positive().max(15_000),
     supplyAccumulationWindowSeconds: z.number().int().min(30).max(3_600),
+    supplyAccumulationScale2Enabled: z.boolean(),
+    supplyAccumulationScale2ThresholdPct: z.number().finite().min(10).max(20),
+    supplyAccumulationScale2BuyUsd: z.number().finite().positive().max(1_000_000),
+    supplyAccumulationScale3Enabled: z.boolean(),
+    supplyAccumulationScale3ThresholdPct: z.number().finite().min(10).max(20),
+    supplyAccumulationScale3BuyUsd: z.number().finite().positive().max(1_000_000),
+    supplyAccumulationScale4Enabled: z.boolean(),
+    supplyAccumulationScale4ThresholdPct: z.number().finite().min(10).max(20),
+    supplyAccumulationScale4BuyUsd: z.number().finite().positive().max(1_000_000),
     custodyJourneyEnabled: z.boolean(),
     revivalTrackerEnabled: z.boolean(),
     revivalMarketCapMinUsd: z.number().finite().min(0).max(1_000_000_000),
@@ -129,6 +139,13 @@ export const BotConfigSchema = z
     message: "Market-cap minimum cannot exceed maximum",
     path: ["mcMaxUsd"],
   })
+  .refine(
+    (config) => config.supplyAccumulationMinMarketCapUsd < config.supplyAccumulationMaxMarketCapUsd,
+    {
+      message: "Supply Accumulation market-cap minimum must stay below the strict maximum",
+      path: ["supplyAccumulationMaxMarketCapUsd"],
+    },
+  )
   .refine((config) => config.revivalMarketCapMinUsd <= config.revivalMarketCapMaxUsd, {
     message: "Revival seed market-cap minimum cannot exceed maximum",
     path: ["revivalMarketCapMaxUsd"],
@@ -186,6 +203,64 @@ export const BotConfigSchema = z
       });
     }
     const configuredTargetCount = (config.targetWallet ? 1 : 0) + normalized.length;
+    if (config.supplyAccumulationScale3Enabled && !config.supplyAccumulationScale2Enabled) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Supply Accumulation scale 3 requires scale 2",
+        path: ["supplyAccumulationScale3Enabled"],
+      });
+    }
+    if (
+      config.supplyAccumulationScale4Enabled &&
+      (!config.supplyAccumulationScale2Enabled || !config.supplyAccumulationScale3Enabled)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Supply Accumulation scale 4 requires scales 2 and 3",
+        path: ["supplyAccumulationScale4Enabled"],
+      });
+    }
+    const enabledSupplyScales = [
+      {
+        enabled: config.supplyAccumulationScale2Enabled,
+        threshold: config.supplyAccumulationScale2ThresholdPct,
+        path: "supplyAccumulationScale2ThresholdPct",
+      },
+      {
+        enabled: config.supplyAccumulationScale3Enabled,
+        threshold: config.supplyAccumulationScale3ThresholdPct,
+        path: "supplyAccumulationScale3ThresholdPct",
+      },
+      {
+        enabled: config.supplyAccumulationScale4Enabled,
+        threshold: config.supplyAccumulationScale4ThresholdPct,
+        path: "supplyAccumulationScale4ThresholdPct",
+      },
+    ] as const;
+    let priorSupplyThreshold = config.supplyAccumulationThresholdPct;
+    for (const tier of enabledSupplyScales) {
+      if (!tier.enabled) continue;
+      if (tier.threshold <= priorSupplyThreshold) {
+        ctx.addIssue({
+          code: "custom",
+          message: "Enabled Supply Accumulation thresholds must increase strictly",
+          path: [tier.path],
+        });
+      }
+      priorSupplyThreshold = tier.threshold;
+    }
+    const configuredSupplyExposure =
+      config.supplyAccumulationBuyUsd +
+      (config.supplyAccumulationScale2Enabled ? config.supplyAccumulationScale2BuyUsd : 0) +
+      (config.supplyAccumulationScale3Enabled ? config.supplyAccumulationScale3BuyUsd : 0) +
+      (config.supplyAccumulationScale4Enabled ? config.supplyAccumulationScale4BuyUsd : 0);
+    if (configuredSupplyExposure > 1_000_000) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Supply Accumulation entry and enabled scales cannot exceed $1,000,000 total",
+        path: ["supplyAccumulationScale4BuyUsd"],
+      });
+    }
     if (config.supplyAccumulationModeEnabled && configuredTargetCount === 0) {
       ctx.addIssue({
         code: "custom",

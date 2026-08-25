@@ -52,8 +52,18 @@ export type BotConfigRow = {
   supply_accumulation_mode_enabled?: boolean;
   supply_accumulation_threshold_pct?: number;
   supply_accumulation_buy_usd?: number;
+  supply_accumulation_min_market_cap_usd?: number;
   supply_accumulation_max_market_cap_usd?: number;
   supply_accumulation_window_seconds?: number;
+  supply_accumulation_scale_2_enabled?: boolean;
+  supply_accumulation_scale_2_threshold_pct?: number;
+  supply_accumulation_scale_2_buy_usd?: number;
+  supply_accumulation_scale_3_enabled?: boolean;
+  supply_accumulation_scale_3_threshold_pct?: number;
+  supply_accumulation_scale_3_buy_usd?: number;
+  supply_accumulation_scale_4_enabled?: boolean;
+  supply_accumulation_scale_4_threshold_pct?: number;
+  supply_accumulation_scale_4_buy_usd?: number;
   custody_journey_enabled?: boolean;
   /** Independent observation-only Revival campaign collector. */
   revival_tracker_enabled?: boolean;
