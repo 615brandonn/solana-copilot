@@ -11,7 +11,8 @@ export type SellTriggerKind =
   | "proportional_follower"
   | "crew_wallet"
   | "trailing_stop"
-  | "mirror_custody_sell";
+  | "mirror_custody_sell"
+  | "price_reversal";
 
 export type DurableSellIdentity = {
   sourceTxSig: string;
@@ -23,7 +24,7 @@ export function periodicSellIdentity(
   positionId: string,
   triggerKind: Extract<
     SellTriggerKind,
-    "take_profit" | "stop_loss" | "target_inactivity" | "distinct_follower" | "trailing_stop" | "mirror_custody_sell"
+    "take_profit" | "stop_loss" | "target_inactivity" | "distinct_follower" | "trailing_stop" | "mirror_custody_sell" | "price_reversal"
   >,
   variant = "default",
 ): DurableSellIdentity {

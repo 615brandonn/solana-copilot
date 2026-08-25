@@ -40,17 +40,20 @@ test("canonical schema includes the Strategy Lab table and RPCs", () => {
   const sellCoverageMarker =
     "-- Sell coverage schema (kept in sync with sell-coverage-migration.sql).";
   const resumeMarker = "revoke all on function public.record_strategy_observations(jsonb)";
+  const nextCanonicalMarker = "-- CUSTODY_BACKLOG_V2_CANONICAL_MIRROR_BEGIN";
   const strategyStart = schema.indexOf(marker);
   const sellCoverageStart = schema.indexOf(sellCoverageMarker, strategyStart);
   const strategyResume = schema.indexOf(resumeMarker, sellCoverageStart);
+  const strategyEnd = schema.indexOf(nextCanonicalMarker, strategyResume);
 
   assert.notEqual(strategyStart, -1, "Strategy Lab schema marker is missing");
   assert.notEqual(sellCoverageStart, -1, "sell-coverage schema marker is missing");
   assert.notEqual(strategyResume, -1, "Strategy Lab schema resume marker is missing");
+  assert.notEqual(strategyEnd, -1, "next canonical schema marker is missing");
 
   const canonicalBlock = [
     schema.slice(strategyStart + marker.length, sellCoverageStart).trim(),
-    schema.slice(strategyResume).trim(),
+    schema.slice(strategyResume, strategyEnd).trim(),
   ].join("\n\n");
   const migrationBlock = sql.slice(sql.indexOf("create table")).trim();
   assert.equal(canonicalBlock, migrationBlock);

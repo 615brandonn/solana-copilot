@@ -11,6 +11,7 @@ const log = pino({ level: env.LOG_LEVEL });
  */
 export class CustodyWatchRegistry {
   private ownersByWallet = new Map<string, Set<string>>();
+  private anchorByWalletOwner = new Map<string, Map<string, number | undefined>>();
   private targetWallets = new Set<string>();
 
   constructor(private poller: RpcBackfillPoller) {}
@@ -79,9 +80,34 @@ export class CustodyWatchRegistry {
   private async retain(wallet: string, owner: string, anchorSlot?: number): Promise<void> {
     const owners = this.ownersByWallet.get(wallet) ?? new Set<string>();
     const first = owners.size === 0;
+    const anchors = this.anchorByWalletOwner.get(wallet) ?? new Map<string, number | undefined>();
+    const priorAnchor = anchors.get(owner);
+    const normalizedAnchor = positiveAnchor(anchorSlot);
+    const priorEffectiveAnchor = effectiveAnchor(anchors);
+
     owners.add(owner);
+    anchors.set(
+      owner,
+      priorAnchor === undefined
+        ? normalizedAnchor
+        : normalizedAnchor === undefined
+          ? priorAnchor
+          : Math.min(priorAnchor, normalizedAnchor),
+    );
     this.ownersByWallet.set(wallet, owners);
-    this.poller.watch(wallet, { anchorSlot });
+    this.anchorByWalletOwner.set(wallet, anchors);
+
+    // Reconciliation reloads the complete durable watch set frequently. An
+    // unchanged owner must not make the low-level poller reconsider (or rewind)
+    // the same anchor on every pass. Wake it only for the first owner or when
+    // the wallet's aggregate activation floor genuinely moves earlier.
+    const nextEffectiveAnchor = effectiveAnchor(anchors);
+    const effectiveAnchorMovedEarlier =
+      nextEffectiveAnchor !== undefined &&
+      (priorEffectiveAnchor === undefined || nextEffectiveAnchor < priorEffectiveAnchor);
+    if (first || effectiveAnchorMovedEarlier) {
+      this.poller.watch(wallet, { anchorSlot: normalizedAnchor });
+    }
     if (first) log.debug({ wallet }, "custody confirmed-RPC watch retained");
   }
 
@@ -89,9 +115,27 @@ export class CustodyWatchRegistry {
     const owners = this.ownersByWallet.get(wallet);
     if (!owners) return;
     owners.delete(owner);
+    const anchors = this.anchorByWalletOwner.get(wallet);
+    anchors?.delete(owner);
     if (owners.size > 0) return;
     this.ownersByWallet.delete(wallet);
+    this.anchorByWalletOwner.delete(wallet);
     this.poller.unwatch(wallet);
     log.debug({ wallet }, "custody confirmed-RPC watch released");
   }
+}
+
+function positiveAnchor(value: number | undefined): number | undefined {
+  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value : undefined;
+}
+
+function effectiveAnchor(
+  anchors: ReadonlyMap<string, number | undefined>,
+): number | undefined {
+  let earliest: number | undefined;
+  for (const anchor of anchors.values()) {
+    if (anchor === undefined) continue;
+    earliest = earliest === undefined ? anchor : Math.min(earliest, anchor);
+  }
+  return earliest;
 }

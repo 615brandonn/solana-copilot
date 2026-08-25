@@ -91,6 +91,8 @@ export interface CustodyStore {
   hasActiveAttribution(wallet: string, tokenMint: string): Promise<boolean>;
   loadActiveWatches(): Promise<ActiveCustodyWatch[]>;
   replayPending(limit?: number): Promise<CustodyPendingReplayResult>;
+  /** Creates custody journeys for open positions that have none. Returns the count of journeys created. */
+  backfillMissingJourneys(targetWallets: string[]): Promise<number>;
 }
 
 export type CustodyObservation = {

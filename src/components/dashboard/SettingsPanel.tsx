@@ -7,6 +7,7 @@ import { Label } from "@/components/ui/label";
 import type { BotConfig } from "@/lib/bot-config";
 import { SectionCard, SettingRow } from "./SettingRow";
 import { ConvictionSettingsCard } from "./ConvictionSettingsCard";
+import { RevivalTrackerSettingsCard } from "./RevivalTrackerSettingsCard";
 
 type Props = {
   cfg: BotConfig;
@@ -155,6 +156,8 @@ export function SettingsPanel({ cfg, onChange }: Props) {
       </SectionCard>
 
       <ConvictionSettingsCard cfg={cfg} onChange={onChange} />
+
+      <RevivalTrackerSettingsCard cfg={cfg} onChange={onChange} />
 
       <fieldset
         disabled={cfg.convictionModeEnabled}

@@ -20,6 +20,23 @@ const OTHER_INPUT_MINT = "other-input-token-mint";
 const OUTPUT_MINT = "output-token-mint";
 const OTHER_OUTPUT_MINT = "other-output-token-mint";
 
+function testCursor(wallet: string, overrides: Partial<RpcWalletCursor> = {}): RpcWalletCursor {
+  return {
+    userId: "user-1",
+    wallet,
+    startSlot: 100,
+    lastProcessedSignature: "sig-100",
+    lastProcessedSlot: 100,
+    lastBlockTime: 1_000,
+    backlogDetected: false,
+    lastSuccessAt: null,
+    lastError: null,
+    createdAt: null,
+    updatedAt: null,
+    ...overrides,
+  };
+}
+
 function tokenBalance(owner: string, mint: string, amount: number, decimals = 6) {
   const raw = BigInt(Math.round(amount * 10 ** decimals));
   return {
@@ -655,6 +672,7 @@ test("RPC poller durably drains more than 5,000 signatures without skipping", as
   });
 
   const advances: string[] = [];
+  const parsedSignatures: string[] = [];
   let backlogMarks = 0;
   let successMarks = 0;
   let current: RpcWalletCursor = {
@@ -711,6 +729,7 @@ test("RPC poller durably drains more than 5,000 signatures without skipping", as
       return signatures.slice(start, start + options.limit);
     },
     async getParsedTransactions(requested: string[]) {
+      parsedSignatures.push(...requested);
       return requested.map((signatureValue) => ({
         slot: Number(signatureValue.slice(4)),
         blockTime: null,
@@ -733,8 +752,12 @@ test("RPC poller durably drains more than 5,000 signatures without skipping", as
   const poller = new RpcBackfillPoller(connection as any, async () => {}, store);
 
   await (poller as any).pollWallet(target, {});
-  assert.equal(advances.length, 5_000);
-  assert.equal(advances[0], "sig-101");
+  assert.equal(parsedSignatures.length, 5_000);
+  assert.equal(new Set(parsedSignatures).size, 5_000);
+  assert.equal(parsedSignatures[0], "sig-101");
+  assert.equal(parsedSignatures.at(-1), "sig-5100");
+  assert.equal(advances.length, 100);
+  assert.equal(advances[0], "sig-150");
   assert.equal(advances.at(-1), "sig-5100");
   assert.equal(current.lastProcessedSignature, "sig-5100");
   assert.equal(backlogMarks, 1);
@@ -742,11 +765,205 @@ test("RPC poller durably drains more than 5,000 signatures without skipping", as
   assert.equal(poller.health().backlogWalletCount, 1);
 
   await (poller as any).pollWallet(target, {});
-  assert.equal(advances.length, 5_101);
+  assert.equal(parsedSignatures.length, 5_101);
+  assert.equal(new Set(parsedSignatures).size, 5_101);
+  assert.equal(parsedSignatures.at(-1), "sig-5201");
+  assert.equal(advances.length, 103);
   assert.equal(advances.at(-1), "sig-5201");
-  assert.equal(new Set(advances).size, 5_101);
+  assert.equal(new Set(advances).size, 103);
   assert.equal(successMarks, 1);
   assert.equal(poller.health().backlogWalletCount, 0);
+});
+
+test("custody time-slices deep signature discovery and reuses the in-memory recovery queue", async () => {
+  const signatures = Array.from({ length: 1_101 }, (_, index) => {
+    const slot = 1_201 - index;
+    return {
+      signature: `sig-${slot}`,
+      slot,
+      err: null,
+      memo: null,
+      blockTime: slot,
+    };
+  });
+  signatures.push({ signature: "sig-100", slot: 100, err: null, memo: null, blockTime: 100 });
+  let current = testCursor(target, {
+    startSlot: 100,
+    lastProcessedSignature: "sig-100",
+    lastProcessedSlot: 100,
+  });
+  let signaturePageCalls = 0;
+  const handled: string[] = [];
+  const store: RpcCursorStore = {
+    async load() {
+      return { ...current };
+    },
+    async ensure() {
+      return { ...current };
+    },
+    async advance(_wallet, signature, slot, blockTime) {
+      current = {
+        ...current,
+        lastProcessedSignature: signature,
+        lastProcessedSlot: slot,
+        lastBlockTime: blockTime,
+      };
+      return { ...current };
+    },
+    async markBacklog() {
+      current = { ...current, backlogDetected: true };
+      return { ...current };
+    },
+    async markSuccess() {
+      current = { ...current, backlogDetected: false };
+      return { ...current };
+    },
+  };
+  const connection = {
+    async getSignaturesForAddress(_wallet: unknown, options: { before?: string; limit: number }) {
+      signaturePageCalls += 1;
+      const start = options.before
+        ? signatures.findIndex((row) => row.signature === options.before) + 1
+        : 0;
+      return signatures.slice(start, start + options.limit);
+    },
+    async getParsedTransactions(requested: string[]) {
+      handled.push(...requested);
+      return requested.map((signature) => ({
+        slot: Number(signature.slice(4)),
+        blockTime: null,
+        transaction: {
+          signatures: [signature],
+          message: { accountKeys: [{ pubkey: target, signer: true }] },
+        },
+        meta: {
+          err: null,
+          fee: 5_000,
+          preBalances: [1_000_000_000],
+          postBalances: [999_995_000],
+          preTokenBalances: [],
+          postTokenBalances: [],
+          logMessages: [],
+        },
+      }));
+    },
+  };
+  const poller = new RpcBackfillPoller(connection as any, async () => {}, store, 1_200, true, {
+    signaturePagesPerTurn: 1,
+    recoveryChunkSize: 50,
+  });
+
+  await (poller as any).pollWallet(target, {});
+  assert.equal(signaturePageCalls, 1);
+  assert.equal(handled.length, 0);
+  await (poller as any).pollWallet(target, {});
+  assert.equal(signaturePageCalls, 2);
+  assert.equal(handled.length, 50);
+  await (poller as any).pollWallet(target, {});
+  assert.equal(signaturePageCalls, 2);
+  assert.equal(handled.length, 100);
+  assert.deepEqual(handled.slice(0, 3), ["sig-101", "sig-102", "sig-103"]);
+});
+
+test("a failed batch checkpoint replays idempotently without skipping handled transactions", async () => {
+  let current: RpcWalletCursor = {
+    userId: "user-1",
+    wallet: target,
+    startSlot: 100,
+    lastProcessedSignature: "sig-100",
+    lastProcessedSlot: 100,
+    lastBlockTime: 1_000,
+    backlogDetected: false,
+    lastSuccessAt: null,
+    lastError: null,
+    createdAt: null,
+    updatedAt: null,
+  };
+  let failNextCheckpoint = true;
+  let checkpointAttempts = 0;
+  const store: RpcCursorStore = {
+    async load() {
+      return { ...current };
+    },
+    async ensure() {
+      return { ...current };
+    },
+    async advance(_wallet, signatureValue, slot, blockTime) {
+      checkpointAttempts += 1;
+      if (failNextCheckpoint) {
+        failNextCheckpoint = false;
+        throw new Error("checkpoint unavailable");
+      }
+      current = {
+        ...current,
+        lastProcessedSignature: signatureValue,
+        lastProcessedSlot: slot,
+        lastBlockTime: blockTime,
+      };
+      return { ...current };
+    },
+    async markBacklog() {
+      return { ...current, backlogDetected: true };
+    },
+    async markSuccess() {
+      current = { ...current, backlogDetected: false };
+      return { ...current };
+    },
+  };
+  const signatures = [
+    { signature: "sig-102", slot: 102, err: null, memo: null, blockTime: 1_020 },
+    { signature: "sig-101", slot: 101, err: null, memo: null, blockTime: 1_010 },
+    { signature: "sig-100", slot: 100, err: null, memo: null, blockTime: 1_000 },
+  ];
+  const connection = {
+    async getSignaturesForAddress() {
+      return signatures;
+    },
+    async getParsedTransactions(requested: string[]) {
+      return requested.map((signatureValue) => {
+        const slot = Number(signatureValue.slice(4));
+        const tx = parsedTx({
+          targetSigner: true,
+          swapLogs: false,
+          preTokens: [
+            tokenBalance(target, OUTPUT_MINT, 10),
+            tokenBalance(recipient, OUTPUT_MINT, 0),
+          ],
+          postTokens: [
+            tokenBalance(target, OUTPUT_MINT, 0),
+            tokenBalance(recipient, OUTPUT_MINT, 10),
+          ],
+        });
+        return {
+          ...tx,
+          slot,
+          blockTime: slot * 10,
+          transaction: { ...tx.transaction, signatures: [signatureValue] },
+        };
+      });
+    },
+  };
+  let handlerAttempts = 0;
+  const durablyHandled = new Set<string>();
+  const poller = new RpcBackfillPoller(
+    connection as any,
+    async (event) => {
+      handlerAttempts += 1;
+      durablyHandled.add(`${event.txSig}:${event.kind}:${event.tokenMint}`);
+    },
+    store,
+  );
+
+  await assert.rejects((poller as any).pollWallet(target, {}), /checkpoint unavailable/);
+  assert.equal(current.lastProcessedSignature, "sig-100");
+  assert.equal(handlerAttempts, 2);
+  assert.equal(durablyHandled.size, 2);
+
+  await (poller as any).pollWallet(target, {});
+  assert.equal(current.lastProcessedSignature, "sig-102");
+  assert.equal(checkpointAttempts, 2);
+  assert.equal(handlerAttempts, 4);
+  assert.equal(durablyHandled.size, 2);
 });
 
 test("RPC poller decodes the activation head before advancing a new cursor", async () => {
@@ -939,6 +1156,7 @@ test("an existing durable cursor is never raised to a newer watch anchor", async
     updatedAt: null,
   };
   const advanced: string[] = [];
+  const parsed: string[] = [];
   const store: RpcCursorStore = {
     async load() {
       return { ...current };
@@ -973,6 +1191,7 @@ test("an existing durable cursor is never raised to a newer watch anchor", async
       return signatures;
     },
     async getParsedTransactions(requested: string[]) {
+      parsed.push(...requested);
       return requested.map((signatureValue) => ({
         slot: Number(signatureValue.slice(4)),
         blockTime: null,
@@ -994,14 +1213,15 @@ test("an existing durable cursor is never raised to a newer watch anchor", async
   };
   const poller = new RpcBackfillPoller(connection as any, async () => {}, store);
   await (poller as any).pollWallet(target, { anchorSlot: 300 });
-  assert.deepEqual(advanced, ["sig-101", "sig-200"]);
+  assert.deepEqual(parsed, ["sig-101", "sig-200"]);
+  assert.deepEqual(advanced, ["sig-200"]);
 });
 
 test("custody rewinds an existing wallet cursor for a newly discovered earlier mint anchor", async () => {
   let current: RpcWalletCursor = {
     userId: "user-1",
     wallet: target,
-    startSlot: 100,
+    startSlot: 180,
     lastProcessedSignature: "sig-200",
     lastProcessedSlot: 200,
     lastBlockTime: 2_000,
@@ -1013,6 +1233,7 @@ test("custody rewinds an existing wallet cursor for a newly discovered earlier m
   };
   let rewinds = 0;
   const advanced: string[] = [];
+  const parsed: string[] = [];
   const store: RpcCursorStore = {
     async load() {
       return { ...current };
@@ -1024,6 +1245,7 @@ test("custody rewinds an existing wallet cursor for a newly discovered earlier m
       rewinds += 1;
       current = {
         ...current,
+        startSlot: anchorSlot,
         lastProcessedSignature: null,
         lastProcessedSlot: anchorSlot,
         lastBlockTime: null,
@@ -1059,6 +1281,7 @@ test("custody rewinds an existing wallet cursor for a newly discovered earlier m
       return signatures;
     },
     async getParsedTransactions(requested: string[]) {
+      parsed.push(...requested);
       return requested.map((signatureValue) => ({
         slot: Number(signatureValue.slice(4)),
         blockTime: null,
@@ -1081,9 +1304,84 @@ test("custody rewinds an existing wallet cursor for a newly discovered earlier m
   const poller = new RpcBackfillPoller(connection as any, async () => {}, store, 1_200, true, {
     allowEarlierAnchorRewind: true,
   });
-  await (poller as any).pollWallet(target, { anchorSlot: 150 });
+  poller.watch(target);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  poller.watch(target, { anchorSlot: 150 });
+  const recoveredWatch = (poller as any).watched.get(target);
+  assert.equal(recoveredWatch.anchorSlot, 150);
+  await (poller as any).pollWallet(target, recoveredWatch);
   assert.equal(rewinds, 1);
-  assert.deepEqual(advanced, ["sig-150", "sig-175", "sig-200"]);
+  assert.deepEqual(parsed, ["sig-150", "sig-175", "sig-200"]);
+  assert.deepEqual(advanced, ["sig-200"]);
+
+  await (poller as any).pollWallet(target, { anchorSlot: 150 });
+  const restartedPoller = new RpcBackfillPoller(
+    connection as any,
+    async () => {},
+    store,
+    1_200,
+    true,
+    { allowEarlierAnchorRewind: true },
+  );
+  await (restartedPoller as any).pollWallet(target, { anchorSlot: 150 });
+  assert.equal(rewinds, 1);
+  assert.deepEqual(parsed, ["sig-150", "sig-175", "sig-200"]);
+  assert.deepEqual(advanced, ["sig-200"]);
+});
+
+test("custody never rewinds an anchor already covered by the durable start slot", async () => {
+  const current: RpcWalletCursor = {
+    userId: "user-1",
+    wallet: target,
+    startSlot: 100,
+    lastProcessedSignature: "sig-200",
+    lastProcessedSlot: 200,
+    lastBlockTime: 2_000,
+    backlogDetected: false,
+    lastSuccessAt: null,
+    lastError: null,
+    createdAt: null,
+    updatedAt: null,
+  };
+  let rewinds = 0;
+  const store: RpcCursorStore = {
+    async load() {
+      return { ...current };
+    },
+    async ensure() {
+      return { ...current };
+    },
+    async rewind() {
+      rewinds += 1;
+      return { ...current };
+    },
+    async advance() {
+      return { ...current };
+    },
+    async markBacklog() {
+      return { ...current, backlogDetected: true };
+    },
+    async markSuccess() {
+      return { ...current };
+    },
+  };
+  const connection = {
+    async getSignaturesForAddress() {
+      return [{ signature: "sig-200", slot: 200, err: null, memo: null, blockTime: 2_000 }];
+    },
+    async getParsedTransactions() {
+      return [];
+    },
+  };
+  const poller = new RpcBackfillPoller(connection as any, async () => {}, store, 1_200, true, {
+    allowEarlierAnchorRewind: true,
+  });
+
+  poller.watch(target, { anchorSlot: 150 });
+  await (poller as any).pollWallet(target, { anchorSlot: 150 });
+  poller.watch(target, { anchorSlot: 150 });
+  await (poller as any).pollWallet(target, { anchorSlot: 150 });
+  assert.equal(rewinds, 0);
 });
 
 test("RPC health is fail-closed while hydrating and restores a durable backlog", async () => {
@@ -1135,4 +1433,283 @@ test("RPC health is fail-closed while hydrating and restores a durable backlog",
 
   poller.unwatch(target);
   assert.equal(poller.health().backlogWalletCount, 0);
+});
+
+test("startup cursor hydration uses one bulk store pass for the whole watch set", async () => {
+  const secondWallet = Keypair.generate().publicKey.toBase58();
+  const wallets = [target, secondWallet];
+  let singleLoads = 0;
+  let bulkLoads = 0;
+  const store: RpcCursorStore = {
+    async load() {
+      singleLoads += 1;
+      throw new Error("single cursor load should not run");
+    },
+    async loadMany(requested) {
+      bulkLoads += 1;
+      assert.deepEqual(requested, wallets);
+      return new Map(requested.map((wallet) => [wallet, testCursor(wallet)]));
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    deferInitialCursorHydration: true,
+  });
+
+  wallets.forEach((wallet) => poller.watch(wallet));
+  assert.equal(poller.health().cursorHydrationPendingCount, 2);
+  await poller.hydrateWatchedCursors();
+
+  assert.equal(bulkLoads, 1);
+  assert.equal(singleLoads, 0);
+  assert.equal(poller.health().cursorHydrationPendingCount, 0);
+  assert.equal(poller.health().backlogWalletCount, 0);
+});
+
+test("a slow wallet lane does not block another wallet or overlap itself", async () => {
+  const slowWallet = Keypair.generate().publicKey.toBase58();
+  const fastWallet = Keypair.generate().publicKey.toBase58();
+  let releaseSlow!: () => void;
+  const slowGate = new Promise<void>((resolve) => {
+    releaseSlow = resolve;
+  });
+  let slowCalls = 0;
+  let fastCalls = 0;
+  let activeSlow = 0;
+  let maximumActiveSlow = 0;
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet);
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 2,
+    maxWalletsPerPoll: 1,
+    deferInitialCursorHydration: true,
+  });
+  (poller as any).pollWallet = async (wallet: string) => {
+    if (wallet === slowWallet) {
+      slowCalls += 1;
+      activeSlow += 1;
+      maximumActiveSlow = Math.max(maximumActiveSlow, activeSlow);
+      await slowGate;
+      activeSlow -= 1;
+      return;
+    }
+    fastCalls += 1;
+  };
+  poller.watch(slowWallet);
+  poller.watch(fastWallet);
+
+  await (poller as any).poll();
+  assert.equal(slowCalls, 1);
+  assert.equal(poller.health().inFlightWalletCount, 1);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(fastCalls, 1);
+  assert.equal(slowCalls, 1);
+
+  await (poller as any).poll();
+  await (poller as any).poll();
+  assert.equal(slowCalls, 1);
+  assert.equal(maximumActiveSlow, 1);
+
+  releaseSlow();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(activeSlow, 0);
+  assert.equal(poller.health().inFlightWalletCount, 0);
+});
+
+test("historical recovery cannot consume the lane reserved for current wallets", async () => {
+  const recoveryOne = Keypair.generate().publicKey.toBase58();
+  const recoveryTwo = Keypair.generate().publicKey.toBase58();
+  const currentWallet = Keypair.generate().publicKey.toBase58();
+  let releaseRecovery!: () => void;
+  const recoveryGate = new Promise<void>((resolve) => {
+    releaseRecovery = resolve;
+  });
+  const started: string[] = [];
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet);
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 2,
+    recoveryConcurrency: 1,
+    maxWalletsPerPoll: 2,
+    deferInitialCursorHydration: true,
+  });
+  (poller as any).pollWallet = async (wallet: string) => {
+    started.push(wallet);
+    if (wallet !== currentWallet) await recoveryGate;
+  };
+  poller.watch(recoveryOne);
+  poller.watch(recoveryTwo);
+  poller.watch(currentWallet);
+  (poller as any).cursorHydrationPending.clear();
+  (poller as any).backlogWallets.add(recoveryOne);
+  (poller as any).backlogWallets.add(recoveryTwo);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(new Set(started), new Set([recoveryOne, currentWallet]));
+  assert.equal((poller as any).walletLaneInFlight.get(recoveryOne), "recovery");
+  assert.equal((poller as any).walletLaneInFlight.has(recoveryTwo), false);
+
+  releaseRecovery();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+});
+
+test("recovery lanes rotate instead of relaunching the first deep wallet", async () => {
+  const recoveryWallets = Array.from({ length: 3 }, () => Keypair.generate().publicKey.toBase58());
+  const started: string[] = [];
+  let releaseTurn: (() => void) | undefined;
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet);
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 2,
+    recoveryConcurrency: 1,
+    maxWalletsPerPoll: 2,
+    deferInitialCursorHydration: true,
+  });
+  (poller as any).pollWallet = async (wallet: string) => {
+    started.push(wallet);
+    await new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+  };
+  for (const wallet of recoveryWallets) {
+    poller.watch(wallet);
+    (poller as any).backlogWallets.add(wallet);
+  }
+  (poller as any).cursorHydrationPending.clear();
+
+  for (let turn = 0; turn < recoveryWallets.length; turn += 1) {
+    await (poller as any).poll();
+    assert.equal(started.length, turn + 1);
+    // Exercise a timer turn while the sole recovery lane is saturated. It must
+    // not reset the round-robin position back to the first wallet.
+    await (poller as any).poll();
+    assert.equal(started.length, turn + 1);
+    releaseTurn?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  assert.deepEqual(started, recoveryWallets);
+});
+
+test("a failing wallet backs off independently while healthy wallets keep polling", async () => {
+  const failingWallet = Keypair.generate().publicKey.toBase58();
+  const healthyWallet = Keypair.generate().publicKey.toBase58();
+  let failingCalls = 0;
+  let healthyCalls = 0;
+  let backlogMarks = 0;
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet);
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      backlogMarks += 1;
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 2,
+    maxWalletsPerPoll: 2,
+    deferInitialCursorHydration: true,
+  });
+  (poller as any).pollWallet = async (wallet: string) => {
+    if (wallet === failingWallet) {
+      failingCalls += 1;
+      throw new Error("provider unavailable");
+    }
+    healthyCalls += 1;
+  };
+  poller.watch(failingWallet);
+  poller.watch(healthyWallet);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const firstRetryAt = (poller as any).walletRetryAt.get(failingWallet) as number;
+  assert.equal(failingCalls, 1);
+  assert.equal(healthyCalls, 1);
+  assert.equal(backlogMarks, 1);
+  assert.ok(firstRetryAt > Date.now());
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(failingCalls, 1);
+  assert.equal(healthyCalls, 2);
+
+  (poller as any).walletRetryAt.set(failingWallet, Date.now() - 1);
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const secondRetryAt = (poller as any).walletRetryAt.get(failingWallet) as number;
+  assert.equal(failingCalls, 2);
+  assert.equal(healthyCalls, 3);
+  assert.equal(backlogMarks, 1);
+  assert.ok(secondRetryAt > firstRetryAt);
+  assert.equal(poller.health().failures, 2);
+  assert.equal(poller.health().inFlightWalletCount, 0);
 });

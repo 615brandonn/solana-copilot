@@ -384,5 +384,17 @@ export function createSupabaseCustodyStore(client: SupabaseClient, userId: strin
       }
       return parseCustodyPendingReplayResult(data);
     },
+
+    async backfillMissingJourneys(targetWallets: string[]): Promise<number> {
+      if (targetWallets.length === 0) return 0;
+      const { data, error } = await client.rpc("backfill_missing_custody_journeys", {
+        p_user_id: userId,
+        p_target_wallets: targetWallets,
+      });
+      if (error) {
+        throw new Error(`custody backfill failed: ${safeDiagnostic(error)}`);
+      }
+      return Array.isArray(data) ? data.length : 0;
+    },
   };
 }

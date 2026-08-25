@@ -142,6 +142,43 @@ custody; the dashboard reports that boundary instead of inventing an off-chain
 sale. Wallet/entity names are confirmed only from explicit evidence or a user
 label. Behavioral guesses are shown as candidates.
 
+## Revival Campaign observer
+
+Revival Campaign is a second independent, observation-only service for the
+“old coin revival” thesis. A first verified target buy seeds evidence but can
+never authorize a transaction. New campaigns are admitted only when the
+point-in-time market cap is inclusively between $2,000 and $15,000. Once
+admitted, they remain sampled above $15,000 so ignition, MFE/MAE, distribution,
+and the eventual price-proxy outcome are not truncated.
+
+Run `supabase/revival-campaign-migration.sql`, build the worker, and start the
+collector separately:
+
+```bash
+cd worker
+npm run build
+pm2 start dist/revival-index.js --name helix-revival-v1
+pm2 save
+```
+
+The migration installs the toggle OFF. Enable **Revival Campaign Tracker** in
+Settings when you are ready to collect. It is independent of Entries,
+Conviction, Coordinated mode, Custody Journey, positions, and exits. Its own
+`revival_rpc_wallet_cursors` and `revival_worker_heartbeat` tables isolate
+catch-up and health from trading. Confirmed target swaps and 30-second market
+snapshots are persisted with both event time and availability time; recovered
+history cannot manufacture a fresh paper decision.
+
+DexScreener pair age, liquidity, volume, and transaction activity are stored
+as dormancy evidence. Pair age is not treated as token creation date, and no
+historical ATH is invented when a causal history source is unavailable. All
+recommendations are CHECK-constrained to non-executable `shadow` rows.
+
+This observer is separate from the older `REVIVAL_ONLY_MODE` environment
+flag in the trading worker. That legacy flag can authorize real entries and is
+not controlled by the dashboard tracker toggle. Keep it OFF during the
+collection-only week.
+
 ## Security
 
 - Funding private keys are AES-256-GCM encrypted by the dashboard server
@@ -157,5 +194,7 @@ label. Behavioral guesses are shown as candidates.
 - Systemd unit or `pm2 start dist/index.js --name helix-worker-v3`.
 - Optional observation-only custody service:
   `pm2 start dist/custody-index.js --name helix-custody-v1` after its migration.
+- Optional observation-only Revival service:
+  `pm2 start dist/revival-index.js --name helix-revival-v1` after its migration.
 - Log to stdout, pipe to Vector/Grafana Loki if you want history.
 - Restart policy: always. Durable confirmed-RPC cursors resume after restart.

@@ -1459,6 +1459,203 @@ async function main() {
       log.error({ err: safeDiagnostic(err) }, "fan-out abandonment loop failed"),
     );
   }, 60_000);
+
+  // Activity-based rebalance: every hour, scan open positions and exit any
+  // where the target's buy activity in the last N hours is below the configured
+  // thresholds. This keeps the portfolio rotating toward coins the target is
+  // actively accumulating and clears out seeds he has abandoned or probed only.
+  async function checkActivityRebalance() {
+    if (!cfg.activity_rebalance_enabled) return;
+
+    const windowHours = Number(cfg.activity_rebalance_window_hours ?? 48);
+    const minUsd = Number(cfg.activity_rebalance_min_usd ?? 50);
+    const minBuys = Number(cfg.activity_rebalance_min_buys ?? 3);
+    if (!Number.isFinite(windowHours) || windowHours <= 0) return;
+    if (!Number.isFinite(minUsd) || !Number.isFinite(minBuys)) return;
+
+    // Only consider positions that are at least as old as the window, so a
+    // brand-new entry isn't immediately evicted before the target has had time
+    // to act on it.
+    const windowMs = windowHours * 60 * 60 * 1000;
+    const windowStart = new Date(Date.now() - windowMs).toISOString();
+    const oldEnoughCutoff = new Date(Date.now() - windowMs).toISOString();
+
+    const { data: openPositions, error: posErr } = await db
+      .from("positions")
+      .select("id,token_mint,amount_remaining,decimals,opened_at")
+      .is("closed_at", null)
+      .lt("opened_at", oldEnoughCutoff)
+      .gt("amount_remaining", 0);
+    if (posErr || !openPositions || openPositions.length === 0) return;
+
+    for (const pos of openPositions as Array<{
+      id: string;
+      token_mint: string;
+      amount_remaining: string;
+      decimals: string | null;
+      opened_at: string;
+    }>) {
+      // Count the target's buy activity on this token in the window.
+      const { data: activity, error: actErr } = await db
+        .from("strategy_observations")
+        .select("amount_usd")
+        .eq("token_mint", pos.token_mint)
+        .eq("side", "buy")
+        .eq("event_kind", "swap")
+        .gte("event_at", windowStart);
+
+      if (actErr) {
+        log.warn(
+          { err: safeDiagnostic(actErr), mint: pos.token_mint },
+          "activity rebalance: failed to query target activity",
+        );
+        continue;
+      }
+
+      const rows = (activity ?? []) as Array<{ amount_usd: string | number | null }>;
+      const buyCount = rows.length;
+      const totalUsd = rows.reduce((sum, r) => sum + Number(r.amount_usd ?? 0), 0);
+
+      // Keep the position if the target is buying enough.
+      if (buyCount >= minBuys || totalUsd >= minUsd) continue;
+
+      log.warn(
+        {
+          positionId: pos.id,
+          mint: pos.token_mint,
+          buyCount,
+          totalUsd: totalUsd.toFixed(2),
+          windowHours,
+          minUsd,
+          minBuys,
+        },
+        "activity rebalance: target has gone cold — exiting position",
+      );
+
+      await executeClaimedPercentageExit(
+        pos.id,
+        pos.token_mint,
+        Number(pos.amount_remaining),
+        Number(pos.decimals ?? 0),
+        100,
+        "target_inactivity",
+        undefined,
+        `activity rebalance: target ${buyCount} buys / $${totalUsd.toFixed(0)} in last ${windowHours}h (min: ${minBuys} buys / $${minUsd})`,
+        {
+          ...periodicSellIdentity(pos.id, "target_inactivity", "activity_rebalance"),
+          markCoordinatedExit: true,
+        },
+      );
+    }
+  }
+  setInterval(() => {
+    checkActivityRebalance().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "activity rebalance loop failed"),
+    );
+  }, 60 * 60 * 1000); // run every hour
+
+  // Probe-only exit: scan every hour for positions where the target has NEVER
+  // placed a buy above the seed threshold (meaning he only probed, never
+  // committed) AND has gone quiet for probe_exit_quiet_days. Positions where
+  // the target has escalated even once are unconditionally kept — they represent
+  // committed capital and may simply be in a quiet accumulation phase (e.g.
+  // BeGY8K: seeded Jul 28, quiet 2 weeks, then $97K in a day on Aug 19).
+  async function checkProbeOnlyExits() {
+    if (!cfg.probe_exit_enabled) return;
+
+    const seedMaxUsd = Number(cfg.probe_exit_seed_max_usd ?? 30);
+    const quietDays = Number(cfg.probe_exit_quiet_days ?? 7);
+    const minAgeDays = Number(cfg.probe_exit_min_age_days ?? 2);
+    if (!Number.isFinite(seedMaxUsd) || !Number.isFinite(quietDays) || !Number.isFinite(minAgeDays))
+      return;
+
+    const minAgeCutoff = new Date(Date.now() - minAgeDays * 86_400_000).toISOString();
+    const quietCutoff = new Date(Date.now() - quietDays * 86_400_000).toISOString();
+
+    const { data: openPositions, error: posErr } = await db
+      .from("positions")
+      .select("id,token_mint,amount_remaining,decimals,opened_at")
+      .is("closed_at", null)
+      .lt("opened_at", minAgeCutoff)
+      .gt("amount_remaining", 0);
+    if (posErr || !openPositions || openPositions.length === 0) return;
+
+    for (const pos of openPositions as Array<{
+      id: string;
+      token_mint: string;
+      amount_remaining: string;
+      decimals: string | null;
+      opened_at: string;
+    }>) {
+      // If the target has ever placed a buy above the seed threshold on this
+      // token, he escalated — keep the position no matter how quiet he is now.
+      const { data: escalated, error: escErr } = await db
+        .from("strategy_observations")
+        .select("id")
+        .eq("token_mint", pos.token_mint)
+        .eq("side", "buy")
+        .eq("event_kind", "swap")
+        .gt("amount_usd", seedMaxUsd)
+        .limit(1);
+      if (escErr) {
+        log.warn(
+          { err: safeDiagnostic(escErr), mint: pos.token_mint },
+          "probe exit: failed to query escalation history",
+        );
+        continue;
+      }
+      if (escalated && escalated.length > 0) continue; // escalated → keep
+
+      // No escalation ever. Check if he's been quiet for quietDays.
+      const { data: recentBuys, error: recentErr } = await db
+        .from("strategy_observations")
+        .select("id")
+        .eq("token_mint", pos.token_mint)
+        .eq("side", "buy")
+        .eq("event_kind", "swap")
+        .gte("event_at", quietCutoff)
+        .limit(1);
+      if (recentErr) {
+        log.warn(
+          { err: safeDiagnostic(recentErr), mint: pos.token_mint },
+          "probe exit: failed to query recent activity",
+        );
+        continue;
+      }
+      if (recentBuys && recentBuys.length > 0) continue; // still buying → keep
+
+      // Pure probe, never escalated, gone quiet for quietDays → exit.
+      log.warn(
+        {
+          positionId: pos.id,
+          mint: pos.token_mint,
+          seedMaxUsd,
+          quietDays,
+        },
+        "probe exit: target never escalated and has gone quiet — exiting probe position",
+      );
+      await executeClaimedPercentageExit(
+        pos.id,
+        pos.token_mint,
+        Number(pos.amount_remaining),
+        Number(pos.decimals ?? 0),
+        100,
+        "target_inactivity",
+        undefined,
+        `probe exit: target never exceeded $${seedMaxUsd}/buy and no buys in last ${quietDays}d`,
+        {
+          ...periodicSellIdentity(pos.id, "target_inactivity", "probe_exit"),
+          markCoordinatedExit: true,
+        },
+      );
+    }
+  }
+  setInterval(() => {
+    checkProbeOnlyExits().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "probe-only exit loop failed"),
+    );
+  }, 60 * 60 * 1000); // run every hour
+
   setInterval(() => {
     checkConfiguredPositionExits().catch((err) =>
       log.error({ err: safeDiagnostic(err) }, "configured position exit loop failed"),
@@ -1466,6 +1663,9 @@ async function main() {
   }, 30_000);
 
   const positionPeakPrice = new Map<string, number>();
+  // Per-position price history for sustained-decline (price reversal) exit.
+  // Stores the last 20 price readings (~10 minutes at 30s poll cadence).
+  const positionPriceHistory = new Map<string, number[]>();
   // Per-position price-tick sanity state, so one corrupted feed tick can never
   // by itself trigger a take-profit, trailing stop, or stop-loss.
   const positionPriceSanity = new Map<string, PriceSanityState>();
@@ -1475,7 +1675,8 @@ async function main() {
       !cfg.take_profit_enabled &&
       !cfg.stop_loss_enabled &&
       cfg.trailing_stop_enabled !== true &&
-      cfg.mirror_custody_sell_exit_enabled !== true
+      cfg.mirror_custody_sell_exit_enabled !== true &&
+      cfg.price_reversal_exit_enabled !== true
     )
       return;
     const { data: positions } = await db
@@ -1495,7 +1696,9 @@ async function main() {
     for (const id of positionPriceSanity.keys()) {
       if (!openIds.has(id)) positionPriceSanity.delete(id);
     }
-
+    for (const id of positionPriceHistory.keys()) {
+      if (!openIds.has(id)) positionPriceHistory.delete(id);
+    }
 
     let mirrorSoldAt: Map<string, string> | null = null;
     if (cfg.mirror_custody_sell_exit_enabled === true && (positions?.length ?? 0) > 0) {
@@ -1503,7 +1706,7 @@ async function main() {
       const { data: soldRows } = await db
         .from("custody_sell_watch")
         .select("token_mint,sold_detected_at")
-        .eq("status", "sold")
+        .in("status", ["sold", "sold_pending"])
         .in("token_mint", openMints);
       mirrorSoldAt = new Map<string, string>();
       for (const s of soldRows ?? []) {
@@ -1583,6 +1786,45 @@ async function main() {
       const prevPeak = positionPeakPrice.get(pos.id) ?? price;
       const peak = price > prevPeak ? price : prevPeak;
       positionPeakPrice.set(pos.id, peak);
+
+      // Price reversal exit: detect sustained decline from peak (shake-out
+      // resistant because a V-shape bounce resets the consecutive counter).
+      const priceHistory = positionPriceHistory.get(pos.id) ?? [];
+      priceHistory.push(price);
+      if (priceHistory.length > 20) priceHistory.shift();
+      positionPriceHistory.set(pos.id, priceHistory);
+      if (cfg.price_reversal_exit_enabled === true && peak > 0) {
+        const confirmCount = Math.max(2, Math.round(Number(cfg.price_reversal_confirm_count ?? 5)));
+        const dropPct = Math.abs(Number(cfg.price_reversal_peak_drop_pct ?? 12));
+        if (priceHistory.length >= confirmCount) {
+          const threshold = peak * (1 - dropPct / 100);
+          const recentReadings = priceHistory.slice(-confirmCount);
+          const allBelowThreshold = recentReadings.every((p) => p < threshold);
+          const stillDeclining = price <= recentReadings[0];
+          if (allBelowThreshold && stillDeclining) {
+            const dropFromPeakPct = ((peak - price) / peak) * 100;
+            log.info(
+              { positionId: pos.id, tokenMint: pos.token_mint, dropFromPeakPct: dropFromPeakPct.toFixed(1), confirmCount, peakPrice: peak },
+              "price-reversal exit triggered — sustained decline from peak",
+            );
+            await executeClaimedPercentageExit(
+              pos.id,
+              pos.token_mint,
+              remaining,
+              Number(pos.decimals ?? 0),
+              Math.abs(Number(cfg.price_reversal_exit_pct ?? 100)) || 100,
+              "price_reversal",
+              undefined,
+              `price-reversal ${dropFromPeakPct.toFixed(1)}% off peak (${confirmCount} consecutive readings)`,
+              periodicSellIdentity(pos.id, "price_reversal"),
+            );
+            positionPeakPrice.delete(pos.id);
+            positionPriceHistory.delete(pos.id);
+            continue;
+          }
+        }
+      }
+
       if (cfg.trailing_stop_enabled === true) {
         const peakGainPct = ((peak - entry) / entry) * 100;
         const dropFromPeakPct = peak > 0 ? ((peak - price) / peak) * 100 : 0;
@@ -3624,6 +3866,57 @@ async function main() {
       return;
     }
 
+    // Reshuffle guard: if other active follower wallets for this position still hold
+    // significantly more than the amount that just went terminal, the source wallet
+    // likely moved tokens internally (Alien reshuffling his custody cluster), not a
+    // real exit. A single wallet going to zero while 14 others hold is the textbook
+    // false-positive we saw on Wikicat at 05:04 UTC 2026-08-20.
+    //
+    // We only fire when siblingTotal <= RESHUFFLE_RATIO * terminalAmount, meaning
+    // the amount that went dark is at least ~25% of what other wallets still hold.
+    // Real exits that empty most wallets simultaneously will pass this gate, and
+    // the mirror_custody_sell supply-decline path covers gradual one-by-one exits.
+    const RESHUFFLE_RATIO = 4; // fire only when terminalAmount ≥ 20% of sibling total
+    if (state.terminalAmount > 0 && state.sourceTriggerEligible) {
+      const { data: siblingRows, error: siblingError } = await db
+        .from("follower_wallets")
+        .select("current_amount")
+        .eq("position_id", ctx.positionId)
+        .is("released_at", null)
+        .gt("current_amount", 0)
+        .neq("wallet", ev.from);
+      if (siblingError) {
+        log.warn(
+          { positionId: ctx.positionId, err: safeDiagnostic(siblingError) },
+          "reshuffle guard sibling query failed — proceeding with terminal exit",
+        );
+      } else {
+        const siblingTotal = (siblingRows ?? []).reduce(
+          (sum, w) => sum + Math.max(0, Number(w.current_amount) || 0),
+          0,
+        );
+        if (siblingTotal > state.terminalAmount * RESHUFFLE_RATIO) {
+          log.warn(
+            {
+              positionId: ctx.positionId,
+              wallet: ev.from,
+              terminalAmount: state.terminalAmount,
+              siblingTotal,
+              siblingCount: (siblingRows ?? []).length,
+            },
+            "terminal_outflow suppressed: sibling wallets hold substantially more — likely reshuffle",
+          );
+          recordStrategyDecision(
+            ev,
+            "tracked",
+            `terminal_outflow suppressed: ${(siblingRows ?? []).length} sibling wallets hold ${siblingTotal.toFixed(0)} tokens vs ${state.terminalAmount.toFixed(0)} terminal`,
+            { position_id: ctx.positionId },
+          );
+          return;
+        }
+      }
+    }
+
     const { data: pos, error } = await db
       .from("positions")
       .select("id,token_mint,amount_remaining,decimals,entry_slot")
@@ -4157,6 +4450,41 @@ async function main() {
     if (priorError)
       throw new Error(`traded-token lookup failed: ${safeDiagnostic(priorError.message)}`);
 
+    if (env.REVIVAL_ONLY_MODE) {
+
+      const minBuy = Number(cfg.min_target_buy_usd);
+
+      if (minBuy > 0) {
+
+        if (options.targetBuyUsd === undefined) {
+
+          recordStrategyDecision(event, "filtered", "revival: target buy size unavailable");
+
+          return null;
+
+        }
+
+        if (options.targetBuyUsd < minBuy) {
+
+          recordStrategyDecision(event, "filtered", "revival: target buy $" + options.targetBuyUsd.toFixed(2) + " < min $" + minBuy);
+
+          return null;
+
+        }
+
+      }
+
+      if (cfg.require_socials && !(meta.socials.website || meta.socials.twitter || meta.socials.telegram)) {
+
+        recordStrategyDecision(event, "filtered", "revival: coin has no socials");
+
+        return null;
+
+      }
+
+    }
+
+
     const decision =
       options.entryMode === "coordinated"
         ? checkCoordinatedEntry(cfg, meta, Boolean(prior), event.timestampMs)
@@ -4245,6 +4573,40 @@ async function main() {
           "conviction gate: passed",
         );
       }
+      // Conviction-scaled position sizing for regular copy entries.
+      // Scales up the base buy size based on Alien's all-time total investment
+      // in this token, reflecting his tier of commitment. Gated on
+      // network_scaling_enabled so it can be toggled live from bot_config.
+      // Tier 1 ($50K+) → 3x | Tier 2 ($10K-$50K) → 2x | Tier 3 ($1K-$10K) → 1.5x | below → 1x
+      if (cfg.network_scaling_enabled && options.entryMode !== "coordinated") {
+        const { data: spendRows } = await db
+          .from("strategy_observations")
+          .select("amount_usd")
+          .eq("token_mint", event.tokenMint)
+          .eq("side", "buy")
+          .eq("event_kind", "swap");
+        const alienTotalUsd = (spendRows ?? []).reduce(
+          (s: number, r: { amount_usd: string | number | null }) => s + Number(r.amount_usd ?? 0),
+          0,
+        );
+        const mult =
+          alienTotalUsd >= 50_000 ? 3 :
+          alienTotalUsd >= 10_000 ? 2 :
+          alienTotalUsd >= 1_000  ? 1.5 : 1;
+        const scaledBuyUsd = buyUsd * mult;
+        log.info(
+          {
+            mint: event.tokenMint,
+            alienTotalUsd: Math.round(alienTotalUsd),
+            mult,
+            baseBuyUsd: Number(buyUsd.toFixed(2)),
+            scaledBuyUsd: Number(scaledBuyUsd.toFixed(2)),
+          },
+          "conviction scaling: buy size determined",
+        );
+        buyUsd = scaledBuyUsd;
+      }
+
       const amountLamports = Math.floor((buyUsd / solPrice) * 1e9);
       if (!cfg.enabled) {
         log.info(

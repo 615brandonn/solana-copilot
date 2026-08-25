@@ -109,6 +109,9 @@ function fakeStore() {
     async loadActiveWatches() {
       return [];
     },
+    async backfillMissingJourneys() {
+      return 0;
+    },
     async replayPending() {
       return {
         processedCount: 0,

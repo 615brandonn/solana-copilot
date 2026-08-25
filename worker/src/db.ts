@@ -50,6 +50,10 @@ export type BotConfigRow = {
   jito_tip_sol: number;
   fixed_buy_usd: number;
   custody_journey_enabled?: boolean;
+  /** Independent observation-only Revival campaign collector. */
+  revival_tracker_enabled?: boolean;
+  revival_market_cap_min_usd?: number;
+  revival_market_cap_max_usd?: number;
   conviction_mode_enabled?: boolean;
   conviction_trading_mode?: "shadow" | "live";
   conviction_rapid_follow_enabled?: boolean;
@@ -123,6 +127,10 @@ export type BotConfigRow = {
   trailing_stop_pct?: number;
   trailing_activation_pct?: number;
   mirror_custody_sell_exit_enabled?: boolean;
+  price_reversal_exit_enabled?: boolean;
+  price_reversal_peak_drop_pct?: number;
+  price_reversal_confirm_count?: number;
+  price_reversal_exit_pct?: number;
   mirror_custody_sell_exit_pct?: number;
   proportional_follower_sells: boolean;
   follower_seller_exit_enabled: boolean;
@@ -161,4 +169,23 @@ export type BotConfigRow = {
   price_sanity_max_entry_multiple?: number;
   price_sanity_max_tick_jump?: number;
   price_sanity_confirm_ticks?: number;
+  // Activity-based rebalance: exit positions where the target has gone cold
+  // (no meaningful buys in the observation window). Runs every hour, looks
+  // back activity_rebalance_window_hours. A position is exited when the target's
+  // total spend in that window is below activity_rebalance_min_usd AND the buy
+  // count is below activity_rebalance_min_buys. Positions younger than the
+  // window are never touched (they haven't had time to prove themselves).
+  activity_rebalance_enabled?: boolean;
+  activity_rebalance_window_hours?: number;   // default 48
+  activity_rebalance_min_usd?: number;        // default 50
+  activity_rebalance_min_buys?: number;       // default 3
+  // Probe-only exit: exit positions where the target NEVER escalated above seed
+  // buy size AND has gone quiet for probe_exit_quiet_days. Positions where the
+  // target has placed even one buy above probe_exit_seed_max_usd are kept
+  // indefinitely — they're committed capital, not probes. This correctly spares
+  // BeGY8K-style runners that the target accumulates slowly over weeks/months.
+  probe_exit_enabled?: boolean;
+  probe_exit_seed_max_usd?: number;    // single-buy threshold; above this = escalated (default $30)
+  probe_exit_quiet_days?: number;      // days of no buys before exiting a probe (default 7)
+  probe_exit_min_age_days?: number;    // min position age before evaluated (default 2)
 };
