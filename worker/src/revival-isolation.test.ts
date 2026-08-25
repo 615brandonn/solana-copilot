@@ -65,10 +65,17 @@ test("every persisted Revival recommendation is structurally shadow-only", () =>
 
 test("engine upgrades hydrate and watch only their own immutable projection generation", () => {
   const store = source("revival-supabase-store.ts");
-  assert.match(store, /strategy_version:revival_strategy_versions!inner\(algorithm_version\)/);
   assert.ok(
-    store.match(/\.eq\("strategy_version\.algorithm_version", REVIVAL_ENGINE_VERSION\)/g)!.length >=
-      2,
+    store.match(/\.eq\("algorithm_version", REVIVAL_ENGINE_VERSION\)/g)!.length >= 2,
+    "hydration and repair must resolve only the current engine's strategy versions",
+  );
+  assert.ok(
+    store.match(/\.eq\("strategy_version_id", strategyVersionId\)/g)!.length >= 2,
+    "event scans must remain pinned to those immutable strategy versions",
+  );
+  assert.doesNotMatch(
+    store,
+    /strategy_version:revival_strategy_versions!inner\(algorithm_version\)/,
   );
   assert.ok(store.match(/\.eq\("engine_version", REVIVAL_ENGINE_VERSION\)/g)!.length >= 3);
 });

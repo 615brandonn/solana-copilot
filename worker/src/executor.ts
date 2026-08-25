@@ -32,6 +32,7 @@ import {
   attributablePositiveBalanceDelta,
   confirmedTokenReceiptFromTx,
 } from "./execution-accounting.js";
+import { capExitRawAmount, exactRawAmount, readExactWalletTokenBalance } from "./exit-sizing.js";
 import {
   SubmissionUncertainError,
   SubmissionCancelledBeforeSendError,
@@ -64,11 +65,20 @@ export type ExecuteInput = {
   signerSecret: string; // base58 secret key of funding wallet
   inputMint: string; // e.g. So1111... for SOL
   outputMint: string;
-  amountLamports: number;
+  amountLamports: number | string | bigint;
   slippageBps: number;
   route: "jito" | "rpc";
   jitoTipSol: number;
   outputDecimals?: number; // needed to compute UI amount received (Jupiter v6 doesn't return this)
+  /** Required for exits so the executor can verify and cap the exact raw wallet balance. */
+  inputDecimals?: number;
+  /** Publishes the exact raw amount every exit route will build and submit. */
+  onInputAmountCapped?: (amount: {
+    requestedRaw: string;
+    liveBalanceRaw: string;
+    amountRaw: string;
+    decimals: number;
+  }) => void;
   /** Skip aggregators for a curve-proven Pump.fun entry. Exits never set this. */
   pumpFunDirectOnly?: boolean;
   /** Prefer Pump.fun for an exit, with alternate routes allowed only after a proven pre-submit failure. */
@@ -347,6 +357,51 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
     );
   }
   const signer = Keypair.fromSecretKey(decodedSecret);
+
+  if (input.outputMint === WSOL_MINT) {
+    const decimals = input.inputDecimals;
+    if (
+      typeof decimals !== "number" ||
+      !Number.isInteger(decimals) ||
+      decimals < 0 ||
+      decimals > 255
+    ) {
+      throw new Error("exit blocked: valid input token decimals are required");
+    }
+    const requestedRaw = exactRawAmount(input.amountLamports, "requested exit amount");
+    const liveBalanceRaw = await readExactWalletTokenBalance(
+      conn,
+      signer.publicKey,
+      new PublicKey(input.inputMint),
+      decimals,
+    );
+    // Never infer position ownership from the wallet's aggregate mint balance:
+    // unrelated/manual holdings may coexist in the same token account. Capping
+    // the requested position amount fixes unsafe round-up without sweeping
+    // tokens that were not attributed to this position.
+    const amountRaw = capExitRawAmount(requestedRaw, liveBalanceRaw);
+    if (amountRaw <= 0n) {
+      throw new Error("exit blocked: live wallet token balance has no executable raw amount");
+    }
+    input.onInputAmountCapped?.({
+      requestedRaw: requestedRaw.toString(),
+      liveBalanceRaw: liveBalanceRaw.toString(),
+      amountRaw: amountRaw.toString(),
+      decimals,
+    });
+    if (amountRaw !== requestedRaw) {
+      log.warn(
+        {
+          inputMint: input.inputMint,
+          requestedRaw: requestedRaw.toString(),
+          liveBalanceRaw: liveBalanceRaw.toString(),
+          amountRaw: amountRaw.toString(),
+        },
+        "exit amount capped to exact live wallet balance",
+      );
+    }
+    input = { ...input, amountLamports: amountRaw };
+  }
 
   if (input.pumpFunDirectOnly === true) {
     return executePumpFunSwap(input, signer, t0);

@@ -150,10 +150,11 @@ boundaries—not automatically labeled as sales—and inferred wallet identities
 are clearly shown as candidates unless confirmed or manually labeled.
 
 Revival Campaign is a separate SHADOW-only collector for low-cap target
-revivals. Apply `supabase/revival-campaign-migration.sql`, build the worker,
-and start `dist/revival-index.js` as its own PM2 process. The feature installs
-OFF and uses an inclusive $2,000–$15,000 market-cap gate only when a campaign
-is seeded. Admitted campaigns continue above $15,000, and no Revival module
+revivals. Apply `supabase/revival-campaign-migration.sql` and the additive
+`supabase/revival-hydration-index-migration.sql`, build the worker, and start
+`dist/revival-index.js` as its own PM2 process. The feature installs OFF and
+uses an inclusive $2,000–$15,000 market-cap gate only when a campaign is
+seeded. Admitted campaigns continue above $15,000, and no Revival module
 imports the executor, funding-key path, positions, trades, or claim ledgers.
 This collector does not control the older worker environment flag
 `REVIVAL_ONLY_MODE`, which is a separate money-moving entry route. Keep that

@@ -86,6 +86,28 @@ test("direct-first Pump.fun exits fall back only after a recoverable pre-submit 
   assert.match(executorSource, /pumpFunDirectFirst\?: boolean/);
 });
 
+test("every SOL exit resolves an exact live raw cap before any route is built", () => {
+  const swapStart = executorSource.indexOf("export async function executeSwap");
+  const swapEnd = executorSource.indexOf("function errorMessage", swapStart);
+  assert.ok(swapStart >= 0 && swapEnd > swapStart, "executeSwap router was not found");
+
+  const swapSource = executorSource.slice(swapStart, swapEnd);
+  const exitGateAt = swapSource.indexOf("if (input.outputMint === WSOL_MINT)");
+  const liveBalanceAt = swapSource.indexOf("await readExactWalletTokenBalance", exitGateAt);
+  const capAt = swapSource.indexOf("capExitRawAmount(", liveBalanceAt);
+  const exactAssignmentAt = swapSource.indexOf(
+    "input = { ...input, amountLamports: amountRaw }",
+    capAt,
+  );
+  const firstRouteAt = swapSource.indexOf("if (input.pumpFunDirectOnly === true)");
+  assert.ok(exitGateAt >= 0 && exitGateAt < liveBalanceAt);
+  assert.ok(liveBalanceAt < capAt && capAt < exactAssignmentAt);
+  assert.ok(exactAssignmentAt < firstRouteAt);
+  assert.match(swapSource, /input\.onInputAmountCapped\?\.\(\{/);
+  assert.match(executorSource, /amountLamports: number \| string \| bigint/);
+  assert.doesNotMatch(executorSource, /fullBalanceExit/);
+});
+
 test("raw RPC submission authorizes after serialization and before the network call", () => {
   const sendStart = executorSource.indexOf("async function sendRawViaRpc");
   const sendEnd = executorSource.indexOf("async function waitForLanding", sendStart);
