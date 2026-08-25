@@ -112,7 +112,11 @@ export function ConvictionSettingsCard({ cfg, onChange }: Props) {
             onCheckedChange={(value) =>
               onChange(
                 value
-                  ? { convictionModeEnabled: true, convictionTradingMode: "shadow" }
+                  ? {
+                      convictionModeEnabled: true,
+                      convictionTradingMode: "shadow",
+                      supplyAccumulationModeEnabled: false,
+                    }
                   : { convictionModeEnabled: false },
               )
             }

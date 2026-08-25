@@ -103,14 +103,53 @@ hypothetical tiers only. LIVE still requires global Entries to be on and all
 monitoring, classification, freshness, funding, exposure, and durable-claim
 safety gates to pass immediately before the shared executor is called.
 
+## Supply Accumulation entry
+
+With global Entries OFF, apply the current
+`supabase/custody-journey-migration.sql` and then
+`supabase/supply-accumulation-entry-migration.sql`. Run `npm test`,
+`npm run build`, and `npm run doctor` before restarting the worker. The migration
+is additive and leaves the strategy OFF. Enable Custody Journey before enabling
+this exclusive automatic entry route; it turns off the Conviction and Coordinated
+toggles.
+
+The strategy aggregates raw verified buys minus raw verified sells across all
+configured market-maker roots inside a 30–3,600 second rolling window. Its
+threshold is constrained to 10–20% of authoritative raw total supply, defaults
+to 10%, and cannot be lowered to the 3% test-buy range. The dedicated entry size
+defaults to $20. Current and estimated post-fill market cap must both remain
+strictly below the configured ceiling, which is capped at $15,000; missing or
+conflicting supply, attribution, Pump.fun, or valuation evidence blocks entry.
+
+`supply_accumulation_events` and `supply_accumulation_state` preserve raw integer
+evidence across restart and duplicate Geyser/RPC delivery. The service-only
+recorder quarantines an event-key payload conflict. A landed entry deliberately
+uses the standard position contract, so take-profit, stop-loss, trailing-stop,
+custody, target-sell, follower-sell, and inactivity exits remain unchanged.
+
+Custody Journey must be ON for every Supply Accumulation entry. The worker calls
+one service-only atomic database gate that requires a fresh, non-degraded
+heartbeat and RPC success, zero backlog, the exact reliable target buy on an
+active same-mint journey, positive live attribution, and no verified custody sell
+or unresolved outflow across any journey in the window. State keeps forwarded
+direct/private-program evidence sticky as `directSettlementSeen` for audit.
+
+The migration adds nullable recovery metadata to durable entry claims without
+rewriting existing rows. Supply execution records its strategy, source slot,
+token decimals, contributing wallets, original planned USD amount, prepared
+signature, and last valid block height before submission. Startup may
+automatically recover only the exact `supply_accumulation` claim; legacy or
+incomplete claims remain fail-closed for manual reconciliation.
+
 ## Custody Journey observer
 
 Custody Journey is an optional, observation-only service. It starts a durable
 journey after every verified configured-target buy, follows attributed token
 balances through split and merged wallet transfers, and closes attributed
 amounts only after a strictly verified on-chain sell. It does not read the
-funding key, submit transactions, change Entries, mutate positions, or feed the
-trading worker's safety gate.
+funding key, submit transactions, change Entries, or mutate positions. Its fresh
+health and custody evidence form a read-only gate only for Supply Accumulation;
+other entry strategies and every exit remain independent.
 
 For deterministic custody accounting, this service uses one ordered confirmed
 RPC timeline rather than the trading worker's processed Geyser hot path. It

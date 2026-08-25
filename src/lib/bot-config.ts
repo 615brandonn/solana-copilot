@@ -9,6 +9,19 @@ export type RevivalTrackerConfig = {
   revivalMarketCapMaxUsd: number;
 };
 
+export type SupplyAccumulationConfig = {
+  /** Exclusive automatic entry strategy based on verified rolling target supply accumulation. */
+  supplyAccumulationModeEnabled: boolean;
+  /** Minimum verified net share of total supply required for an entry signal. */
+  supplyAccumulationThresholdPct: number;
+  /** Dedicated USD size for a supply-accumulation entry. */
+  supplyAccumulationBuyUsd: number;
+  /** Strict live entry ceiling. Values above $15,000 are never accepted. */
+  supplyAccumulationMaxMarketCapUsd: number;
+  /** Rolling buy-minus-sell observation window. */
+  supplyAccumulationWindowSeconds: number;
+};
+
 export type ConvictionConfig = {
   convictionModeEnabled: boolean;
   convictionTradingMode: ConvictionTradingMode;
@@ -49,7 +62,8 @@ export type ConvictionConfig = {
 };
 
 export type BotConfig = ConvictionConfig &
-  RevivalTrackerConfig & {
+  RevivalTrackerConfig &
+  SupplyAccumulationConfig & {
     enabled: boolean;
     targetWallet: string;
     additionalTargetWallets: string[];
@@ -173,6 +187,11 @@ export const DEFAULT_CONFIG: BotConfig = {
   executionRoute: "jito",
   jitoTipSol: 0.001,
   fixedBuyUsd: 25,
+  supplyAccumulationModeEnabled: false,
+  supplyAccumulationThresholdPct: 10,
+  supplyAccumulationBuyUsd: 20,
+  supplyAccumulationMaxMarketCapUsd: 15_000,
+  supplyAccumulationWindowSeconds: 600,
   custodyJourneyEnabled: false,
   revivalTrackerEnabled: false,
   revivalMarketCapMinUsd: 2_000,

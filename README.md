@@ -86,14 +86,51 @@ before restarting the worker. Fresh installations can run `supabase/schema.sql`,
 which already contains the same schema. Applying the migration does not enable
 Conviction Mode or Entries.
 
+### Supply Accumulation Entry
+
+Supply Accumulation is an exclusive live entry strategy for verified Pump.fun
+activity across the primary and every additional configured market-maker root.
+Inside a configurable 30–3,600 second window, it adds raw verified buy amounts,
+subtracts raw verified sells, and compares the result with authoritative raw
+total supply. The threshold is restricted to 10–20% and defaults to 10%; a 3%
+cluster share can never authorize a buy. The dedicated buy size defaults to $20.
+
+Every entry requires reliable same-token supply and attribution evidence plus a
+strict current and estimated post-fill market cap below the configured ceiling,
+which can never exceed $15,000. Missing, conflicting, stale, or rounded evidence
+fails closed. Landed entries are standard positions, so all existing take-profit,
+stop-loss, trailing-stop, custody, target-sell, follower-sell, and inactivity
+exits remain authoritative.
+
+Custody Journey must be ON for every Supply Accumulation entry. One service-only
+atomic database gate requires a fresh, non-degraded observer and RPC success,
+zero backlog, the exact reliable target buy on an active same-mint journey,
+positive live attribution, and no verified custody sell or unresolved outflow
+across any journey in the accumulation window. Direct/private-program forwarding
+is surfaced as sticky `directSettlementSeen` audit evidence.
+
+Durable entry claims also carry nullable strategy, source-slot, token-decimal,
+contributing-wallet, planned-USD, and block-height recovery metadata. Existing
+claims are not backfilled. Only an exact `supply_accumulation` claim with its
+prepared signature, original USD basis, and expiry recorded before send is
+eligible for automatic crash recovery.
+
+Existing deployments must leave global Entries OFF, apply the current
+`supabase/custody-journey-migration.sql` first, then run the additive
+`supabase/supply-accumulation-entry-migration.sql`, deploy the matching worker,
+and pass `cd worker && npm run doctor`. The migration installs the strategy OFF;
+enable Custody Journey and then enable this strategy explicitly in Settings only
+after validation. Enabling it turns off the Conviction and Coordinated toggles.
+
 ### Optional Custody Journey observer
 
 Custody Journey runs as a separate observation-only VPS process. It starts on
 verified configured-target buys even when Entries is off, follows conservatively
 attributed balances across split and merged wallet transfers, records strict
 verified sells, and builds destination/journey leaderboards. It never imports
-the trade executor, reads the funding key, changes a position, or participates
-in the trading worker's health gate.
+the trade executor, reads the funding key, or changes a position. Its fresh
+health and custody evidence form a read-only gate only for Supply Accumulation;
+other entry strategies and every exit remain independent.
 
 The observer applies one ordered, confirmed-RPC timeline and keeps one active
 campaign per user and token mint. Later verified target buys extend that

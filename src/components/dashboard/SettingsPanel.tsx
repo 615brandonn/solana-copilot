@@ -8,6 +8,7 @@ import type { BotConfig } from "@/lib/bot-config";
 import { SectionCard, SettingRow } from "./SettingRow";
 import { ConvictionSettingsCard } from "./ConvictionSettingsCard";
 import { RevivalTrackerSettingsCard } from "./RevivalTrackerSettingsCard";
+import { SupplyAccumulationSettingsCard } from "./SupplyAccumulationSettingsCard";
 
 type Props = {
   cfg: BotConfig;
@@ -114,10 +115,15 @@ export function SettingsPanel({ cfg, onChange }: Props) {
       >
         <SettingRow
           label="Enable custody observation"
-          hint="Monitors verified target buys, downstream custody transfers, and verified sells. This does not enable Entries, place trades, or change any exit strategy."
+          hint={
+            cfg.supplyAccumulationModeEnabled
+              ? "Required by Supply Accumulation. Turn that strategy off before disabling custody observation."
+              : "Monitors verified target buys, downstream custody transfers, and verified sells. This does not enable Entries, place trades, or change any exit strategy."
+          }
         >
           <Switch
             checked={cfg.custodyJourneyEnabled}
+            disabled={cfg.supplyAccumulationModeEnabled}
             onCheckedChange={(value) => onChange({ custodyJourneyEnabled: value })}
             aria-label="Enable observation-only Custody Journey monitoring"
           />
@@ -151,13 +157,16 @@ export function SettingsPanel({ cfg, onChange }: Props) {
         </SettingRow>
         <div className="rounded-xl border border-border/70 bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
           Observation only · maximum 8 transfer hops · maximum 250 actively watched wallets per
-          journey. Entries and trading controls are independent.
+          journey. It never submits a trade; Supply Accumulation reads its fresh health and custody
+          proof as a safety gate.
         </div>
       </SectionCard>
 
       <ConvictionSettingsCard cfg={cfg} onChange={onChange} />
 
       <RevivalTrackerSettingsCard cfg={cfg} onChange={onChange} />
+
+      <SupplyAccumulationSettingsCard cfg={cfg} onChange={onChange} />
 
       <fieldset
         disabled={cfg.convictionModeEnabled}
@@ -175,7 +184,16 @@ export function SettingsPanel({ cfg, onChange }: Props) {
           >
             <Switch
               checked={cfg.coordinatedModeEnabled}
-              onCheckedChange={(v) => onChange({ coordinatedModeEnabled: v })}
+              onCheckedChange={(v) =>
+                onChange(
+                  v
+                    ? {
+                        coordinatedModeEnabled: true,
+                        supplyAccumulationModeEnabled: false,
+                      }
+                    : { coordinatedModeEnabled: false },
+                )
+              }
             />
           </SettingRow>
           {cfg.coordinatedModeEnabled && (
@@ -354,13 +372,23 @@ export function SettingsPanel({ cfg, onChange }: Props) {
       </fieldset>
 
       <fieldset
-        disabled={cfg.coordinatedModeEnabled || cfg.convictionModeEnabled}
+        disabled={
+          cfg.coordinatedModeEnabled ||
+          cfg.convictionModeEnabled ||
+          cfg.supplyAccumulationModeEnabled
+        }
         className={
-          cfg.coordinatedModeEnabled || cfg.convictionModeEnabled
+          cfg.coordinatedModeEnabled ||
+          cfg.convictionModeEnabled ||
+          cfg.supplyAccumulationModeEnabled
             ? "pointer-events-none space-y-6 opacity-45"
             : "space-y-6"
         }
-        aria-disabled={cfg.coordinatedModeEnabled || cfg.convictionModeEnabled}
+        aria-disabled={
+          cfg.coordinatedModeEnabled ||
+          cfg.convictionModeEnabled ||
+          cfg.supplyAccumulationModeEnabled
+        }
       >
         {/* Position sizing */}
         <SectionCard

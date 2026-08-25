@@ -49,6 +49,11 @@ export type BotConfigRow = {
   execution_route: "jito" | "rpc";
   jito_tip_sol: number;
   fixed_buy_usd: number;
+  supply_accumulation_mode_enabled?: boolean;
+  supply_accumulation_threshold_pct?: number;
+  supply_accumulation_buy_usd?: number;
+  supply_accumulation_max_market_cap_usd?: number;
+  supply_accumulation_window_seconds?: number;
   custody_journey_enabled?: boolean;
   /** Independent observation-only Revival campaign collector. */
   revival_tracker_enabled?: boolean;

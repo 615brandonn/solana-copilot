@@ -14,6 +14,11 @@ export const BotConfigSchema = z
     executionRoute: z.enum(["jito", "rpc"]),
     jitoTipSol: z.number().finite().min(0).max(1),
     fixedBuyUsd: z.number().finite().positive().max(1_000_000),
+    supplyAccumulationModeEnabled: z.boolean(),
+    supplyAccumulationThresholdPct: z.number().finite().min(10).max(20),
+    supplyAccumulationBuyUsd: z.number().finite().positive().max(1_000_000),
+    supplyAccumulationMaxMarketCapUsd: z.number().finite().positive().max(15_000),
+    supplyAccumulationWindowSeconds: z.number().int().min(30).max(3_600),
     custodyJourneyEnabled: z.boolean(),
     revivalTrackerEnabled: z.boolean(),
     revivalMarketCapMinUsd: z.number().finite().min(0).max(1_000_000_000),
@@ -181,6 +186,30 @@ export const BotConfigSchema = z
       });
     }
     const configuredTargetCount = (config.targetWallet ? 1 : 0) + normalized.length;
+    if (config.supplyAccumulationModeEnabled && configuredTargetCount === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Supply Accumulation requires at least one configured market-maker wallet",
+        path: ["supplyAccumulationModeEnabled"],
+      });
+    }
+    if (config.supplyAccumulationModeEnabled && !config.custodyJourneyEnabled) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Supply Accumulation requires Custody Journey to be enabled",
+        path: ["custodyJourneyEnabled"],
+      });
+    }
+    if (
+      config.supplyAccumulationModeEnabled &&
+      (config.convictionModeEnabled || config.coordinatedModeEnabled)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Supply Accumulation cannot run with Conviction or Coordinated mode",
+        path: ["supplyAccumulationModeEnabled"],
+      });
+    }
     if (config.convictionModeEnabled && configuredTargetCount !== 3) {
       ctx.addIssue({
         code: "custom",
