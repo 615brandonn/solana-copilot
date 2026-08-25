@@ -125,10 +125,12 @@ export type CustodyPendingEventRow = {
   requested_amount_tokens: number | string;
   payload: unknown;
   status: string;
+  queue_state?: "ready" | "dormant_scope" | "waiting_dependency" | "transient_retry" | "resolved";
   retry_count: number | string;
   next_retry_at: string;
   last_retry_at: string | null;
   last_error_code: string | null;
+  last_error_sqlstate?: string | null;
   journey_id: string | null;
   event_id: string | null;
   result: unknown;
@@ -139,6 +141,8 @@ export type CustodyPendingEventRow = {
 
 export type CustodyPendingEventCounts = {
   pending: number;
+  waiting: number;
+  dormant: number;
   expired: number;
   terminal: number;
 };
@@ -290,6 +294,8 @@ export type CustodyObserverHealth = {
   activeJourneyCount: number;
   lastEventAt: string | null;
   pendingEventCount: number;
+  waitingDependencyCount: number;
+  dormantEvidenceCount: number;
   expiredEventCount: number;
   terminalEventCount: number;
   hasObservationGap: boolean;
@@ -371,6 +377,8 @@ export function buildCustodyObserverHealth(
   pendingEvents: Partial<CustodyPendingEventCounts> = {},
 ): CustodyObserverHealth {
   const pendingEventCount = Math.max(0, Math.trunc(finiteNumber(pendingEvents.pending)));
+  const waitingDependencyCount = Math.max(0, Math.trunc(finiteNumber(pendingEvents.waiting)));
+  const dormantEvidenceCount = Math.max(0, Math.trunc(finiteNumber(pendingEvents.dormant)));
   const expiredEventCount = Math.max(0, Math.trunc(finiteNumber(pendingEvents.expired)));
   const terminalEventCount = Math.max(0, Math.trunc(finiteNumber(pendingEvents.terminal)));
   const hasObservationGap = expiredEventCount > 0 || terminalEventCount > 0;
@@ -393,6 +401,8 @@ export function buildCustodyObserverHealth(
       activeJourneyCount: 0,
       lastEventAt: null,
       pendingEventCount,
+      waitingDependencyCount,
+      dormantEvidenceCount,
       expiredEventCount,
       terminalEventCount,
       hasObservationGap,
@@ -438,6 +448,8 @@ export function buildCustodyObserverHealth(
     activeJourneyCount: Math.max(0, Math.trunc(finiteNumber(row.active_journey_count))),
     lastEventAt: cleanText(row.last_event_at),
     pendingEventCount,
+    waitingDependencyCount,
+    dormantEvidenceCount,
     expiredEventCount,
     terminalEventCount,
     hasObservationGap,

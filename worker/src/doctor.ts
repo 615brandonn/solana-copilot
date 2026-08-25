@@ -489,7 +489,7 @@ async function checkCustodyJourneySchema(cfg: BotConfigRow): Promise<boolean> {
     db
       .from("custody_pending_events")
       .select(
-        "id,user_id,event_key,event_type,request_fingerprint,token_mint,tx_sig,slot,event_at,source_wallet,requested_amount_tokens,payload,status,retry_count,next_retry_at,last_retry_at,last_error_code,journey_id,event_id,result,expires_at,created_at,updated_at",
+        "id,user_id,event_key,event_type,request_fingerprint,token_mint,tx_sig,slot,event_at,source_wallet,requested_amount_tokens,payload,status,queue_state,retry_count,next_retry_at,last_retry_at,last_error_code,last_error_sqlstate,journey_id,event_id,result,expires_at,created_at,updated_at",
       )
       .limit(1),
   ]);
@@ -497,7 +497,7 @@ async function checkCustodyJourneySchema(cfg: BotConfigRow): Promise<boolean> {
   if (schemaError) {
     fail(
       "Custody Journey schema",
-      `${safeDiagnostic(schemaError.message)} — run supabase/custody-journey-migration.sql`,
+      `${safeDiagnostic(schemaError.message)} — run supabase/custody-journey-migration.sql and supabase/custody-backlog-v2-migration.sql`,
     );
     return false;
   }
@@ -522,11 +522,29 @@ async function checkCustodyJourneySchema(cfg: BotConfigRow): Promise<boolean> {
       "/rpc/record_verified_custody_sell",
       "/rpc/record_custody_unresolved_outflow",
       "/rpc/replay_custody_pending_events",
+      "/rpc/custody_pending_queue_health",
     ].filter((path) => !paths[path]);
     if (!response.ok || missingRpc.length > 0) {
       fail("Custody Journey RPCs", {
         httpStatus: response.status,
         missingFunctionCount: missingRpc.length,
+      });
+      return false;
+    }
+
+    const { data: queueHealth, error: queueHealthError } = await db.rpc(
+      "custody_pending_queue_health",
+      { p_user_id: env.HELIX_USER_ID },
+    );
+    const health =
+      queueHealth && typeof queueHealth === "object" && !Array.isArray(queueHealth)
+        ? (queueHealth as Record<string, unknown>)
+        : null;
+    if (queueHealthError || Number(health?.schemaVersion) !== 2 || health?.indexesReady !== true) {
+      fail("Custody Journey backlog scheduler", {
+        schemaVersion: health ? Number(health.schemaVersion ?? 0) : 0,
+        indexesReady: health?.indexesReady === true,
+        hasError: Boolean(queueHealthError),
       });
       return false;
     }
@@ -538,7 +556,7 @@ async function checkCustodyJourneySchema(cfg: BotConfigRow): Promise<boolean> {
   pass(
     "Custody Journey schema",
     cfg.custody_journey_enabled
-      ? "observer enabled; isolated ledger, cursors, heartbeat, and replay-safe RPCs are ready"
+      ? "observer enabled; isolated ledger, cursors, heartbeat, and backlog scheduler v2 are ready"
       : "OFF — observation ledger is installed but no custody monitoring is enabled",
   );
   return true;
@@ -625,7 +643,6 @@ async function checkRevivalTrackerSchema(cfg: BotConfigRow): Promise<boolean> {
     );
     return false;
   }
-
   const heartbeat = await db
     .from("revival_worker_heartbeat")
     .select("updated_at,enabled,degraded,rpc_backlog_wallet_count,last_error_code")
@@ -656,7 +673,6 @@ async function checkRevivalTrackerSchema(cfg: BotConfigRow): Promise<boolean> {
       });
     }
   }
-
   pass(
     "Revival Campaign schema",
     cfg.revival_tracker_enabled

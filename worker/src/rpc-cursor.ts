@@ -31,6 +31,11 @@ export interface RpcWalletCursor {
  */
 export interface RpcCursorStore {
   load(wallet: string): Promise<RpcWalletCursor | null>;
+  /**
+   * Loads many durable cursors without issuing one database request per wallet.
+   * Large custody watch sets use this during startup to avoid a thundering herd.
+   */
+  loadMany?(wallets: readonly string[]): Promise<Map<string, RpcWalletCursor>>;
   ensure(wallet: string, anchorSlot?: number): Promise<RpcWalletCursor>;
   /**
    * Moves only the recovery floor backward. Used by the custody observer when
@@ -207,6 +212,43 @@ export function createSupabaseRpcCursorStore(
     return result.data == null ? null : mapCursorRow(result.data);
   };
 
+  const loadMany = async (
+    walletInputs: readonly string[],
+  ): Promise<Map<string, RpcWalletCursor>> => {
+    const wallets = Array.from(
+      new Set(walletInputs.map((wallet) => normalizeRequiredText(wallet, "wallet"))),
+    );
+    const loaded = new Map<string, RpcWalletCursor>();
+    const chunks: string[][] = [];
+    for (let offset = 0; offset < wallets.length; offset += 250) {
+      chunks.push(wallets.slice(offset, offset + 250));
+    }
+    // Four bounded queries at a time replaces thousands of simultaneous
+    // single-row cursor reads during a large custody restart.
+    for (let offset = 0; offset < chunks.length; offset += 4) {
+      const results = await Promise.all(
+        chunks.slice(offset, offset + 4).map(async (chunk) => {
+          const result = (await client
+            .from(cursorTable)
+            .select(
+              "user_id,wallet,start_slot,last_processed_signature,last_processed_slot,last_block_time,backlog_detected,last_success_at,last_error,created_at,updated_at",
+            )
+            .eq("user_id", normalizedUserId)
+            .in("wallet", chunk)) as QueryResult;
+          throwQueryError("RPC cursor bulk load failed", result);
+          if (!Array.isArray(result.data)) {
+            throw new Error("RPC cursor bulk load failed: invalid cursor rows");
+          }
+          return result.data.map(mapCursorRow);
+        }),
+      );
+      for (const rows of results) {
+        for (const cursor of rows) loaded.set(cursor.wallet, cursor);
+      }
+    }
+    return loaded;
+  };
+
   const updateAndLoad = async (
     wallet: string,
     values: Record<string, unknown>,
@@ -228,6 +270,7 @@ export function createSupabaseRpcCursorStore(
 
   return {
     load,
+    loadMany,
 
     async ensure(walletInput: string, anchorSlot?: number): Promise<RpcWalletCursor> {
       const wallet = normalizeRequiredText(walletInput, "wallet");
@@ -256,12 +299,14 @@ export function createSupabaseRpcCursorStore(
       const anchorSlot = normalizeSlot(anchorSlotInput, "rewind anchor slot");
       const current = await load(wallet);
       if (!current) throw new Error("RPC cursor rewind failed: cursor was not initialized");
-      const currentBoundary = current.lastProcessedSlot ?? current.startSlot;
-      if (anchorSlot >= currentBoundary) return current;
+      // `startSlot` is the earliest boundary this cursor has already covered.
+      // Comparing against lastProcessedSlot would rewind the same completed
+      // history on every subscription reconciliation.
+      if (anchorSlot >= current.startSlot) return current;
       return updateAndLoad(
         wallet,
         {
-          start_slot: Math.min(current.startSlot, anchorSlot),
+          start_slot: anchorSlot,
           last_processed_signature: null,
           last_processed_slot: anchorSlot,
           last_block_time: null,
