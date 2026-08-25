@@ -28,9 +28,13 @@ import { fetch } from "undici";
 import pino from "pino";
 import { env } from "./env.js";
 import { safeDiagnostic } from "./diagnostics.js";
-import { attributablePositiveBalanceDelta } from "./execution-accounting.js";
+import {
+  attributablePositiveBalanceDelta,
+  confirmedTokenReceiptFromTx,
+} from "./execution-accounting.js";
 import {
   SubmissionUncertainError,
+  SubmissionCancelledBeforeSendError,
   SubmittedTransactionFailedError,
   assertSubmissionAuthorized,
   isPostSubmissionError,
@@ -65,6 +69,16 @@ export type ExecuteInput = {
   route: "jito" | "rpc";
   jitoTipSol: number;
   outputDecimals?: number; // needed to compute UI amount received (Jupiter v6 doesn't return this)
+  /** Skip aggregators for a curve-proven Pump.fun entry. Exits never set this. */
+  pumpFunDirectOnly?: boolean;
+  /** Prefer Pump.fun for an exit, with alternate routes allowed only after a proven pre-submit failure. */
+  pumpFunDirectFirst?: boolean;
+  /**
+   * Called for an owned Pump.fun transaction after signing and before the
+   * caller's final submission gate. Throwing cancels submission and blocks
+   * alternate-route fallback so the caller can durably persist the signature.
+   */
+  onPrepared?: (prepared: { txSig: string; lastValidBlockHeight: number }) => void | Promise<void>;
   /** Rechecked immediately before the first network submission begins. */
   beforeSubmit?: () => boolean | Promise<boolean>;
 };
@@ -304,9 +318,15 @@ async function submitSignedSwapTx(
       if (!submissionMayHaveOccurred && !isPostSubmissionError(err)) throw err;
       submissionMayHaveOccurred ||= isPostSubmissionError(err);
     }
-    if (!submissionMayHaveOccurred) throw new Error(`${label}: Jito and RPC failed before submission`);
+    if (!submissionMayHaveOccurred)
+      throw new Error(`${label}: Jito and RPC failed before submission`);
     await waitForLanding(knownSig, t0, `${label}/rpc-backup`, jitoAccepted ? "jito" : "rpc");
-    return { txSig: knownSig, latencyMs: Date.now() - t0, route: jitoAccepted ? "jito" : "rpc", outUiAmount };
+    return {
+      txSig: knownSig,
+      latencyMs: Date.now() - t0,
+      route: jitoAccepted ? "jito" : "rpc",
+      outUiAmount,
+    };
   }
 
   try {
@@ -328,7 +348,41 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
   }
   const signer = Keypair.fromSecretKey(decodedSecret);
 
+  if (input.pumpFunDirectOnly === true) {
+    return executePumpFunSwap(input, signer, t0);
+  }
+  if (input.pumpFunDirectFirst === true && input.outputMint !== WSOL_MINT) {
+    throw new Error("pumpFunDirectFirst is only valid for SOL exits");
+  }
+
   const failures: string[] = [];
+  const pumpFunDirectFirst = input.pumpFunDirectFirst === true;
+  if (pumpFunDirectFirst) {
+    try {
+      return await executePumpFunSwap(input, signer, t0);
+    } catch (err) {
+      // Construction, blockhash and serialization failures are known to be
+      // pre-submission and may safely use another route. A revoked final gate,
+      // failed preparation callback, or any possible submission must stop.
+      if (!mayTryAlternateExecution(err)) {
+        log.error(
+          submissionLogFields(err, input),
+          "Pump.fun direct-first exit requires reconciliation or was cancelled; alternate routes blocked",
+        );
+        throw err;
+      }
+      failures.push(`Pump.fun direct-first: ${errorMessage(err)}`);
+      log.warn(
+        {
+          err: safeDiagnostic(err),
+          inputMint: input.inputMint,
+          outputMint: input.outputMint,
+        },
+        "Pump.fun direct-first exit failed before submission — falling back to aggregators",
+      );
+    }
+  }
+
   // DFlow first when enabled; fall through to the full Jupiter → Pump.fun chain
   // on any recoverable failure so behaviour is unchanged when it is off.
   if (env.DFLOW_ENABLED) {
@@ -336,7 +390,10 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
       return await executeDflowSwap(input, signer, t0);
     } catch (err) {
       if (!mayTryAlternateExecution(err)) {
-        log.error(submissionLogFields(err, input), "DFlow submission requires reconciliation; alternate routes blocked");
+        log.error(
+          submissionLogFields(err, input),
+          "DFlow submission requires reconciliation; alternate routes blocked",
+        );
         throw err;
       }
       failures.push(`DFlow: ${errorMessage(err)}`);
@@ -391,6 +448,21 @@ export async function executeSwap(input: ExecuteInput): Promise<ExecuteResult> {
     }
   } else {
     failures.push("Jupiter V2: JUPITER_API_KEY is not configured");
+  }
+
+  // A direct-first attempt already proved that this Pump.fun path could not be
+  // prepared. Do not build a second Pump.fun transaction after the aggregator
+  // fallbacks, which would invoke onPrepared twice with a different signature.
+  if (pumpFunDirectFirst) {
+    log.error(
+      {
+        inputMint: input.inputMint,
+        outputMint: input.outputMint,
+        failures,
+      },
+      "all swap execution paths failed",
+    );
+    throw new Error(`All swap execution paths failed: ${failures.join(" | ")}`);
   }
 
   try {
@@ -662,7 +734,7 @@ async function executePumpFunSwap(
         BigInt(input.slippageBps),
         "processed",
       );
-  const { blockhash } = await conn.getLatestBlockhash("processed");
+  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("processed");
   const tx = new VersionedTransaction(
     new TransactionMessage({
       payerKey: signer.publicKey,
@@ -676,9 +748,26 @@ async function executePumpFunSwap(
   );
   tx.sign([signer]);
   const knownSig = signedTransactionSignature(tx);
+  // Prove local serialization before publishing the prepared identity. Once
+  // onPrepared succeeds, every remaining failure is either an explicit
+  // cancellation or a possible submission, both of which block a new route.
+  const serialized = tx.serialize();
+  await notifyPumpTransactionPrepared(input, {
+    txSig: knownSig,
+    lastValidBlockHeight,
+  });
 
   try {
-    await sendRawViaRpc(tx, t0, "pump.fun", knownSig, input.beforeSubmit, false, "pump.fun");
+    await sendRawViaRpc(
+      tx,
+      t0,
+      "pump.fun",
+      knownSig,
+      input.beforeSubmit,
+      false,
+      "pump.fun",
+      serialized,
+    );
   } catch (err) {
     if (!isPostSubmissionError(err)) throw err;
     log.warn(
@@ -703,11 +792,11 @@ async function executePumpFunSwap(
 
   let outUiAmount: number | undefined;
   if (isBuy) {
-    outUiAmount = tokenDeltaFromTx(
+    outUiAmount = confirmedTokenReceiptFromTx(
       landedTx ?? undefined,
       signer.publicKey.toBase58(),
       mint.toBase58(),
-    );
+    )?.amountUi;
     if (outUiAmount === undefined) {
       let postBuyTokenBalanceUi: number;
       try {
@@ -746,25 +835,20 @@ async function executePumpFunSwap(
   return { txSig: knownSig, latencyMs: Date.now() - t0, route: "rpc", outUiAmount };
 }
 
-function tokenDeltaFromTx(
-  tx: VersionedTransactionResponse | undefined,
-  owner: string,
-  mint: string,
-): number | undefined {
-  const pre = (tx?.meta?.preTokenBalances ?? [])
-    .filter((b) => b.owner === owner && b.mint === mint)
-    .reduce(
-      (sum, b) => sum + Number(b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount ?? 0),
-      0,
+async function notifyPumpTransactionPrepared(
+  input: ExecuteInput,
+  prepared: { txSig: string; lastValidBlockHeight: number },
+): Promise<void> {
+  if (!input.onPrepared) return;
+  try {
+    await input.onPrepared(prepared);
+  } catch (err) {
+    // Persistence is part of the caller-owned authorization contract. If it
+    // fails, no network submission and no different transaction may follow.
+    throw new SubmissionCancelledBeforeSendError(
+      `Pump.fun prepared-transaction callback failed: ${safeDiagnostic(err)}`,
     );
-  const post = (tx?.meta?.postTokenBalances ?? [])
-    .filter((b) => b.owner === owner && b.mint === mint)
-    .reduce(
-      (sum, b) => sum + Number(b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount ?? 0),
-      0,
-    );
-  const delta = post - pre;
-  return delta > 0 ? delta : undefined;
+  }
 }
 
 async function tokenBalanceUi(owner: PublicKey, mint: PublicKey, decimals = 6): Promise<number> {
@@ -797,9 +881,10 @@ async function sendRawViaRpc(
   beforeSubmit?: () => boolean | Promise<boolean>,
   skipPreflight = true,
   submissionRoute: SubmissionRoute = "rpc",
+  preparedSerialization?: Uint8Array,
 ) {
   // Serialization is local and therefore a proven pre-submission operation.
-  const serialized = tx.serialize();
+  const serialized = preparedSerialization ?? tx.serialize();
   await assertSubmissionAuthorized(beforeSubmit);
   let returnedSig: string;
   try {

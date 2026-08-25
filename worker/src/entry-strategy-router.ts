@@ -1,7 +1,12 @@
-export type AutomaticEntryStrategy = "regular" | "coordinated" | "conviction";
+export type AutomaticEntryStrategy =
+  | "regular"
+  | "coordinated"
+  | "conviction"
+  | "supply_accumulation";
 
 export type EntryStrategyConfig = {
   conviction_mode_enabled?: boolean;
+  supply_accumulation_mode_enabled?: boolean;
   coordinated_mode_enabled?: boolean;
 };
 
@@ -14,6 +19,7 @@ export type EntryStrategyConfig = {
  */
 export function automaticEntryStrategy(config: EntryStrategyConfig): AutomaticEntryStrategy {
   if (config.conviction_mode_enabled === true) return "conviction";
+  if (config.supply_accumulation_mode_enabled === true) return "supply_accumulation";
   if (config.coordinated_mode_enabled === true) return "coordinated";
   return "regular";
 }

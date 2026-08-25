@@ -46,3 +46,23 @@ test("turning Conviction Mode back off restores saved legacy routing", () => {
   assert.equal(automaticEntryStrategy(saved), "coordinated");
   assert.equal(saved.coordinated_mode_enabled, true);
 });
+
+test("Supply Accumulation is exclusive and preserves regular exit semantics separately", () => {
+  assert.equal(
+    automaticEntryStrategy({
+      conviction_mode_enabled: false,
+      supply_accumulation_mode_enabled: true,
+      coordinated_mode_enabled: true,
+    }),
+    "supply_accumulation",
+  );
+  assert.equal(
+    automaticEntryStrategy({
+      conviction_mode_enabled: true,
+      supply_accumulation_mode_enabled: true,
+      coordinated_mode_enabled: false,
+    }),
+    "conviction",
+    "a malformed conflicting config must never run two entry strategies",
+  );
+});

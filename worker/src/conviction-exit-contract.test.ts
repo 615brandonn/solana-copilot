@@ -21,7 +21,7 @@ test("new Conviction positions retain the regular exit policy", () => {
 
 test("TP, SL, configured follower exits, inactivity, and proportional mirroring remain active", () => {
   const tpSl = section("async function checkTpSl", "async function checkConfiguredPositionExits");
-  assert.match(tpSl, /entry_mode \?\? "regular"\) === "coordinated"\) continue/);
+  assert.doesNotMatch(tpSl, /entry_mode \?\? "regular"\) === "coordinated"\) continue/);
   assert.match(tpSl, /cfg\.stop_loss_enabled/);
   assert.match(tpSl, /cfg\.take_profit_enabled/);
 

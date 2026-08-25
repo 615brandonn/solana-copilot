@@ -666,6 +666,143 @@ async function checkRevivalTrackerSchema(cfg: BotConfigRow): Promise<boolean> {
   return true;
 }
 
+async function checkSupplyAccumulationSchema(
+  cfg: BotConfigRow,
+  targetCount: number,
+): Promise<boolean> {
+  const requiredConfigFields: Array<keyof BotConfigRow> = [
+    "supply_accumulation_mode_enabled",
+    "supply_accumulation_threshold_pct",
+    "supply_accumulation_buy_usd",
+    "supply_accumulation_max_market_cap_usd",
+    "supply_accumulation_window_seconds",
+  ];
+  const missing = requiredConfigFields.filter(
+    (field) => cfg[field] === undefined || cfg[field] === null,
+  );
+  if (missing.length > 0) {
+    fail(
+      "Supply Accumulation migration",
+      `missing ${missing.length} config field(s) — run supabase/supply-accumulation-entry-migration.sql`,
+    );
+    return false;
+  }
+
+  const threshold = Number(cfg.supply_accumulation_threshold_pct);
+  const buyUsd = Number(cfg.supply_accumulation_buy_usd);
+  const maxMarketCapUsd = Number(cfg.supply_accumulation_max_market_cap_usd);
+  const windowSeconds = Number(cfg.supply_accumulation_window_seconds);
+  if (
+    !Number.isFinite(threshold) ||
+    threshold < 10 ||
+    threshold > 20 ||
+    !Number.isFinite(buyUsd) ||
+    buyUsd <= 0 ||
+    !Number.isFinite(maxMarketCapUsd) ||
+    maxMarketCapUsd <= 0 ||
+    maxMarketCapUsd > 15_000 ||
+    !Number.isInteger(windowSeconds) ||
+    windowSeconds < 30 ||
+    windowSeconds > 3_600
+  ) {
+    fail(
+      "Supply Accumulation config",
+      "threshold, buy size, strict market-cap ceiling, or rolling window is outside its safety bounds",
+    );
+    return false;
+  }
+  if (cfg.supply_accumulation_mode_enabled && targetCount < 1) {
+    fail("Supply Accumulation wallets", "at least one configured market-maker root is required");
+    return false;
+  }
+  if (cfg.supply_accumulation_mode_enabled && cfg.custody_journey_enabled !== true) {
+    fail(
+      "Supply Accumulation custody gate",
+      "Custody Journey must be ON because every supply entry requires fresh atomic custody proof",
+    );
+    return false;
+  }
+  if (
+    cfg.supply_accumulation_mode_enabled &&
+    (cfg.conviction_mode_enabled || cfg.coordinated_mode_enabled)
+  ) {
+    fail(
+      "Supply Accumulation exclusivity",
+      "Conviction and Coordinated mode must be OFF while Supply Accumulation is enabled",
+    );
+    return false;
+  }
+  if (cfg.supply_accumulation_mode_enabled && env.REVIVAL_ONLY_MODE) {
+    fail(
+      "Supply Accumulation exclusivity",
+      "legacy REVIVAL_ONLY_MODE is another money-moving entry route and must be OFF",
+    );
+    return false;
+  }
+
+  const [events, state] = await Promise.all([
+    db
+      .from("supply_accumulation_events")
+      .select(
+        "id,user_id,event_key,request_fingerprint,tx_sig,slot,event_at,recorded_at,target_wallet,token_mint,side,amount_raw,total_supply_raw,decimals,market_cap_usd,valuation_slot,market_data_reliable,is_pump_fun,classification_reliable,quarantined,conflict_count,last_conflict_at,metadata",
+      )
+      .limit(1),
+    db
+      .from("supply_accumulation_state")
+      .select(
+        "user_id,token_mint,window_seconds,as_of,window_started_at,total_supply_raw,decimals,gross_buy_raw,gross_sell_raw,net_acquired_raw,net_supply_bps,buy_count,sell_count,root_wallets,last_event_key,last_event_at,last_event_slot,last_event_side,latest_market_cap_usd,valuation_slot,market_data_reliable,pump_fun_verified,classification_reliable,direct_settlement_seen,payload_conflict,data_reliable,threshold_pct,threshold_reached,max_market_cap_usd,under_market_cap,entry_ready,updated_at",
+      )
+      .limit(1),
+  ]);
+  const schemaError = events.error ?? state.error;
+  if (schemaError) {
+    fail(
+      "Supply Accumulation schema",
+      `${safeDiagnostic(schemaError.message)} — run supabase/supply-accumulation-entry-migration.sql`,
+    );
+    return false;
+  }
+
+  try {
+    const apiUrl = new URL("/rest/v1/", env.BOT_SUPABASE_URL);
+    const headers: Record<string, string> = { apikey: env.BOT_SUPABASE_SERVICE_ROLE_KEY };
+    if (!env.BOT_SUPABASE_SERVICE_ROLE_KEY.startsWith("sb_")) {
+      headers.Authorization = `Bearer ${env.BOT_SUPABASE_SERVICE_ROLE_KEY}`;
+    }
+    const response = await fetch(apiUrl, {
+      headers,
+      signal: AbortSignal.timeout(5_000),
+    });
+    const payload = response.ok
+      ? ((await response.json()) as { paths?: Record<string, unknown> })
+      : undefined;
+    const paths = payload?.paths ?? {};
+    const missingRpc = [
+      "/rpc/record_supply_accumulation_event",
+      "/rpc/get_supply_accumulation_state",
+      "/rpc/check_supply_accumulation_custody_gate",
+    ].filter((path) => !paths[path]);
+    if (!response.ok || missingRpc.length > 0) {
+      fail("Supply Accumulation RPCs", {
+        httpStatus: response.status,
+        missingFunctionCount: missingRpc.length,
+      });
+      return false;
+    }
+  } catch (error) {
+    fail("Supply Accumulation RPCs", safeDiagnostic(error));
+    return false;
+  }
+
+  pass(
+    "Supply Accumulation schema",
+    cfg.supply_accumulation_mode_enabled
+      ? `LIVE strategy selected across ${targetCount} configured root(s); ${threshold}% net supply in ${windowSeconds}s; strict MC below $${maxMarketCapUsd}; standard position exits preserved`
+      : `OFF — replay-safe raw event/state storage ready; threshold ${threshold}%, strict MC below $${maxMarketCapUsd}`,
+  );
+  return true;
+}
+
 async function checkSellCoverageSchema(cfg: BotConfigRow): Promise<boolean> {
   const requiredConfigFields: Array<keyof BotConfigRow> = [
     "direct_target_sell_exit_mode",
@@ -732,7 +869,7 @@ async function checkSellCoverageSchema(cfg: BotConfigRow): Promise<boolean> {
     db
       .from("entry_signal_claims")
       .select(
-        "user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig,error_code,submission_started_at,landed_at,persisted_at,created_at,updated_at",
+        "user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,entry_strategy,source_slot,token_decimals,contributing_wallets,planned_buy_usd,last_valid_block_height,amount_lamports,status,bot_tx_sig,error_code,submission_started_at,landed_at,persisted_at,created_at,updated_at",
       )
       .limit(1),
     db
@@ -1167,6 +1304,7 @@ async function main() {
     pass("Legacy REVIVAL_ONLY_MODE", "OFF — Revival Campaign collection remains observation-only");
   }
   if (!(await checkRevivalTrackerSchema(cfg))) return;
+  if (!(await checkSupplyAccumulationSchema(cfg, targets.length))) return;
 
   if (
     cfg.follower_seller_exit_enabled === undefined ||

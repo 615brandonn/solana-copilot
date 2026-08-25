@@ -10,11 +10,9 @@ import { db, type BotConfigRow } from "./db.js";
 import { GeyserFeed, type FeedEvent, type SwapEvent, type TransferEvent } from "./geyser.js";
 import { FollowerMonitor, type ChainedTransferBatchState } from "./monitor.js";
 import { executeSwap, type ExecuteResult } from "./executor.js";
-import {
-  checkPriceSanity,
-  priceSanityConfigFrom,
-  type PriceSanityState,
-} from "./price-sanity.js";
+import { confirmedTokenReceiptFromTx } from "./execution-accounting.js";
+import { BoundedBackgroundQueue } from "./bounded-background-queue.js";
+import { checkPriceSanity, priceSanityConfigFrom, type PriceSanityState } from "./price-sanity.js";
 import { SubmissionUncertainError, isPostSubmissionError } from "./execution-safety.js";
 import {
   canReclaimEntryClaim,
@@ -24,7 +22,7 @@ import {
   type EntryClaimStatus,
 } from "./entry-claim-policy.js";
 import { decryptPrivateKey } from "./crypto.js";
-import { checkEntry, loadTokenMeta } from "./filters.js";
+import { checkEntry, loadTokenMeta, type TokenMeta } from "./filters.js";
 import { RpcBackfillPoller } from "./poller.js";
 import { createSupabaseRpcCursorStore } from "./rpc-cursor.js";
 import { PendingTransferBuffer } from "./pending-transfer-buffer.js";
@@ -52,7 +50,23 @@ import {
   RecentEventDeduper,
 } from "./event-deduper.js";
 import { resolveTargetBuyValue } from "./target-buy-valuation.js";
-import { automaticEntryStrategy } from "./entry-strategy-router.js";
+import { automaticEntryStrategy, type AutomaticEntryStrategy } from "./entry-strategy-router.js";
+import {
+  confirmedSourceIsFresh,
+  loadConfirmedSourceTransaction,
+  loadPumpFunSupplySnapshot,
+  maximumSpendWithSlippageLamports,
+  pumpFunCurrentMarketCapUsd,
+  pumpFunTokenPriceUsd,
+  reachesSupplyThreshold,
+  solanaRpcWithTimeout,
+  strictestPumpFunMarketCaps,
+} from "./pump-fun-supply.js";
+import {
+  SupplyAccumulationStore,
+  type SupplyAccumulationState,
+  type VerifiedSupplySell,
+} from "./supply-accumulation-store.js";
 import { evaluateConvictionLiveExecutionGate } from "./conviction-execution-policy.js";
 import {
   ConvictionRuntime,
@@ -108,10 +122,16 @@ const followerRecipientEligibility = new Map<string, RecipientClassification>();
 
 type CopyBuyOptions = {
   entryMode: "regular" | "coordinated";
+  entryStrategy?: AutomaticEntryStrategy;
   firstBuy: boolean;
   targetBuyUsd: number | undefined;
   coordinatedWallets?: string[];
+  supplyState?: SupplyAccumulationState;
 };
+
+function copyBuyEntryStrategy(options: CopyBuyOptions): AutomaticEntryStrategy {
+  return options.entryStrategy ?? options.entryMode;
+}
 
 type EntryClaimRow = {
   id: string;
@@ -124,6 +144,14 @@ type EntryClaimRow = {
   amount_lamports: number | string;
   status: EntryClaimStatus;
   bot_tx_sig: string | null;
+  entry_strategy?: string | null;
+  source_slot?: number | string | null;
+  token_decimals?: number | null;
+  contributing_wallets?: string[] | null;
+  last_valid_block_height?: number | string | null;
+  planned_buy_usd?: number | string | null;
+  submission_started_at?: string | null;
+  created_at?: string | null;
 };
 
 async function classifyFollowerRecipient(address: string): Promise<RecipientClassification> {
@@ -282,7 +310,7 @@ async function waitForConfig(userId: string): Promise<BotConfigRow> {
   while (true) {
     try {
       const cfg = await loadConfig(userId);
-      if (cfg?.target_wallet) {
+      if (cfg && configuredTargetWallets(cfg).length > 0) {
         log.info({ targetCount: configuredTargetWallets(cfg).length }, "config loaded");
         return cfg;
       }
@@ -300,12 +328,29 @@ async function waitForConfig(userId: string): Promise<BotConfigRow> {
   }
 }
 
+function supplyAccumulationConfigFingerprint(config: BotConfigRow): string {
+  return JSON.stringify({
+    enabled: config.supply_accumulation_mode_enabled === true,
+    thresholdPct: Number(config.supply_accumulation_threshold_pct ?? 10),
+    buyUsd: Number(config.supply_accumulation_buy_usd ?? 20),
+    maxMarketCapUsd: Number(config.supply_accumulation_max_market_cap_usd ?? 15_000),
+    windowSeconds: Number(config.supply_accumulation_window_seconds ?? 600),
+    targets: configuredTargetWallets(config).sort(),
+  });
+}
+
 async function main() {
   const USER_ID = env.HELIX_USER_ID;
   let cfg = await waitForConfig(USER_ID);
   let entryConfigTransitioning = false;
   let configRefreshRunning = false;
-  let fundingReadiness = await checkFundingWalletReadiness(cfg.user_id, cfg.fixed_buy_usd);
+  let supplyConfigFingerprint = supplyAccumulationConfigFingerprint(cfg);
+  let fundingReadiness = await checkFundingWalletReadiness(
+    cfg.user_id,
+    automaticEntryStrategy(cfg) === "supply_accumulation"
+      ? Number(cfg.supply_accumulation_buy_usd ?? 20)
+      : cfg.fixed_buy_usd,
+  );
 
   const feed: GeyserFeed = new GeyserFeed(async (event): Promise<void> => {
     await handle(event);
@@ -327,7 +372,10 @@ async function main() {
       .select("wallet,mint_count")
       .gte("mint_count", minMints);
     if (error) {
-      log.warn({ err: safeDiagnostic(error.message) }, "crew wallet refresh failed; keeping prior set");
+      log.warn(
+        { err: safeDiagnostic(error.message) },
+        "crew wallet refresh failed; keeping prior set",
+      );
       return;
     }
     crewWallets = new Set(
@@ -355,6 +403,7 @@ async function main() {
     });
   };
   const coordinatedBuys = new CoordinatedBuyTracker();
+  const supplyAccumulationStore = new SupplyAccumulationStore(db, cfg.user_id);
 
   // Cumulative USDC the target has committed to each mint over a rolling window
   // (his real conviction). Used by the USDC-conviction gate/sizing when enabled.
@@ -381,6 +430,10 @@ async function main() {
   // position that was closed while the buy was being built.
   const tradeExecutionQueue = new KeyedExecutionQueue();
   const exitExecutionQueue = new KeyedExecutionQueue();
+  // Supply evidence is serialized per mint but never on the Geyser drain.
+  // A later sell for the same mint therefore queues behind the preceding buy,
+  // while unrelated mints and the live feed continue independently.
+  const supplyObservationQueue = new KeyedExecutionQueue();
   const exitsInFlight = new Set<string>();
   const pendingTransfers = new PendingTransferBuffer({
     ttlMs: 5 * 60_000,
@@ -391,6 +444,135 @@ async function main() {
   const targetBuyActivityAccounting = new RecentAsyncResultCache<void>();
   const targetFirstBuyAccounting = new RecentAsyncResultCache<boolean>();
   const uncertainEntryMints = new Set<string>();
+  const supplyEntryPositionCache = new Map<string, boolean>();
+  const pendingEntrySells = new Map<string, Array<{ event: SwapEvent; bufferedAt: number }>>();
+  const PENDING_ENTRY_SELL_TTL_MS = 2 * 60_000;
+  const PENDING_ENTRY_SELLS_PER_MINT = 100;
+
+  function bufferEntrySell(event: SwapEvent): void {
+    const now = Date.now();
+    const existing = (pendingEntrySells.get(event.tokenMint) ?? []).filter(
+      (row) => now - row.bufferedAt <= PENDING_ENTRY_SELL_TTL_MS,
+    );
+    const identity = `${event.txSig}:${event.wallet}:${event.slot}`;
+    if (
+      existing.some(
+        (row) => `${row.event.txSig}:${row.event.wallet}:${row.event.slot}` === identity,
+      )
+    ) {
+      return;
+    }
+    existing.push({ event, bufferedAt: now });
+    pendingEntrySells.set(event.tokenMint, existing.slice(-PENDING_ENTRY_SELLS_PER_MINT));
+  }
+
+  function forgetBufferedEntrySell(event: SwapEvent): void {
+    const identity = `${event.txSig}:${event.wallet}:${event.slot}`;
+    const remaining = (pendingEntrySells.get(event.tokenMint) ?? []).filter(
+      (row) => `${row.event.txSig}:${row.event.wallet}:${row.event.slot}` !== identity,
+    );
+    if (remaining.length > 0) pendingEntrySells.set(event.tokenMint, remaining);
+    else pendingEntrySells.delete(event.tokenMint);
+  }
+
+  function schedulePendingEntrySellDrain(tokenMint: string): void {
+    const now = Date.now();
+    const rows = (pendingEntrySells.get(tokenMint) ?? [])
+      .filter((row) => now - row.bufferedAt <= PENDING_ENTRY_SELL_TTL_MS)
+      .sort((a, b) => a.event.slot - b.event.slot);
+    pendingEntrySells.delete(tokenMint);
+    if (rows.length === 0) return;
+    setTimeout(() => {
+      void (async () => {
+        for (const row of rows) {
+          try {
+            await handleFollowerSell(row.event);
+          } catch (err) {
+            bufferEntrySell(row.event);
+            log.error(
+              { err: safeDiagnostic(err), mint: tokenMint, txSig: row.event.txSig },
+              "buffered in-flight entry sell failed and remains queued for retry",
+            );
+          }
+        }
+        if (pendingEntrySells.has(tokenMint)) {
+          setTimeout(() => schedulePendingEntrySellDrain(tokenMint), 2_000);
+        }
+      })().catch((err) => {
+        log.error(
+          { err: safeDiagnostic(err), mint: tokenMint, bufferedSellCount: rows.length },
+          "buffered in-flight entry sell drain failed",
+        );
+      });
+    }, 0);
+  }
+
+  function recoveredSupplySellEvent(row: VerifiedSupplySell): SwapEvent | null {
+    const scale = 10 ** row.decimals;
+    const amountTokens = Number(BigInt(row.amountRaw)) / scale;
+    const tokenBalanceBefore = Number(BigInt(row.tokenBalanceBeforeRaw)) / scale;
+    const tokenBalanceAfter = Number(BigInt(row.tokenBalanceAfterRaw)) / scale;
+    if (
+      !Number.isFinite(amountTokens) ||
+      amountTokens <= 0 ||
+      !Number.isFinite(tokenBalanceBefore) ||
+      !Number.isFinite(tokenBalanceAfter)
+    ) {
+      return null;
+    }
+    return {
+      kind: "swap",
+      wallet: row.targetWallet,
+      side: "sell",
+      tokenMint: row.tokenMint,
+      amountTokens,
+      amountRaw: row.amountRaw,
+      decimals: row.decimals,
+      solDelta: 0,
+      slot: row.slot,
+      txSig: row.txSig,
+      timestampMs: row.eventAtMs,
+      blockTimeMs: row.eventAtMs,
+      observedAtMs: Date.now(),
+      delivery: "catchup",
+      source: "rpc",
+      isPumpFun: true,
+      verifiedSwap: true,
+      sellAttribution: {
+        verified: true,
+        tokenBalanceBefore,
+        tokenBalanceAfter,
+        tokenBalanceBeforeRaw: row.tokenBalanceBeforeRaw,
+        tokenBalanceAfterRaw: row.tokenBalanceAfterRaw,
+        soldAmountRaw: row.soldAmountRaw,
+        soldFraction:
+          tokenBalanceBefore > 0
+            ? Math.min(1, Math.max(0, amountTokens / tokenBalanceBefore))
+            : undefined,
+        signerCount: 1,
+      },
+    };
+  }
+
+  async function processDurableSupplySells(
+    positionId: string,
+    tokenMint: string,
+    sourceSlot: number,
+    tradeLockHeld: boolean,
+  ): Promise<void> {
+    const durableSells = await supplyAccumulationStore.verifiedSellsAfter(tokenMint, sourceSlot);
+    for (const durableSell of durableSells) {
+      const sellEvent = recoveredSupplySellEvent(durableSell);
+      if (!sellEvent) {
+        throw new Error("durable in-flight supply sell could not be reconstructed safely");
+      }
+      await handleFollowerSell(sellEvent, {
+        durableRecoveredSupplyPositionId: positionId,
+        tradeLockHeld,
+      });
+      forgetBufferedEntrySell(sellEvent);
+    }
+  }
 
   async function retryDb<T>(
     label: string,
@@ -432,15 +614,75 @@ async function main() {
     return false;
   }
 
+  async function beginEntryClaimSubmission(
+    claimId: string,
+    submissionStartedAt: string,
+  ): Promise<void> {
+    const { data, error } = await db
+      .from("entry_signal_claims")
+      .update({
+        status: "submitted",
+        submission_started_at: submissionStartedAt,
+        error_code: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", claimId)
+      .eq("user_id", cfg.user_id)
+      .eq("status", "claimed")
+      .is("bot_tx_sig", null)
+      .is("submission_started_at", null)
+      .select("id")
+      .maybeSingle();
+    if (error || !data) {
+      throw new Error(
+        `entry claim submission ownership was lost: ${safeDiagnostic(error ?? "claim changed")}`,
+      );
+    }
+  }
+
+  async function persistPreparedSupplyEntryClaim(
+    claimId: string,
+    submissionStartedAt: string,
+    txSig: string,
+    lastValidBlockHeight: number,
+  ): Promise<void> {
+    const { data, error } = await db
+      .from("entry_signal_claims")
+      .update({
+        bot_tx_sig: txSig,
+        last_valid_block_height: lastValidBlockHeight,
+        error_code: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", claimId)
+      .eq("user_id", cfg.user_id)
+      .eq("status", "submitted")
+      .eq("submission_started_at", submissionStartedAt)
+      .is("bot_tx_sig", null)
+      .select("id")
+      .maybeSingle();
+    if (error || !data) {
+      // The executor wraps this failure as a pre-send cancellation. An older
+      // builder can therefore never publish a transaction after recovery has
+      // released or replaced its durable attempt.
+      throw new Error(
+        `prepared Supply claim ownership was lost: ${safeDiagnostic(error ?? "claim changed")}`,
+      );
+    }
+  }
+
   async function claimEntrySubmission(
     event: SwapEvent,
     entryMode: "regular" | "coordinated",
     amountLamports: number,
+    plannedBuyUsd: number,
+    entryStrategy: AutomaticEntryStrategy,
+    contributingWallets: string[] = [],
   ): Promise<EntryClaimRow | null> {
     const sourceTxSig = event.txSig || `slot-${event.slot}`;
     const plannedPositionId = randomUUID();
     const fields =
-      "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig";
+      "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig,entry_strategy,source_slot,token_decimals,contributing_wallets,last_valid_block_height,planned_buy_usd,submission_started_at,created_at";
     const { data: inserted, error: insertError } = await db
       .from("entry_signal_claims")
       .insert({
@@ -451,6 +693,11 @@ async function main() {
         planned_position_id: plannedPositionId,
         entry_mode: entryMode,
         amount_lamports: amountLamports,
+        planned_buy_usd: plannedBuyUsd,
+        entry_strategy: entryStrategy,
+        source_slot: event.slot,
+        token_decimals: event.decimals,
+        contributing_wallets: Array.from(new Set([event.wallet, ...contributingWallets])),
         status: "claimed",
       })
       .select(fields)
@@ -491,6 +738,7 @@ async function main() {
       .update({
         status: "claimed",
         amount_lamports: amountLamports,
+        planned_buy_usd: plannedBuyUsd,
         error_code: null,
         bot_tx_sig: null,
         submission_started_at: null,
@@ -512,6 +760,165 @@ async function main() {
   }
 
   let reconcilingEntryClaims = false;
+
+  async function recoverPreparedSupplyEntryClaim(
+    claim: EntryClaimRow,
+    existingPositionId?: string,
+  ): Promise<"persisted" | "retryable" | null> {
+    if (claim.entry_strategy !== "supply_accumulation" || !claim.bot_tx_sig) return null;
+    const statuses = await solanaRpcWithTimeout(
+      rpc.getSignatureStatuses([claim.bot_tx_sig], {
+        searchTransactionHistory: true,
+      }),
+      15_000,
+    );
+    const status = statuses.value[0];
+    if (status?.err) {
+      // A chain-recorded failure proves the prepared transaction did not buy.
+      await updateEntryClaim(claim.id, {
+        status: "failed_pre_submit",
+        error_code: "prepared-transaction-failed-on-chain",
+      });
+      return "retryable";
+    }
+    if (status?.confirmationStatus !== "confirmed" && status?.confirmationStatus !== "finalized") {
+      // A processed signature proves the transaction reached the cluster and
+      // may still confirm. A null status is also not proof of absence: RPC
+      // history can be temporarily unavailable or pruned. Once a signed
+      // transaction has been prepared, only an explicit on-chain error is safe
+      // to reclaim; every other ambiguous state stays quarantined.
+      return null;
+    }
+    if (!fundingReadiness.walletPubkey) return null;
+    const transaction = await solanaRpcWithTimeout(
+      rpc.getTransaction(claim.bot_tx_sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      }),
+      15_000,
+    );
+    const receipt = confirmedTokenReceiptFromTx(
+      transaction ?? undefined,
+      fundingReadiness.walletPubkey,
+      claim.token_mint,
+    );
+    const tokenDecimals = Number(claim.token_decimals);
+    const sourceSlot = Number(claim.source_slot);
+    if (
+      !receipt ||
+      !Number.isInteger(tokenDecimals) ||
+      tokenDecimals < 0 ||
+      tokenDecimals > 18 ||
+      receipt.decimals !== tokenDecimals ||
+      !Number.isSafeInteger(sourceSlot) ||
+      sourceSlot <= 0
+    ) {
+      return null;
+    }
+    const nominalBuyUsd = Number(claim.planned_buy_usd);
+    if (!Number.isFinite(nominalBuyUsd) || nominalBuyUsd <= 0) {
+      // Never reconstruct an old cost basis from today's SOL price. Keep the
+      // landed claim quarantined until its execution-time USD basis exists.
+      return null;
+    }
+    const entryPriceUsd = nominalBuyUsd / receipt.amountUi;
+    if (!Number.isFinite(entryPriceUsd) || entryPriceUsd <= 0) return null;
+    const contributingWallets = Array.from(
+      new Set([claim.source_wallet, ...(claim.contributing_wallets ?? [])]),
+    );
+    const observedAt = claim.created_at ?? new Date().toISOString();
+    const position = existingPositionId
+      ? { id: existingPositionId }
+      : await retryDb<{ id: string } | null>("recover prepared supply position", () =>
+          db
+            .from("positions")
+            .upsert(
+              {
+                id: claim.planned_position_id,
+                user_id: cfg.user_id,
+                token_mint: claim.token_mint,
+                entry_price_usd: entryPriceUsd,
+                amount_tokens: receipt.amountUi,
+                amount_remaining: receipt.amountUi,
+                decimals: tokenDecimals,
+                mirrored_sold_fraction: 0,
+                tp_taken: false,
+                entry_tx_sig: claim.bot_tx_sig,
+                entry_slot: sourceSlot,
+                entry_mode: "regular",
+                coordinated_exit_triggered: false,
+                follower_seller_exit_triggered: false,
+                root_buy_count: Math.max(1, contributingWallets.length),
+                last_root_buy_at: observedAt,
+                last_root_buy_wallet: claim.source_wallet,
+              },
+              { onConflict: "id" },
+            )
+            .select("id")
+            .maybeSingle(),
+        );
+    if (!position) return null;
+    supplyEntryPositionCache.set(position.id, true);
+
+    for (const wallet of contributingWallets) {
+      await linkTargetToPosition(position.id, wallet, "recovered", observedAt, true);
+    }
+    await monitor.onCopyBuy({
+      positionId: position.id,
+      tokenMint: claim.token_mint,
+      targetWallet: claim.source_wallet,
+      entrySlot: sourceSlot,
+    });
+    const { data: existingTrade, error: tradeLookupError } = await db
+      .from("trades")
+      .select("id")
+      .eq("user_id", cfg.user_id)
+      .eq("tx_sig", claim.bot_tx_sig)
+      .eq("side", "buy")
+      .maybeSingle();
+    if (tradeLookupError) {
+      throw new Error(`recovered trade lookup failed: ${safeDiagnostic(tradeLookupError)}`);
+    }
+    if (!existingTrade) {
+      const { error: tradeError } = await db.from("trades").insert({
+        user_id: cfg.user_id,
+        position_id: position.id,
+        side: "buy",
+        token_mint: claim.token_mint,
+        amount_tokens: receipt.amountUi,
+        amount_usd: nominalBuyUsd,
+        price_usd: entryPriceUsd,
+        tx_sig: claim.bot_tx_sig,
+        reason: "recovered supply-accumulation buy",
+        // The canonical trade ledger currently distinguishes Jito from all
+        // non-Jito submissions. Pump direct executions therefore persist as
+        // `rpc`, matching executeSwap's landed result and the DB constraint.
+        route: "rpc",
+      });
+      if (tradeError) {
+        throw new Error(`recovered trade insert failed: ${safeDiagnostic(tradeError)}`);
+      }
+    }
+    const { error: tradedTokenError } = await db
+      .from("traded_tokens")
+      .upsert({ user_id: cfg.user_id, token_mint: claim.token_mint });
+    if (tradedTokenError) {
+      throw new Error(`recovered traded-token save failed: ${safeDiagnostic(tradedTokenError)}`);
+    }
+    // This is the only stale-sell authorization in the worker. It is tied to
+    // the exact confirmed supply claim, recovered position, ordered durable
+    // sell evidence, and entry-slot check inside handleDirectTargetSell.
+    await processDurableSupplySells(position.id, claim.token_mint, sourceSlot, false);
+    await updateEntryClaim(claim.id, {
+      status: "persisted",
+      error_code: null,
+      landed_at: new Date().toISOString(),
+      persisted_at: new Date().toISOString(),
+    });
+    schedulePendingEntrySellDrain(claim.token_mint);
+    return "persisted";
+  }
+
   async function reconcileUnresolvedEntryClaims(): Promise<number> {
     if (reconcilingEntryClaims) return 0;
     reconcilingEntryClaims = true;
@@ -520,7 +927,7 @@ async function main() {
         db
           .from("entry_signal_claims")
           .select(
-            "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig",
+            "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig,entry_strategy,source_slot,token_decimals,contributing_wallets,last_valid_block_height,planned_buy_usd,submission_started_at,created_at",
           )
           .eq("user_id", cfg.user_id)
           .in("status", ["claimed", "submitted", "landed", "uncertain"])
@@ -529,37 +936,117 @@ async function main() {
       let resolved = 0;
       for (const claim of claims ?? []) {
         if (!isUnresolvedEntryClaim(claim.status)) continue;
-        uncertainEntryMints.add(claim.token_mint);
-        const { data: position, error: positionError } = await db
-          .from("positions")
-          .select("id,token_mint,entry_tx_sig")
-          .eq("user_id", cfg.user_id)
-          .eq("id", claim.planned_position_id)
-          .maybeSingle();
-        if (positionError) {
-          throw new Error(
-            `entry claim position reconciliation failed: ${safeDiagnostic(positionError)}`,
+        try {
+          uncertainEntryMints.add(claim.token_mint);
+          const { data: position, error: positionError } = await db
+            .from("positions")
+            .select("id,token_mint,entry_tx_sig")
+            .eq("user_id", cfg.user_id)
+            .eq("id", claim.planned_position_id)
+            .maybeSingle();
+          if (positionError) {
+            throw new Error(
+              `entry claim position reconciliation failed: ${safeDiagnostic(positionError)}`,
+            );
+          }
+          const positionMatchesClaim = entryClaimMatchesPersistedPosition(claim, position);
+          const preparedSupplyClaim =
+            claim.entry_strategy === "supply_accumulation" && Boolean(claim.bot_tx_sig);
+          const unsignedAttemptStartedAt = Date.parse(
+            claim.submission_started_at ?? claim.created_at ?? "",
           );
-        }
-        if (entryClaimMatchesPersistedPosition(claim, position)) {
-          await updateEntryClaim(claim.id, {
-            status: "persisted",
-            error_code: null,
-            persisted_at: new Date().toISOString(),
-          });
-          uncertainEntryMints.delete(claim.token_mint);
-          resolved += 1;
-          continue;
-        }
+          const unsignedAttemptIsStale =
+            Number.isFinite(unsignedAttemptStartedAt) &&
+            Date.now() - unsignedAttemptStartedAt >= 120_000;
 
-        // A confirmed signature without the exact planned position proves only
-        // that Helix may hold tokens. It does not authorize adopting that balance
-        // or buying again; keep the mint quarantined for manual reconciliation.
-        if (claim.bot_tx_sig) {
-          try {
-            const statuses = await rpc.getSignatureStatuses([claim.bot_tx_sig], {
-              searchTransactionHistory: true,
+          // Pump direct submission cannot begin until onPrepared has durably
+          // stored the signed transaction signature. Therefore a Supply claim
+          // that crashed in claimed/submitted with no signature and no planned
+          // position is proven pre-send and may be safely released. Any landed,
+          // uncertain, or position-bearing mismatch remains quarantined.
+          if (
+            claim.entry_strategy === "supply_accumulation" &&
+            !claim.bot_tx_sig &&
+            !position &&
+            unsignedAttemptIsStale &&
+            (claim.status === "claimed" || claim.status === "submitted")
+          ) {
+            let releaseQuery = db
+              .from("entry_signal_claims")
+              .update({
+                status: "failed_pre_submit",
+                submission_started_at: null,
+                error_code: "prepared-signature-not-recorded-before-restart",
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", claim.id)
+              .eq("user_id", cfg.user_id)
+              .eq("status", claim.status)
+              .is("bot_tx_sig", null);
+            releaseQuery = claim.submission_started_at
+              ? releaseQuery.eq("submission_started_at", claim.submission_started_at)
+              : releaseQuery.is("submission_started_at", null);
+            const { data: released, error: releaseError } = await releaseQuery
+              .select("id")
+              .maybeSingle();
+            if (releaseError) {
+              throw new Error(
+                `unsigned Supply claim release failed: ${safeDiagnostic(releaseError)}`,
+              );
+            }
+            if (!released) continue;
+            uncertainEntryMints.delete(claim.token_mint);
+            resolved += 1;
+            continue;
+          }
+
+          // Supply recovery also repairs every side effect after the position
+          // upsert (monitor watch, root links, trade row, and traded-token guard).
+          // Run it before the generic exact-position shortcut so a crash between
+          // any two of those writes cannot leave a partially armed position.
+          if (preparedSupplyClaim && (!position || positionMatchesClaim)) {
+            const supplyRecovery = await recoverPreparedSupplyEntryClaim(claim, position?.id);
+            if (supplyRecovery) {
+              uncertainEntryMints.delete(claim.token_mint);
+              resolved += 1;
+              log.warn(
+                {
+                  mint: claim.token_mint,
+                  claimId: claim.id,
+                  recovery: supplyRecovery,
+                },
+                supplyRecovery === "persisted"
+                  ? "prepared supply buy was recovered into its exact planned position"
+                  : "expired/failed prepared supply buy was safely released for retry",
+              );
+            }
+            // A still-pending prepared signature remains quarantined. In
+            // particular, do not mark an already-upserted position persisted
+            // until all idempotent recovery side effects above have succeeded.
+            continue;
+          }
+
+          if (positionMatchesClaim) {
+            await updateEntryClaim(claim.id, {
+              status: "persisted",
+              error_code: null,
+              persisted_at: new Date().toISOString(),
             });
+            uncertainEntryMints.delete(claim.token_mint);
+            resolved += 1;
+            continue;
+          }
+
+          // A confirmed signature without the exact planned position proves only
+          // that Helix may hold tokens. It does not authorize adopting that balance
+          // or buying again; keep the mint quarantined for manual reconciliation.
+          if (claim.bot_tx_sig) {
+            const statuses = await solanaRpcWithTimeout(
+              rpc.getSignatureStatuses([claim.bot_tx_sig], {
+                searchTransactionHistory: true,
+              }),
+              15_000,
+            );
             const status = statuses.value[0];
             if (status && !status.err && claim.status !== "landed") {
               await updateEntryClaim(claim.id, {
@@ -568,12 +1055,17 @@ async function main() {
                 error_code: "landed-position-not-persisted",
               });
             }
-          } catch (err) {
-            log.warn(
-              { err: safeDiagnostic(err), mint: claim.token_mint },
-              "entry signature reconciliation unavailable — quarantine retained",
-            );
           }
+        } catch (err) {
+          // One unreadable signature or transient row must never prevent the
+          // worker from rehydrating every unrelated open position and starting
+          // its exit monitors. The durable unique claim keeps this mint safely
+          // quarantined until the recurring reconciliation succeeds.
+          uncertainEntryMints.add(claim.token_mint);
+          log.warn(
+            { err: safeDiagnostic(err), mint: claim.token_mint, claimId: claim.id },
+            "entry claim reconciliation deferred — quarantine retained",
+          );
         }
       }
       if ((claims?.length ?? 0) > 0) {
@@ -1100,19 +1592,22 @@ async function main() {
     configRefreshRunning = true;
     try {
       const next = await loadConfig(cfg.user_id);
-      if (!next?.target_wallet) return;
+      if (!next || configuredTargetWallets(next).length === 0) return;
       const previousTargets = targetWallets;
       const nextTargets = new Set(configuredTargetWallets(next));
       const previousEntryStrategy = automaticEntryStrategy(cfg);
       const nextEntryStrategy = automaticEntryStrategy(next);
       const nextConvictionConfig = convictionConfigFromBotConfig(next);
       const nextConvictionFingerprint = JSON.stringify(nextConvictionConfig);
+      const nextSupplyFingerprint = supplyAccumulationConfigFingerprint(next);
       const targetsChanged =
         Array.from(previousTargets).sort().join(",") !== Array.from(nextTargets).sort().join(",");
       const convictionConfigChanged = nextConvictionFingerprint !== convictionConfigFingerprint;
+      const supplyConfigChanged = nextSupplyFingerprint !== supplyConfigFingerprint;
       entryConfigTransitioning =
         previousEntryStrategy !== nextEntryStrategy ||
-        (nextEntryStrategy === "conviction" && (targetsChanged || convictionConfigChanged));
+        (nextEntryStrategy === "conviction" && (targetsChanged || convictionConfigChanged)) ||
+        (nextEntryStrategy === "supply_accumulation" && supplyConfigChanged);
 
       // Hydrate and atomically reconfigure the Conviction runtime before the
       // new strategy/config becomes visible to event handlers. During this
@@ -1145,20 +1640,16 @@ async function main() {
           await syncConvictionPositionExposure();
         }
       }
+      supplyConfigFingerprint = nextSupplyFingerprint;
       if (previousEntryStrategy !== nextEntryStrategy) {
         log.info(
           {
-            event:
-              nextEntryStrategy === "conviction"
-                ? "CONVICTION_MODE_ENABLED"
-                : "CONVICTION_MODE_DISABLED",
+            event: "AUTOMATIC_ENTRY_STRATEGY_CHANGED",
             previousEntryStrategy,
             nextEntryStrategy,
             tradingMode: cfg.conviction_trading_mode ?? "shadow",
           },
-          nextEntryStrategy === "conviction"
-            ? "Conviction Mode enabled — it is now the exclusive automatic entry strategy"
-            : "Conviction Mode disabled — the saved legacy entry strategy is restored",
+          "exclusive automatic entry strategy changed; existing exits remain active",
         );
       }
       if (targetsChanged)
@@ -1279,7 +1770,11 @@ async function main() {
     );
   }, 20_000);
   setInterval(() => {
-    checkFundingWalletReadiness(cfg.user_id, cfg.fixed_buy_usd)
+    const configuredBuyUsd =
+      automaticEntryStrategy(cfg) === "supply_accumulation"
+        ? Number(cfg.supply_accumulation_buy_usd ?? 20)
+        : cfg.fixed_buy_usd;
+    checkFundingWalletReadiness(cfg.user_id, configuredBuyUsd)
       .then((next) => {
         fundingReadiness = next;
       })
@@ -1303,7 +1798,6 @@ async function main() {
     if (cfg.crew_exit_enabled !== true) return;
     void refreshCrewWallets(cfg.crew_exit_min_mints ?? 4);
   }, 60_000);
-
 
   // Take-profit / stop-loss watcher — polls prices every 4s for all open positions.
   setInterval(() => {
@@ -1470,6 +1964,54 @@ async function main() {
   // by itself trigger a take-profit, trailing stop, or stop-loss.
   const positionPriceSanity = new Map<string, PriceSanityState>();
 
+  async function isSupplyEntryPosition(positionId: string): Promise<boolean> {
+    const cached = supplyEntryPositionCache.get(positionId);
+    if (cached !== undefined) return cached;
+    const { data, error } = await db
+      .from("entry_signal_claims")
+      .select("id")
+      .eq("user_id", cfg.user_id)
+      .eq("planned_position_id", positionId)
+      .eq("entry_strategy", "supply_accumulation")
+      .limit(1);
+    if (error) {
+      log.debug(
+        { err: safeDiagnostic(error), positionId },
+        "Supply entry provenance unavailable; using standard exit routing",
+      );
+      return false;
+    }
+    const isSupplyEntry = (data?.length ?? 0) > 0;
+    supplyEntryPositionCache.set(positionId, isSupplyEntry);
+    return isSupplyEntry;
+  }
+
+  async function positionPriceUsd(
+    positionId: string,
+    tokenMint: string,
+    decimals: number,
+  ): Promise<number | undefined> {
+    const indexedPrice = await priceUsd(tokenMint);
+    if (indexedPrice !== undefined) return indexedPrice;
+    if (!(await isSupplyEntryPosition(positionId))) return undefined;
+    try {
+      const [curve, solPrice] = await Promise.all([
+        loadPumpFunSupplySnapshot(rpc, tokenMint, { commitment: "confirmed" }),
+        priceUsd(WSOL),
+      ]);
+      if (curve && !curve.complete && curve.decimals === decimals && solPrice !== undefined) {
+        const curvePrice = pumpFunTokenPriceUsd(curve, solPrice);
+        if (curvePrice !== undefined) return curvePrice;
+      }
+    } catch (err) {
+      log.debug(
+        { err: safeDiagnostic(err), mint: tokenMint },
+        "Pump curve price fallback unavailable; using indexed price if present",
+      );
+    }
+    return undefined;
+  }
+
   async function checkTpSl() {
     if (
       !cfg.take_profit_enabled &&
@@ -1495,7 +2037,6 @@ async function main() {
     for (const id of positionPriceSanity.keys()) {
       if (!openIds.has(id)) positionPriceSanity.delete(id);
     }
-
 
     let mirrorSoldAt: Map<string, string> | null = null;
     if (cfg.mirror_custody_sell_exit_enabled === true && (positions?.length ?? 0) > 0) {
@@ -1539,7 +2080,7 @@ async function main() {
           continue;
         }
       }
-      const price = await priceUsd(pos.token_mint);
+      const price = await positionPriceUsd(pos.id, pos.token_mint, Number(pos.decimals ?? 0));
       if (!price || price <= 0) continue;
       if (cfg.price_sanity_enabled !== false) {
         const sanity = checkPriceSanity(
@@ -1660,9 +2201,7 @@ async function main() {
         );
       }
     }
-
   }
-
 
   async function checkConfiguredPositionExits() {
     const { data: positions, error } = await db
@@ -1781,6 +2320,18 @@ async function main() {
           position_id: positionId,
         });
       }
+      let pumpFunDirectFirst = false;
+      if (await isSupplyEntryPosition(positionId)) {
+        try {
+          const curve = await loadPumpFunSupplySnapshot(rpc, mint, { commitment: "processed" });
+          pumpFunDirectFirst = Boolean(curve && !curve.complete);
+        } catch (err) {
+          log.debug(
+            { err: safeDiagnostic(err), mint },
+            "active Pump curve check unavailable; exit will use normal route order",
+          );
+        }
+      }
       const result = await executeSwap({
         signerSecret: secret,
         inputMint: mint,
@@ -1792,6 +2343,7 @@ async function main() {
         slippageBps: 1500,
         route: cfg.execution_route,
         jitoTipSol: cfg.jito_tip_sol,
+        pumpFunDirectFirst,
       });
       landedResult = result;
       if (strategyEvent) {
@@ -2098,6 +2650,55 @@ async function main() {
       : tradeExecutionQueue.run(mint, () => exitExecutionQueue.run(positionId, runClaimedExit));
   }
 
+  const supplyBuyBackground = new BoundedBackgroundQueue(16, 512);
+  const supplySellBackground = new BoundedBackgroundQueue(8, 256);
+
+  function scheduleSupplyBackground(
+    event: FeedEvent,
+    task: () => Promise<void>,
+    lane: "buy" | "sell" = "buy",
+  ): void {
+    const identity = [
+      event.kind,
+      event.txSig,
+      event.kind === "swap" ? event.wallet : event.from,
+      event.tokenMint,
+      event.kind === "swap" ? event.side : "transfer",
+    ].join(":");
+    const result = (lane === "sell" ? supplySellBackground : supplyBuyBackground).schedule(
+      identity,
+      async () => {
+        try {
+          await task();
+        } catch (err) {
+          recordStrategyDecision(event, "failed", safeDiagnostic(err), {
+            metadata: { entryStrategy: "supply_accumulation", background: true },
+          });
+          log.error(
+            { err: safeDiagnostic(err), mint: event.tokenMint, txSig: event.txSig },
+            "background supply-accumulation handler failed; confirmed RPC recovery remains active",
+          );
+        }
+      },
+    );
+    if (result === "full") {
+      recordStrategyDecision(
+        event,
+        "tracked",
+        "hot-feed supply queue reached its safe bound; confirmed RPC recovery will replay it",
+        { metadata: { entryStrategy: "supply_accumulation", deferredToRpc: true } },
+      );
+      log.warn(
+        {
+          mint: event.tokenMint,
+          lane,
+          queue: lane === "sell" ? supplySellBackground.health() : supplyBuyBackground.health(),
+        },
+        "supply hot-feed work deferred to confirmed RPC recovery",
+      );
+    }
+  }
+
   async function handle(event: FeedEvent): Promise<void> {
     // This is bounded in-memory work. Supabase persistence happens on the
     // recorder timer and cannot delay the serial Geyser hot path.
@@ -2110,6 +2711,13 @@ async function main() {
       }
       if (event.kind === "swap") {
         if (targetWallets.has(event.wallet) && event.side === "buy") {
+          if (event.source === "geyser" && automaticEntryStrategy(cfg) === "supply_accumulation") {
+            // Yellowstone pauses while this callback is pending. Confirmation,
+            // curve reads, persistence, and execution all run off-path so the
+            // next buy/sell can be decoded and queued before the final send gate.
+            scheduleSupplyBackground(event, () => handleTargetBuy(event));
+            return;
+          }
           await handleTargetBuy(event);
           return;
         }
@@ -2118,7 +2726,25 @@ async function main() {
           // a potentially slow existing exit runs. Observation failure never
           // suppresses the independently configured sell/risk path.
           let convictionObservationError: unknown;
+          let supplyObservationError: unknown;
+          let supplyObservationPromise: Promise<void> | undefined;
           if (targetWallets.has(event.wallet)) {
+            if (cfg.supply_accumulation_mode_enabled === true) {
+              if (event.source === "geyser") {
+                scheduleSupplyBackground(
+                  event,
+                  () =>
+                    supplyObservationQueue.run(event.tokenMint, async () => {
+                      await observeSupplyAccumulationEvent(event);
+                    }),
+                  "sell",
+                );
+              } else {
+                supplyObservationPromise = supplyObservationQueue.run(event.tokenMint, async () => {
+                  await observeSupplyAccumulationEvent(event);
+                });
+              }
+            }
             try {
               await observeConvictionSell(event);
             } catch (err) {
@@ -2130,10 +2756,22 @@ async function main() {
             }
           }
           await handleFollowerSell(event);
+          if (supplyObservationPromise) {
+            try {
+              await supplyObservationPromise;
+            } catch (err) {
+              supplyObservationError = err;
+              log.warn(
+                { err: safeDiagnostic(err), mint: event.tokenMint },
+                "supply-accumulation target-sell observation failed after exit handling",
+              );
+            }
+          }
           // Keep the RPC cursor on this signature so a transient Conviction
           // persistence/valuation failure can replay after the independent
           // exit path has had its chance to act. Durable dedupe makes replay
           // safe for both systems.
+          if (supplyObservationError) throw supplyObservationError;
           if (convictionObservationError) throw convictionObservationError;
           return;
         }
@@ -2182,8 +2820,9 @@ async function main() {
     wallet: string,
     linkReason: "entry" | "coordinated" | "additional_buy" | "recovered",
     observedAt = new Date().toISOString(),
+    allowDurableHistoricalTarget = false,
   ) {
-    if (!targetWallets.has(wallet)) return;
+    if (!allowDurableHistoricalTarget && !targetWallets.has(wallet)) return;
     const { error } = await db.from("position_target_wallets").upsert(
       {
         user_id: cfg.user_id,
@@ -2367,6 +3006,310 @@ async function main() {
     if (!authoritativeEventMs || !Number.isFinite(authoritativeEventMs)) return false;
     const ageMs = Date.now() - authoritativeEventMs;
     return ageMs >= -5_000 && ageMs <= maxAgeMs;
+  }
+
+  function exactSupplyEventAmountRaw(event: SwapEvent): string | undefined {
+    const raw =
+      event.side === "buy"
+        ? (event.grossAmountRaw ?? event.amountRaw)
+        : (event.sellAttribution?.soldAmountRaw ?? event.amountRaw);
+    if (typeof raw !== "string" || !/^\d+$/.test(raw)) return undefined;
+    try {
+      return BigInt(raw) > 0n ? BigInt(raw).toString() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function loadSupplyCurveViews(event: SwapEvent) {
+    const [confirmedCurve, processedCurve] = await Promise.all([
+      loadPumpFunSupplySnapshot(rpc, event.tokenMint, {
+        commitment: "confirmed",
+        minContextSlot: event.slot,
+      }),
+      loadPumpFunSupplySnapshot(rpc, event.tokenMint, {
+        commitment: "processed",
+        minContextSlot: event.slot,
+      }),
+    ]);
+    if (
+      !confirmedCurve ||
+      !processedCurve ||
+      confirmedCurve.complete ||
+      processedCurve.complete ||
+      confirmedCurve.observedSlot < event.slot ||
+      processedCurve.observedSlot < event.slot ||
+      confirmedCurve.totalSupplyRaw !== processedCurve.totalSupplyRaw ||
+      confirmedCurve.decimals !== processedCurve.decimals ||
+      confirmedCurve.decimals !== event.decimals
+    ) {
+      return null;
+    }
+    return { confirmedCurve, processedCurve };
+  }
+
+  async function loadCanonicalSupplyEvidence(event: SwapEvent, confirmationTimeoutMs: number) {
+    const source = await loadConfirmedSourceTransaction(rpc, event.txSig, {
+      expectedSlot: event.slot,
+      // RPC recovery has an authoritative block time. Yellowstone receive
+      // timestamps are not chain time and must never establish freshness.
+      knownBlockTimeMs: event.source === "rpc" ? event.blockTimeMs : undefined,
+      timeoutMs: confirmationTimeoutMs,
+      searchTransactionHistory: event.source === "rpc",
+    });
+    if (!source) {
+      // A confirmed-RPC observation is the durable recovery source. If its
+      // canonical status cannot be proven, keep that wallet cursor on the
+      // signature instead of silently consuming the event.
+      if (event.source === "rpc") {
+        throw new Error("confirmed supply source status is temporarily unavailable");
+      }
+      return null;
+    }
+    event.blockTimeMs = source.blockTimeMs;
+    const curves = await loadSupplyCurveViews(event);
+    return curves ? { source, ...curves } : null;
+  }
+
+  async function observeSupplyAccumulationEvent(event: SwapEvent) {
+    if (cfg.supply_accumulation_mode_enabled !== true) return null;
+    const attributionReliable =
+      event.side === "buy" ? event.verifiedSwap === true : event.sellAttribution?.verified === true;
+    const amountRaw = exactSupplyEventAmountRaw(event);
+    if (!attributionReliable || !amountRaw) {
+      recordStrategyDecision(
+        event,
+        "filtered",
+        "supply accumulation requires exact verified raw token attribution",
+        { metadata: { entryStrategy: "supply_accumulation" } },
+      );
+      return null;
+    }
+
+    // Only confirmed/finalized source events enter the aggregate. A processed
+    // observation that drops from the canonical chain can never supply part of
+    // the configured 10–20% threshold.
+    const evidence = await loadCanonicalSupplyEvidence(
+      event,
+      event.source === "geyser" ? 1_500 : 0,
+    );
+    if (!evidence) {
+      recordStrategyDecision(
+        event,
+        "tracked",
+        "supply observation is not yet confirmed with matching Pump curve evidence",
+        { metadata: { entryStrategy: "supply_accumulation", actionable: false } },
+      );
+      return null;
+    }
+
+    const valuationSlot = Math.max(
+      evidence.confirmedCurve.observedSlot,
+      evidence.processedCurve.observedSlot,
+    );
+    let result = await supplyAccumulationStore.record(event, {
+      amountRaw,
+      totalSupplyRaw: evidence.confirmedCurve.totalSupplyRaw.toString(),
+      valuationSlot,
+      marketDataReliable: false,
+      pumpFunVerified: true,
+      classificationReliable: attributionReliable,
+    });
+    if (result.payloadMismatch) {
+      throw new Error("supply accumulation event payload conflict was quarantined");
+    }
+
+    // Price is irrelevant until the exact confirmed raw aggregate reaches the
+    // configured threshold. This keeps ordinary 3% lots off the HTTP hot path.
+    if (
+      event.side === "buy" &&
+      result.state.thresholdReached &&
+      result.state.lastEventSlot === String(event.slot)
+    ) {
+      const solPrice = await priceUsd(WSOL);
+      const marketCaps =
+        solPrice === undefined
+          ? []
+          : [
+              pumpFunCurrentMarketCapUsd(evidence.confirmedCurve, solPrice),
+              pumpFunCurrentMarketCapUsd(evidence.processedCurve, solPrice),
+            ].filter((value): value is number => value !== undefined);
+      if (marketCaps.length === 2) {
+        result = await supplyAccumulationStore.record(event, {
+          amountRaw,
+          totalSupplyRaw: evidence.confirmedCurve.totalSupplyRaw.toString(),
+          marketCapUsd: Math.max(...marketCaps),
+          valuationSlot,
+          marketDataReliable: true,
+          pumpFunVerified: true,
+          classificationReliable: attributionReliable,
+        });
+        if (result.payloadMismatch) {
+          throw new Error("supply accumulation event enrichment conflict was quarantined");
+        }
+      }
+    }
+    return { result, evidence };
+  }
+
+  type SupplySubmissionValidation = {
+    state: SupplyAccumulationState;
+    currentMarketCapUsd: number;
+    projectedPostBuyMarketCapUsd: number;
+  };
+
+  async function validateSupplyAccumulationSubmission(
+    event: SwapEvent,
+    amountLamports: number,
+    waitForConfirmation: boolean,
+  ): Promise<SupplySubmissionValidation | null> {
+    if (
+      !cfg.enabled ||
+      entryConfigTransitioning ||
+      automaticEntryStrategy(cfg) !== "supply_accumulation" ||
+      cfg.supply_accumulation_mode_enabled !== true ||
+      currentEntryMonitoringGate().blocked ||
+      !Number.isSafeInteger(amountLamports) ||
+      amountLamports <= 0
+    ) {
+      return null;
+    }
+    return supplyObservationQueue.run(event.tokenMint, async () => {
+      const source = await loadConfirmedSourceTransaction(rpc, event.txSig, {
+        expectedSlot: event.slot,
+        knownBlockTimeMs: event.source === "rpc" ? event.blockTimeMs : undefined,
+        timeoutMs: waitForConfirmation ? 1_500 : 0,
+        searchTransactionHistory: event.source === "rpc",
+      });
+      if (!source || !confirmedSourceIsFresh(source, 15_000)) return null;
+      event.blockTimeMs = source.blockTimeMs;
+
+      const [state, solPrice] = await Promise.all([
+        supplyAccumulationStore.state(event.tokenMint),
+        priceUsd(WSOL),
+      ]);
+      if (
+        solPrice === undefined ||
+        !state.ok ||
+        !state.modeEnabled ||
+        !state.entryReady ||
+        !state.dataReliable ||
+        state.payloadConflict ||
+        state.lastEventSlot !== String(event.slot) ||
+        state.decimals !== event.decimals
+      ) {
+        return null;
+      }
+      if (cfg.custody_journey_enabled !== true) return null;
+      const custodyGate = await supplyAccumulationStore.custodyDistributionGate(
+        event.tokenMint,
+        state.windowStartedAt,
+        { txSig: event.txSig, slot: event.slot, targetWallet: event.wallet },
+      );
+      if (!custodyGate.safe) return null;
+
+      // Load both chain views last. No database, HTTP, or classification await
+      // occurs after this hard current/post-fill cap snapshot in beforeSubmit.
+      const curves = await loadSupplyCurveViews(event);
+      if (!curves || state.totalSupplyRaw !== curves.confirmedCurve.totalSupplyRaw.toString()) {
+        return null;
+      }
+      if (
+        !reachesSupplyThreshold(
+          BigInt(state.netAcquiredRaw),
+          curves.confirmedCurve.totalSupplyRaw,
+          state.thresholdPct,
+        )
+      ) {
+        return null;
+      }
+      const configuredCap = Math.min(15_000, state.maxMarketCapUsd);
+      const maxSpendLamports = maximumSpendWithSlippageLamports(BigInt(amountLamports), 800);
+      if (maxSpendLamports === null) return null;
+      const caps = strictestPumpFunMarketCaps(
+        [curves.confirmedCurve, curves.processedCurve],
+        solPrice,
+        maxSpendLamports,
+        configuredCap,
+      );
+      // Every prior await can consume the 15-second reaction budget. Recheck
+      // chain time after the final curve read, immediately before returning
+      // authorization to the executor's no-more-await submission boundary.
+      if (!caps?.belowCap || !confirmedSourceIsFresh(source, 15_000)) return null;
+
+      return {
+        state,
+        currentMarketCapUsd: caps.currentMarketCapUsd,
+        projectedPostBuyMarketCapUsd: caps.projectedPostBuyMarketCapUsd,
+      };
+    });
+  }
+
+  async function processSupplyAccumulationTargetBuy(
+    event: SwapEvent,
+    firstBuy: boolean | Promise<boolean>,
+  ) {
+    const observed = await supplyObservationQueue.run(event.tokenMint, async () => {
+      // Classification is part of the ordered mint lane. A slow lookup for an
+      // earlier forwarded buy can therefore never let a later slot mutate the
+      // supply ledger first.
+      const recipients = Array.from(
+        new Set([...(event.inferredRecipients ?? []), ...(event.custodyForwardRecipients ?? [])]),
+      );
+      if (recipients.length > 0) {
+        const recipientChecks = await Promise.all(
+          recipients.map((recipient) => isEligibleFollowerRecipient(recipient)),
+        );
+        if (recipientChecks.some((eligible) => !eligible)) {
+          recordStrategyDecision(
+            event,
+            "skipped",
+            "forwarded supply output recipient is program controlled, off-curve, or unavailable",
+            { metadata: { entryStrategy: "supply_accumulation" } },
+          );
+          return null;
+        }
+      }
+      return observeSupplyAccumulationEvent(event);
+    });
+    if (!observed) return;
+    const { state } = observed.result;
+    const metadata = {
+      entryStrategy: "supply_accumulation",
+      netSupplyPct: state.netSupplyPct,
+      thresholdPct: state.thresholdPct,
+      windowSeconds: state.windowSeconds,
+      contributingWallets: state.rootWallets,
+      dataReliable: state.dataReliable,
+    };
+    if (!isFreshAutomaticAction(event, 15_000)) {
+      recordStrategyDecision(event, "tracked", "historical supply accumulation evidence stored", {
+        market_cap_usd: state.latestMarketCapUsd ?? undefined,
+        metadata: { ...metadata, actionable: false },
+      });
+      return;
+    }
+    if (!state.entryReady) {
+      recordStrategyDecision(
+        event,
+        "tracked",
+        `market-maker net acquisition ${state.netSupplyPct.toFixed(2)}% has not passed the live entry gate`,
+        {
+          market_cap_usd: state.latestMarketCapUsd ?? undefined,
+          metadata,
+        },
+      );
+      return;
+    }
+    const resolvedFirstBuy = typeof firstBuy === "boolean" ? firstBuy : await firstBuy;
+    await tryCopyBuy(event, "market-maker supply accumulation threshold reached", {
+      entryStrategy: "supply_accumulation",
+      entryMode: "regular",
+      firstBuy: resolvedFirstBuy,
+      targetBuyUsd: undefined,
+      coordinatedWallets: state.rootWallets,
+      supplyState: state,
+    });
   }
 
   async function classifyTransferRecipients(
@@ -3068,17 +4011,32 @@ async function main() {
     }
     const transactionId = event.txSig || `slot-${event.slot}`;
     const dedupeKey = `${event.wallet}:${transactionId}:${event.tokenMint}`;
+    const selectedEntryStrategy = automaticEntryStrategy(cfg);
+
+    const activityPromise = targetBuyActivityAccounting.getOrCreate(dedupeKey, () =>
+      recordOpenPositionTargetBuy(event),
+    );
+    const firstBuyPromise = targetFirstBuyAccounting.getOrCreate(dedupeKey, () =>
+      observeTargetFirstBuy(event.wallet, event.tokenMint),
+    );
+
+    if (selectedEntryStrategy === "supply_accumulation") {
+      // Bookkeeping and the confirmed supply ledger run concurrently. The live
+      // Geyser callback itself already returned before this background task.
+      await Promise.all([
+        activityPromise,
+        firstBuyPromise.then(() => undefined),
+        processSupplyAccumulationTargetBuy(event, firstBuyPromise),
+      ]);
+      return;
+    }
 
     // Recovered buys must still reset target inactivity and repair target
     // linkage/history. Only the entry action is freshness-gated.
-    await targetBuyActivityAccounting.getOrCreate(dedupeKey, () =>
-      recordOpenPositionTargetBuy(event),
-    );
-    const firstBuy = await targetFirstBuyAccounting.getOrCreate(dedupeKey, () =>
-      observeTargetFirstBuy(event.wallet, event.tokenMint),
-    );
+    await activityPromise;
+    const firstBuy = await firstBuyPromise;
     const freshForAutomaticEntry = isFreshAutomaticAction(event, 15_000);
-    if (!freshForAutomaticEntry && automaticEntryStrategy(cfg) !== "conviction") {
+    if (!freshForAutomaticEntry && selectedEntryStrategy !== "conviction") {
       recordStrategyDecision(event, "tracked", "historical target buy recovered without entry", {
         metadata: {
           delivery: event.delivery ?? "live",
@@ -3220,6 +4178,13 @@ async function main() {
       );
       return;
     }
+    if (entryStrategy === "supply_accumulation") {
+      log.warn(
+        { mint: event.tokenMint },
+        "legacy target-buy path blocked by the exclusive Supply Accumulation router",
+      );
+      return;
+    }
     if (!cfg.enabled) {
       log.info(
         { wallet: event.wallet, mint: event.tokenMint },
@@ -3326,7 +4291,6 @@ async function main() {
         log.error({ err: safeDiagnostic(err) }, "crew-wallet exit attempt failed safely"),
       );
     }
-
 
     if (!targetWallets.has(ev.from)) {
       if (ctx) {
@@ -3652,6 +4616,7 @@ async function main() {
   async function handleDirectTargetSell(
     ev: SwapEvent,
     ctx: { positionId: string; tokenMint: string; targetWallet: string },
+    options: { durableRecoveredSupplyPositionId?: string; tradeLockHeld?: boolean } = {},
   ) {
     if (cfg.direct_target_sell_exit_mode === "off") {
       recordStrategyDecision(ev, "tracked", "direct target sell observed; response is off", {
@@ -3670,7 +4635,11 @@ async function main() {
       );
       return;
     }
-    if (!isFreshAutomaticAction(ev, 120_000)) {
+    const exactDurableRecovery =
+      options.durableRecoveredSupplyPositionId === ctx.positionId &&
+      ev.source === "rpc" &&
+      ev.delivery === "catchup";
+    if (!exactDurableRecovery && !isFreshAutomaticAction(ev, 120_000)) {
       recordStrategyDecision(ev, "tracked", "historical target sale recovered without execution", {
         position_id: ctx.positionId,
         metadata: { stale: true },
@@ -3738,17 +4707,39 @@ async function main() {
       "direct_target_sell",
       ev,
       `verified linked target sell (${cfg.direct_target_sell_exit_mode})`,
+      {},
+      options.tradeLockHeld === true,
     );
   }
 
-  async function handleFollowerSell(ev: SwapEvent): Promise<void> {
+  async function handleFollowerSell(
+    ev: SwapEvent,
+    options: { durableRecoveredSupplyPositionId?: string; tradeLockHeld?: boolean } = {},
+  ): Promise<void> {
     const ctx = monitor.activeForMint(ev.tokenMint);
     if (!ctx) {
+      if (
+        uncertainEntryMints.has(ev.tokenMint) &&
+        ev.verifiedSwap === true &&
+        ev.sellAttribution?.verified === true
+      ) {
+        bufferEntrySell(ev);
+        recordStrategyDecision(
+          ev,
+          "tracked",
+          "verified sell buffered while the copied entry is landing and being armed",
+          { metadata: { inFlightEntry: true } },
+        );
+        return;
+      }
       recordStrategyDecision(ev, "skipped", "no active copied position for this token");
       return;
     }
-    if (targetWallets.has(ev.wallet)) {
-      return handleDirectTargetSell(ev, ctx);
+    if (
+      targetWallets.has(ev.wallet) ||
+      options.durableRecoveredSupplyPositionId === ctx.positionId
+    ) {
+      return handleDirectTargetSell(ev, ctx, options);
     }
 
     if (!ev.verifiedSwap || !ev.sellAttribution?.verified) {
@@ -3989,7 +4980,8 @@ async function main() {
     reason = "target copy buy",
     options: CopyBuyOptions,
   ): Promise<string | null> {
-    if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== options.entryMode) {
+    const expectedStrategy = copyBuyEntryStrategy(options);
+    if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy) {
       recordStrategyDecision(
         event,
         "skipped",
@@ -4022,9 +5014,10 @@ async function main() {
     reason: string,
     options: CopyBuyOptions,
   ): Promise<string | null> {
-    if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== options.entryMode) {
+    const expectedStrategy = copyBuyEntryStrategy(options);
+    if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy) {
       log.info(
-        { mint: event.tokenMint, expectedStrategy: options.entryMode },
+        { mint: event.tokenMint, expectedStrategy },
         "entry cancelled after queue wait — automatic strategy changed",
       );
       recordStrategyDecision(event, "skipped", "automatic entry strategy changed while queued");
@@ -4073,6 +5066,7 @@ async function main() {
         target: event.wallet,
         coordinatedWallets: options.coordinatedWallets,
         entryMode: options.entryMode,
+        entryStrategy: expectedStrategy,
         mint: event.tokenMint,
         tokenAmount: event.amountTokens,
         solDelta: event.solDelta,
@@ -4105,11 +5099,18 @@ async function main() {
       return null;
     }
 
-    const meta = await loadTokenMeta(event.tokenMint);
+    const supplyEntry = expectedStrategy === "supply_accumulation";
+    const meta: TokenMeta = supplyEntry
+      ? {
+          marketCapUsd: options.supplyState?.latestMarketCapUsd ?? undefined,
+          isPumpFun: true,
+          socials: {},
+        }
+      : await loadTokenMeta(event.tokenMint);
 
     // Revival gate: only enter aged, dormant coins (a dead coin the target is
     // reviving), on the first signal. Applies only in revival-only mode.
-    if (env.REVIVAL_ONLY_MODE) {
+    if (env.REVIVAL_ONLY_MODE && !supplyEntry) {
       const ageDays =
         meta.pairCreatedAtMs !== undefined
           ? (Date.now() - meta.pairCreatedAtMs) / 86_400_000
@@ -4141,6 +5142,7 @@ async function main() {
       has_socials: Boolean(meta.socials.website || meta.socials.twitter || meta.socials.telegram),
       metadata: {
         entryMode: options.entryMode,
+        entryStrategy: expectedStrategy,
         pairCreatedAtMs: meta.pairCreatedAtMs,
         isPumpFun: meta.isPumpFun,
         firstBuy: options.firstBuy,
@@ -4157,8 +5159,13 @@ async function main() {
     if (priorError)
       throw new Error(`traded-token lookup failed: ${safeDiagnostic(priorError.message)}`);
 
-    const decision =
-      options.entryMode === "coordinated"
+    const decision = supplyEntry
+      ? prior !== null
+        ? ({ pass: false, reason: "already traded this token" } as const)
+        : options.supplyState?.entryReady === true
+          ? ({ pass: true } as const)
+          : ({ pass: false, reason: "supply accumulation state is not entry-ready" } as const)
+      : options.entryMode === "coordinated"
         ? checkCoordinatedEntry(cfg, meta, Boolean(prior), event.timestampMs)
         : checkEntry(cfg, event, meta, { first: options.firstBuy, already: Boolean(prior) });
     if (!decision.pass) {
@@ -4213,12 +5220,19 @@ async function main() {
         coordinatedWalletCount >= 3 && threeWalletBuyUsd > 0
           ? threeWalletBuyUsd
           : Number(cfg.coordinated_fixed_buy_usd);
-      let buyUsd =
-        options.entryMode === "coordinated" ? coordinatedBuyUsd : Number(cfg.fixed_buy_usd);
+      let buyUsd = supplyEntry
+        ? Number(cfg.supply_accumulation_buy_usd ?? 20)
+        : options.entryMode === "coordinated"
+          ? coordinatedBuyUsd
+          : Number(cfg.fixed_buy_usd);
       // USDC-conviction gate + sizing (env-flagged, coordinated entries only):
       // skip coins the target has barely committed to, and size up as his
       // committed USDC rises. Leaves behaviour unchanged when the flag is off.
-      if (env.USDC_CONVICTION_ENABLED && !env.REVIVAL_ONLY_MODE && options.entryMode === "coordinated") {
+      if (
+        env.USDC_CONVICTION_ENABLED &&
+        !env.REVIVAL_ONLY_MODE &&
+        options.entryMode === "coordinated"
+      ) {
         const hisUsd = targetConvictionUsdFor(event.tokenMint, Date.now());
         const minUsd = Number(env.USDC_CONVICTION_MIN_USD);
         if (hisUsd < minUsd) {
@@ -4241,11 +5255,36 @@ async function main() {
           buyUsd = buyUsd + (maxUsd - buyUsd) * t;
         }
         log.info(
-          { mint: event.tokenMint, targetUsdc: Math.round(hisUsd), sizedBuyUsd: Number(buyUsd.toFixed(2)) },
+          {
+            mint: event.tokenMint,
+            targetUsdc: Math.round(hisUsd),
+            sizedBuyUsd: Number(buyUsd.toFixed(2)),
+          },
           "conviction gate: passed",
         );
       }
       const amountLamports = Math.floor((buyUsd / solPrice) * 1e9);
+      if (supplyEntry) {
+        const validation = await validateSupplyAccumulationSubmission(event, amountLamports, true);
+        if (!validation) {
+          recordStrategyDecision(
+            event,
+            "skipped",
+            "supply threshold, confirmed source, or sub-$15k curve gate changed before claim",
+            metaPatch,
+          );
+          return null;
+        }
+        options.supplyState = validation.state;
+        options.coordinatedWallets = validation.state.rootWallets;
+        metaPatch.market_cap_usd = validation.currentMarketCapUsd;
+        metaPatch.metadata = {
+          ...(metaPatch.metadata ?? {}),
+          netSupplyPct: validation.state.netSupplyPct,
+          thresholdPct: validation.state.thresholdPct,
+          projectedPostBuyMarketCapUsd: validation.projectedPostBuyMarketCapUsd,
+        };
+      }
       if (!cfg.enabled) {
         log.info(
           { mint: event.tokenMint, txSig: event.txSig },
@@ -4273,7 +5312,7 @@ async function main() {
         );
         return null;
       }
-      if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== options.entryMode) {
+      if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy) {
         recordStrategyDecision(
           event,
           "skipped",
@@ -4283,7 +5322,14 @@ async function main() {
         return null;
       }
 
-      const entryClaim = await claimEntrySubmission(event, options.entryMode, amountLamports);
+      const entryClaim = await claimEntrySubmission(
+        event,
+        options.entryMode,
+        amountLamports,
+        buyUsd,
+        expectedStrategy,
+        options.coordinatedWallets,
+      );
       if (!entryClaim) {
         recordStrategyDecision(
           event,
@@ -4294,18 +5340,15 @@ async function main() {
         return null;
       }
       uncertainEntryMints.add(event.tokenMint);
-      await updateEntryClaim(entryClaim.id, {
-        status: "submitted",
-        submission_started_at: new Date().toISOString(),
-        error_code: null,
-      });
+      const entrySubmissionStartedAt = new Date().toISOString();
+      await beginEntryClaimSubmission(entryClaim.id, entrySubmissionStartedAt);
 
       // The durable claim/update calls above yield to the event loop. Config or
       // monitoring health may have changed during those awaits, so re-check at
       // the final boundary with no intervening await before executeSwap starts.
       const finalSubmissionGate = currentEntryMonitoringGate();
       const strategyChangedAfterClaim =
-        entryConfigTransitioning || automaticEntryStrategy(cfg) !== options.entryMode;
+        entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy;
       if (!cfg.enabled || finalSubmissionGate.blocked || strategyChangedAfterClaim) {
         const gateReason = strategyChangedAfterClaim
           ? "automatic entry strategy changed after the durable claim"
@@ -4362,11 +5405,40 @@ async function main() {
           route: cfg.execution_route,
           jitoTipSol: cfg.jito_tip_sol,
           outputDecimals: event.decimals,
-          beforeSubmit: () =>
-            cfg.enabled === true &&
-            !entryConfigTransitioning &&
-            automaticEntryStrategy(cfg) === options.entryMode &&
-            !currentEntryMonitoringGate().blocked,
+          pumpFunDirectOnly: supplyEntry,
+          onPrepared: supplyEntry
+            ? async ({ txSig, lastValidBlockHeight }) => {
+                await persistPreparedSupplyEntryClaim(
+                  entryClaim.id,
+                  entrySubmissionStartedAt,
+                  txSig,
+                  lastValidBlockHeight,
+                );
+              }
+            : undefined,
+          beforeSubmit: async () => {
+            const genericGate =
+              cfg.enabled === true &&
+              !entryConfigTransitioning &&
+              automaticEntryStrategy(cfg) === expectedStrategy &&
+              !currentEntryMonitoringGate().blocked;
+            if (!genericGate) return false;
+            if (!supplyEntry) return true;
+            const validation = await validateSupplyAccumulationSubmission(
+              event,
+              amountLamports,
+              false,
+            );
+            if (!validation) return false;
+            options.supplyState = validation.state;
+            options.coordinatedWallets = validation.state.rootWallets;
+            return (
+              cfg.enabled === true &&
+              !entryConfigTransitioning &&
+              automaticEntryStrategy(cfg) === expectedStrategy &&
+              !currentEntryMonitoringGate().blocked
+            );
+          },
         });
       } catch (err) {
         const disposition = entryClaimFailureDisposition(err);
@@ -4467,12 +5539,7 @@ async function main() {
           `copy buy ${result.txSig} landed but position ${positionId} could not be read back`,
         );
       }
-      await monitor.onCopyBuy({
-        positionId: pos.id,
-        tokenMint: event.tokenMint,
-        targetWallet: event.wallet,
-        entrySlot: event.slot > 0 ? event.slot : undefined,
-      });
+      if (supplyEntry) supplyEntryPositionCache.set(pos.id, true);
       const linkedTargets = new Set([event.wallet, ...(options.coordinatedWallets ?? [])]);
       for (const wallet of linkedTargets) {
         await linkTargetToPosition(
@@ -4482,13 +5549,12 @@ async function main() {
           targetBuyAt,
         );
       }
-      await updateEntryClaim(entryClaim.id, {
-        status: "persisted",
-        error_code: null,
-        persisted_at: new Date().toISOString(),
+      await monitor.onCopyBuy({
+        positionId: pos.id,
+        tokenMint: event.tokenMint,
+        targetWallet: event.wallet,
+        entrySlot: event.slot > 0 ? event.slot : undefined,
       });
-      uncertainEntryMints.delete(event.tokenMint);
-
       const { error: tradeError } = await db.from("trades").insert({
         user_id: cfg.user_id,
         position_id: pos.id,
@@ -4501,19 +5567,47 @@ async function main() {
         latency_ms: result.latencyMs,
         route: result.route,
       });
-      if (tradeError)
+      if (tradeError) {
         log.error(
           { err: safeDiagnostic(tradeError), positionId: pos.id },
           "copy buy landed but trade log save failed",
         );
+        if (supplyEntry) {
+          throw new Error(`supply buy trade log save failed: ${safeDiagnostic(tradeError)}`);
+        }
+      }
       const { error: tradedTokenError } = await db
         .from("traded_tokens")
         .upsert({ user_id: cfg.user_id, token_mint: event.tokenMint });
-      if (tradedTokenError)
+      if (tradedTokenError) {
         log.error(
           { err: safeDiagnostic(tradedTokenError), mint: event.tokenMint },
           "could not save traded-token history",
         );
+        if (supplyEntry) {
+          throw new Error(
+            `supply buy traded-token save failed: ${safeDiagnostic(tradedTokenError)}`,
+          );
+        }
+      }
+      if (supplyEntry) {
+        // Wait for every already-queued same-mint observation, then replay all
+        // exact confirmed sells that landed after the entry source slot while
+        // this mint lock is still held. The buy claim is not finalized until
+        // those inherited exit signals have been durably handled.
+        await supplyObservationQueue.run(event.tokenMint, async () => undefined);
+        await processDurableSupplySells(pos.id, event.tokenMint, event.slot, true);
+      }
+      // This is the final durable write. A supply claim remains landed and
+      // quarantined until its position, monitor links, trade row, and
+      // already-traded guard are all recoverably installed.
+      await updateEntryClaim(entryClaim.id, {
+        status: "persisted",
+        error_code: null,
+        persisted_at: new Date().toISOString(),
+      });
+      uncertainEntryMints.delete(event.tokenMint);
+      schedulePendingEntrySellDrain(event.tokenMint);
 
       for (const transfer of pendingTransfers.drainForLandedBuy(event.tokenMint, event.slot)) {
         const classifiedPending = await classifyTransferRecipients(transfer);

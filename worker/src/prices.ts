@@ -6,6 +6,38 @@ const PRICE_CACHE_TTL_MS = 2_500;
 const priceCache = new Map<string, { value: number; expiresAt: number }>();
 const inFlight = new Map<string, Promise<number | undefined>>();
 
+export function dexScreenerPriceForBase(payload: unknown, mint: string): number | undefined {
+  const pairs =
+    payload &&
+    typeof payload === "object" &&
+    Array.isArray((payload as { pairs?: unknown[] }).pairs)
+      ? ((payload as { pairs: unknown[] }).pairs ?? [])
+      : [];
+  const candidates = pairs
+    .map((pair) => {
+      if (!pair || typeof pair !== "object") return undefined;
+      const row = pair as Record<string, unknown>;
+      const baseAddress =
+        row.baseToken && typeof row.baseToken === "object"
+          ? String((row.baseToken as Record<string, unknown>).address ?? "")
+          : "";
+      // DexScreener's priceUsd describes baseToken. Using a pair where the
+      // requested mint is the quote token can turn a $150 SOL price into $1.
+      if (baseAddress !== mint) return undefined;
+      const price = Number(row.priceUsd);
+      const liquidity = Number(
+        row.liquidity && typeof row.liquidity === "object"
+          ? (row.liquidity as Record<string, unknown>).usd
+          : 0,
+      );
+      if (!Number.isFinite(price) || price <= 0) return undefined;
+      return { price, liquidity: Number.isFinite(liquidity) ? liquidity : 0 };
+    })
+    .filter((row): row is { price: number; liquidity: number } => row !== undefined)
+    .sort((a, b) => b.liquidity - a.liquidity);
+  return candidates[0]?.price;
+}
+
 export async function priceUsd(mint: string): Promise<number | undefined> {
   const cached = priceCache.get(mint);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
@@ -40,23 +72,7 @@ async function fetchPriceUsd(mint: string): Promise<number | undefined> {
       signal: AbortSignal.timeout(1_500),
     });
     if (!response.ok) return undefined;
-    const payload = (await response.json()) as { pairs?: unknown[] };
-    const candidates = (Array.isArray(payload.pairs) ? payload.pairs : [])
-      .map((pair) => {
-        if (!pair || typeof pair !== "object") return undefined;
-        const row = pair as Record<string, unknown>;
-        const price = Number(row.priceUsd);
-        const liquidity = Number(
-          row.liquidity && typeof row.liquidity === "object"
-            ? (row.liquidity as Record<string, unknown>).usd
-            : 0,
-        );
-        if (!Number.isFinite(price) || price <= 0) return undefined;
-        return { price, liquidity: Number.isFinite(liquidity) ? liquidity : 0 };
-      })
-      .filter((row): row is { price: number; liquidity: number } => row !== undefined)
-      .sort((a, b) => b.liquidity - a.liquidity);
-    return candidates[0]?.price;
+    return dexScreenerPriceForBase(await response.json(), mint);
   } catch {
     return undefined;
   }
