@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type {
-  ConfirmedSignatureInfo,
-  ParsedTransactionWithMeta,
-} from "@solana/web3.js";
+import type { ConfirmedSignatureInfo, ParsedTransactionWithMeta } from "@solana/web3.js";
 import {
   loadFreshTailFinalizedTransactions,
   type FreshTailTransactionConnection,
@@ -51,10 +48,7 @@ function transaction(row: ConfirmedSignatureInfo): ParsedTransactionWithMeta {
 }
 
 function rpc(
-  handler: (
-    signatures: string[],
-    call: number,
-  ) => Promise<Array<ParsedTransactionWithMeta | null>>,
+  handler: (signatures: string[], call: number) => Promise<Array<ParsedTransactionWithMeta | null>>,
 ): FreshTailTransactionConnection & { calls: string[][] } {
   const calls: string[][] = [];
   return {
@@ -71,7 +65,9 @@ function rpc(
 test("rebinds reordered RPC batches and preserves durable scan order", async () => {
   const rows = [signature("oldest", 10), signature("middle", 11), signature("newest", 12)];
   const connection = rpc(async (requested) =>
-    [...requested].reverse().map((value) => transaction(rows.find((row) => row.signature === value)!)),
+    [...requested]
+      .reverse()
+      .map((value) => transaction(rows.find((row) => row.signature === value)!)),
   );
   const result = await loadFreshTailFinalizedTransactions(connection, {
     signatures: rows,
@@ -98,30 +94,42 @@ test("accepts a finalized failed transaction while preserving failure identity",
 
 test("fails closed on absent, substituted, duplicate, or stale transaction identity", async () => {
   const row = signature("expected", 30);
-  const unavailable = await loadFreshTailFinalizedTransactions(rpc(async () => [null]), {
-    signatures: [row],
-  });
-  assert.deepEqual(
-    unavailable.ok ? null : [unavailable.code, unavailable.retryable],
-    ["transaction_unavailable", true],
+  const unavailable = await loadFreshTailFinalizedTransactions(
+    rpc(async () => [null]),
+    {
+      signatures: [row],
+    },
   );
+  assert.deepEqual(unavailable.ok ? null : [unavailable.code, unavailable.retryable], [
+    "transaction_unavailable",
+    true,
+  ]);
 
   const substituted = transaction(signature("other", 30));
-  const wrongSet = await loadFreshTailFinalizedTransactions(rpc(async () => [substituted]), {
-    signatures: [row],
-  });
+  const wrongSet = await loadFreshTailFinalizedTransactions(
+    rpc(async () => [substituted]),
+    {
+      signatures: [row],
+    },
+  );
   assert.equal(wrongSet.ok ? null : wrongSet.code, "transaction_identity_conflict");
 
-  const duplicateRows = await loadFreshTailFinalizedTransactions(rpc(async () => []), {
-    signatures: [row, row],
-  });
+  const duplicateRows = await loadFreshTailFinalizedTransactions(
+    rpc(async () => []),
+    {
+      signatures: [row, row],
+    },
+  );
   assert.equal(duplicateRows.ok ? null : duplicateRows.code, "invalid_request");
 
   const stale = transaction(row);
   stale.slot = 31;
-  const staleResult = await loadFreshTailFinalizedTransactions(rpc(async () => [stale]), {
-    signatures: [row],
-  });
+  const staleResult = await loadFreshTailFinalizedTransactions(
+    rpc(async () => [stale]),
+    {
+      signatures: [row],
+    },
+  );
   assert.equal(staleResult.ok ? null : staleResult.code, "transaction_identity_conflict");
 });
 
@@ -138,10 +146,11 @@ test("does not begin another batch after the shared absolute deadline", async ()
     deadlineMs: 2_000,
     nowMs: () => now,
   });
-  assert.deepEqual(
-    result.ok ? null : [result.code, result.retryable, result.batchesRead],
-    ["deadline_exceeded", true, 1],
-  );
+  assert.deepEqual(result.ok ? null : [result.code, result.retryable, result.batchesRead], [
+    "deadline_exceeded",
+    true,
+    1,
+  ]);
   assert.equal(connection.calls.length, 1);
 });
 

@@ -7,12 +7,14 @@ import {
   type FreshTailFinalizedHeadConnection,
 } from "./fresh-tail-finalized-head.js";
 
-function rpc(options: {
-  slot?: number;
-  blocks?: Map<number, { blockhash: string; blockTime: number | null } | null>;
-  throwAt?: number;
-  requests?: Array<{ slot: number; config: unknown }>;
-} = {}): FreshTailFinalizedHeadConnection {
+function rpc(
+  options: {
+    slot?: number;
+    blocks?: Map<number, { blockhash: string; blockTime: number | null } | null>;
+    throwAt?: number;
+    requests?: Array<{ slot: number; config: unknown }>;
+  } = {},
+): FreshTailFinalizedHeadConnection {
   return {
     async getSlot(commitment) {
       assert.equal(commitment, "finalized");
@@ -178,7 +180,10 @@ test("exact event block resolver never backwalks and binds transaction block tim
     assert.equal(result.head.blockhash, "enrollment-103");
     assert.equal(result.head.blockTimeMs, 1_800_000_103_000);
   }
-  assert.deepEqual(requests.map((request) => request.slot), [103]);
+  assert.deepEqual(
+    requests.map((request) => request.slot),
+    [103],
+  );
 });
 
 test("null or time-mismatched exact event block fails closed without a fallback slot", async () => {
@@ -189,7 +194,10 @@ test("null or time-mismatched exact event block fails closed without a fallback 
   );
   assert.equal(missing.ok, false);
   if (!missing.ok) assert.equal(missing.code, "head_unavailable");
-  assert.deepEqual(requests.map((request) => request.slot), [103]);
+  assert.deepEqual(
+    requests.map((request) => request.slot),
+    [103],
+  );
 
   const mismatch = await resolveFreshTailExactFinalizedBlock(
     rpc({ blocks: new Map([[103, { blockhash: "hash", blockTime: 100 }]]) }),

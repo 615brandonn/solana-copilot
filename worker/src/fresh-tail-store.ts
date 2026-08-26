@@ -1,7 +1,4 @@
-import type {
-  FreshTailCustodyEvent,
-  FreshTailSupplyEvent,
-} from "./fresh-tail-event-decoder.js";
+import type { FreshTailCustodyEvent, FreshTailSupplyEvent } from "./fresh-tail-event-decoder.js";
 import { PublicKey } from "@solana/web3.js";
 import type { FreshTailFinalizedHead } from "./fresh-tail-finalized-head.js";
 import type { PumpFunCreateProof } from "./pump-fun-create-proof.js";
@@ -547,8 +544,7 @@ export function createSupabaseFreshTailStore(client: FreshTailDbClient, userId: 
         p_finalized_head_slot: input.finalizedHead.slot,
         p_finalized_head_blockhash: input.finalizedHead.blockhash,
         p_finalized_head_block_time: isoFromMs(input.finalizedHead.blockTimeMs),
-        p_head_snapshot_parser_abi_fingerprint:
-          PUMP_FUN_SNAPSHOT_PARSER_ABI_FINGERPRINT,
+        p_head_snapshot_parser_abi_fingerprint: PUMP_FUN_SNAPSHOT_PARSER_ABI_FINGERPRINT,
         p_head_curve_state_fingerprint: snapshot.curveStateFingerprint,
         p_head_curve_observed_slot: snapshot.observedSlot,
         p_head_curve_complete: snapshot.complete,

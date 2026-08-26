@@ -29,10 +29,7 @@ test("claimed exits preserve exact raw sizing and persist the executor-capped am
   );
   assert.match(claimedExit, /currentPosition\.amount_remaining_raw/);
   assert.match(claimedExit, /const positionRaw = BigInt\(currentPositionRawText\)/);
-  assert.match(
-    claimedExit,
-    /sellRaw = uiAmountToRawFloor\(requestedSellAmount, currentDecimals\)/,
-  );
+  assert.match(claimedExit, /sellRaw = uiAmountToRawFloor\(requestedSellAmount, currentDecimals\)/);
   assert.match(claimedExit, /sellRaw = \(positionRaw \* BigInt\(scaledPct\)\) \/ 100_000_000n/);
   assert.match(claimedExit, /sellRaw,[\s\S]*currentDecimals,[\s\S]*reason/);
   assert.match(claimedExit, /sellClaimRecoveryStore\.apply\(/);

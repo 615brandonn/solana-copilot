@@ -92,23 +92,14 @@ export async function sampleFreshTailFinalizedHead(
     0,
     512,
   );
-  const timeoutMs = boundedInteger(
-    request.rpcCallTimeoutMs,
-    DEFAULT_RPC_TIMEOUT_MS,
-    250,
-    30_000,
-  );
+  const timeoutMs = boundedInteger(request.rpcCallTimeoutMs, DEFAULT_RPC_TIMEOUT_MS, 250, 30_000);
   const nowMs = request.nowMs ?? Date.now;
   const startedAtMs = Number(nowMs());
   const deadlineMs = Number(request.deadlineMs ?? startedAtMs + DEFAULT_OPERATION_BUDGET_MS);
   if (minimumSlot === null || maxSkippedSlots === null || timeoutMs === null) {
     return failure("invalid_request", "fresh-tail finalized head request is invalid", false);
   }
-  if (
-    !Number.isSafeInteger(startedAtMs) ||
-    startedAtMs <= 0 ||
-    !Number.isSafeInteger(deadlineMs)
-  ) {
+  if (!Number.isSafeInteger(startedAtMs) || startedAtMs <= 0 || !Number.isSafeInteger(deadlineMs)) {
     return failure("invalid_request", "fresh-tail finalized head clock is invalid", false);
   }
 
@@ -237,12 +228,7 @@ export async function resolveFreshTailExactFinalizedBlock(
   request: FreshTailExactFinalizedBlockRequest,
 ): Promise<FreshTailFinalizedHeadResult> {
   const slot = safePositiveInteger(request.slot);
-  const timeoutMs = boundedInteger(
-    request.rpcCallTimeoutMs,
-    DEFAULT_RPC_TIMEOUT_MS,
-    250,
-    30_000,
-  );
+  const timeoutMs = boundedInteger(request.rpcCallTimeoutMs, DEFAULT_RPC_TIMEOUT_MS, 250, 30_000);
   const expectedBlockTimeMs =
     request.expectedBlockTimeMs === undefined
       ? null

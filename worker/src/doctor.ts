@@ -953,7 +953,6 @@ async function checkSupplyAccumulationSchema(
     return false;
   }
 
-
   try {
     const apiUrl = new URL("/rest/v1/", env.BOT_SUPABASE_URL);
     const headers: Record<string, string> = { apikey: env.BOT_SUPABASE_SERVICE_ROLE_KEY };
@@ -1000,6 +999,8 @@ async function checkSupplyAccumulationSchema(
       "/rpc/resolve_custody_fresh_tail_exit_intent",
       "/rpc/check_supply_accumulation_fresh_custody_gate",
       "/rpc/get_custody_fresh_tail_entry_candidates",
+      "/rpc/prepare_sell_claim_attempt_v1",
+      "/rpc/apply_landed_sell_claim_v1",
     ].filter((path) => !paths[path]);
     if (!response.ok || missingRpc.length > 0) {
       fail("Supply Accumulation RPCs", {
@@ -1086,7 +1087,7 @@ async function checkSellCoverageSchema(cfg: BotConfigRow): Promise<boolean> {
     db
       .from("sell_signal_claims")
       .select(
-        "user_id,position_id,source_tx_sig,source_wallet,trigger_kind,status,requested_sell_pct,requested_sell_amount,bot_tx_sig,error_code,submission_started_at,landed_at,created_at,updated_at",
+        "user_id,position_id,source_tx_sig,source_wallet,trigger_kind,status,requested_sell_pct,requested_sell_amount,bot_tx_sig,error_code,submission_started_at,landed_at,created_at,updated_at,recovery_version,token_decimals,executed_sell_amount_raw,prepared_wallet_balance_raw,position_amount_before_raw,recent_blockhash,last_valid_block_height,receipt_pre_amount_raw,receipt_post_amount_raw,trade_id,exit_reason,mark_tp_taken,mark_coordinated_exit,mark_follower_seller_exit,mirrored_sold_fraction,execution_route,execution_latency_ms,persisted_at",
       )
       .limit(1),
     db
@@ -1549,7 +1550,9 @@ async function main() {
   const schemaChecks = await Promise.all([
     db
       .from("positions")
-      .select("entry_mode,coordinated_exit_triggered,follower_seller_exit_triggered")
+      .select(
+        "entry_mode,coordinated_exit_triggered,follower_seller_exit_triggered,amount_remaining_raw",
+      )
       .limit(1),
     db.from("follower_wallets").select("first_sell_at,last_seen_signature,last_seen_slot").limit(1),
   ]);

@@ -147,6 +147,7 @@ export type PositionRow = {
   entry_price_usd: number;
   amount_tokens: number;
   amount_remaining: number;
+  amount_remaining_raw: string | null;
   entry_tx_sig: string;
   entry_slot: number | null;
   opened_at: string;
@@ -182,13 +183,7 @@ export type EntrySignalClaimRow = {
   received_amount_raw: string | null;
   received_token_decimals: number | null;
   amount_lamports: number;
-  status:
-    | "claimed"
-    | "submitted"
-    | "landed"
-    | "persisted"
-    | "failed_pre_submit"
-    | "uncertain";
+  status: "claimed" | "submitted" | "landed" | "persisted" | "failed_pre_submit" | "uncertain";
   bot_tx_sig: string | null;
   error_code: string | null;
   submission_started_at: string | null;
@@ -665,59 +660,121 @@ export type CustodyFreshTailExitIntentRow = {
 };
 
 export type CustodyFreshTailRootRow = {
-  epoch_id: string; user_id: string; wallet: string; ordinal: number;
-  floor_slot: number; boundary_kind: "exclusive_slot"; created_at: string;
+  epoch_id: string;
+  user_id: string;
+  wallet: string;
+  ordinal: number;
+  floor_slot: number;
+  boundary_kind: "exclusive_slot";
+  created_at: string;
 };
 
 export type CustodyFreshTailFinalizedHeadRow = {
-  epoch_id: string; user_id: string; slot: number; blockhash: string;
-  block_time: string; first_lease_generation: number;
-  last_lease_generation: number; first_seen_at: string; last_seen_at: string;
+  epoch_id: string;
+  user_id: string;
+  slot: number;
+  blockhash: string;
+  block_time: string;
+  first_lease_generation: number;
+  last_lease_generation: number;
+  first_seen_at: string;
+  last_seen_at: string;
 };
 
 export type CustodyFreshTailMintRejectionRow = {
-  epoch_id: string; user_id: string; token_mint: string; source_tx_sig: string;
-  source_slot: number; rejection_code: string; parser_abi_fingerprint: string;
-  proof_fingerprint: string; finalized_head_slot: number;
-  finalized_head_blockhash: string; quarantined: boolean; conflict_count: number;
-  first_conflict_at: string | null; created_at: string; updated_at: string;
+  epoch_id: string;
+  user_id: string;
+  token_mint: string;
+  source_tx_sig: string;
+  source_slot: number;
+  rejection_code: string;
+  parser_abi_fingerprint: string;
+  proof_fingerprint: string;
+  finalized_head_slot: number;
+  finalized_head_blockhash: string;
+  quarantined: boolean;
+  conflict_count: number;
+  first_conflict_at: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 export type CustodyFreshTailEdgeRow = {
-  epoch_id: string; user_id: string; token_mint: string; custody_event_id: string;
-  source_wallet: string; destination_wallet: string; discovery_slot: number;
-  amount_raw: string; classification: string; classification_reliable: boolean;
-  watchable: boolean; applied_revision: number | null; scope_applied_at: string | null;
+  epoch_id: string;
+  user_id: string;
+  token_mint: string;
+  custody_event_id: string;
+  source_wallet: string;
+  destination_wallet: string;
+  discovery_slot: number;
+  amount_raw: string;
+  classification: string;
+  classification_reliable: boolean;
+  watchable: boolean;
+  applied_revision: number | null;
+  scope_applied_at: string | null;
   recorded_at: string;
 };
 
 export type CustodyFreshTailWalletRow = {
-  epoch_id: string; user_id: string; token_mint: string; wallet: string;
-  parent_wallet: string; discovery_event_id: string; discovery_event_key: string;
-  discovery_slot: number; floor_slot: number; boundary_kind: "inclusive_slot";
-  watch_status: "active" | "released" | "unwatchable"; classification: string;
-  classification_reliable: boolean; added_revision: number;
-  created_at: string; updated_at: string;
+  epoch_id: string;
+  user_id: string;
+  token_mint: string;
+  wallet: string;
+  parent_wallet: string;
+  discovery_event_id: string;
+  discovery_event_key: string;
+  discovery_slot: number;
+  floor_slot: number;
+  boundary_kind: "inclusive_slot";
+  watch_status: "active" | "released" | "unwatchable";
+  classification: string;
+  classification_reliable: boolean;
+  added_revision: number;
+  created_at: string;
+  updated_at: string;
 };
 
 export type CustodyFreshTailBackscanRangeRow = {
-  id: string; epoch_id: string; user_id: string; token_mint: string; wallet: string;
-  source_edge_event_id: string; floor_slot: number; boundary_kind: "inclusive_slot";
+  id: string;
+  epoch_id: string;
+  user_id: string;
+  token_mint: string;
+  wallet: string;
+  source_edge_event_id: string;
+  floor_slot: number;
+  boundary_kind: "inclusive_slot";
   current_boundary_kind: "inclusive_slot" | "exact_signature";
-  last_processed_signature: string | null; last_processed_slot: number | null;
-  last_block_time: number | null; first_available_block: number | null;
-  history_floor_proven: boolean; covered_through_slot: number | null;
-  covered_through_blockhash: string | null; coverage_revision: number;
-  backlog_detected: boolean; last_error: string | null; last_success_at: string | null;
-  last_lease_generation: number; completed_at: string | null;
-  created_at: string; updated_at: string;
+  last_processed_signature: string | null;
+  last_processed_slot: number | null;
+  last_block_time: number | null;
+  first_available_block: number | null;
+  history_floor_proven: boolean;
+  covered_through_slot: number | null;
+  covered_through_blockhash: string | null;
+  coverage_revision: number;
+  backlog_detected: boolean;
+  last_error: string | null;
+  last_success_at: string | null;
+  last_lease_generation: number;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 export type CustodyFreshTailCoverageAttestationRow = {
-  id: string; epoch_id: string; user_id: string; lane_kind: "main" | "backscan";
-  scope_mint: string | null; wallet: string | null; range_id: string | null;
-  covered_head_slot: number; covered_head_blockhash: string;
-  coverage_revision: number; lease_generation: number; attested_at: string;
+  id: string;
+  epoch_id: string;
+  user_id: string;
+  lane_kind: "main" | "backscan";
+  scope_mint: string | null;
+  wallet: string | null;
+  range_id: string | null;
+  covered_head_slot: number;
+  covered_head_blockhash: string;
+  coverage_revision: number;
+  lease_generation: number;
+  attested_at: string;
 };
 
 export type CustodyFreshTailWorkerHeartbeatRow = {
@@ -877,7 +934,9 @@ export type Database = {
       };
       positions: {
         Row: PositionRow;
-        Insert: Omit<PositionRow, "id" | "opened_at">;
+        Insert: Omit<PositionRow, "id" | "opened_at" | "amount_remaining_raw"> & {
+          amount_remaining_raw?: string | null;
+        };
         Update: Partial<PositionRow>;
         Relationships: [];
       };

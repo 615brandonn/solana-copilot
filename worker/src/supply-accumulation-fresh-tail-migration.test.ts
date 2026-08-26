@@ -110,7 +110,10 @@ test("activation is one common finalized boundary with Entries OFF and exactly t
   assert.match(migration, /supply_accumulation_mode_enabled is not true/i);
   assert.match(migration, /custody_journey_enabled is not true/i);
   assert.match(migration, /cardinality\(v_config_roots\), 0\) <> 3/i);
-  assert.match(migration, /root_wallets text\[\] not null check \(cardinality\(root_wallets\) = 3\)/i);
+  assert.match(
+    migration,
+    /root_wallets text\[\] not null check \(cardinality\(root_wallets\) = 3\)/i,
+  );
   assert.match(migration, /'exclusive_slot'/i);
   assert.match(migration, /custody_fresh_tail_finalized_heads/i);
   assert.match(migration, /'finalized_head_conflict'/i);
@@ -126,10 +129,7 @@ test("lease renewal requires the prior secret token and generation", () => {
   assert.match(acquire, /p_expected_lease_token uuid default null/i);
   assert.match(acquire, /p_expected_lease_generation bigint default null/i);
   assert.match(acquire, /v_epoch\.lease_token is distinct from p_expected_lease_token/i);
-  assert.match(
-    acquire,
-    /v_epoch\.lease_generation is distinct from p_expected_lease_generation/i,
-  );
+  assert.match(acquire, /v_epoch\.lease_generation is distinct from p_expected_lease_generation/i);
   assert.match(acquire, /lease_busy_or_fenced/i);
   assert.doesNotMatch(
     acquire,
@@ -155,7 +155,10 @@ test("restart discovery reads the active epoch without activation or lease secre
 test("mint enrollment is epoch-level, strict Pump creation proof with durable rejections", () => {
   const signature = migration.slice(
     migration.indexOf("create or replace function public.attest_custody_fresh_tail_mint_creation("),
-    migration.indexOf(")\nreturns jsonb", migration.indexOf("attest_custody_fresh_tail_mint_creation(")),
+    migration.indexOf(
+      ")\nreturns jsonb",
+      migration.indexOf("attest_custody_fresh_tail_mint_creation("),
+    ),
   );
   assert.doesNotMatch(signature, /request_id/i);
   for (const proof of [
@@ -174,10 +177,7 @@ test("mint enrollment is epoch-level, strict Pump creation proof with durable re
     assert.match(migration, new RegExp(proof, "i"));
   }
   assert.match(migration, /classic_v1[\s\S]*create_v2_token2022/i);
-  assert.match(
-    migration,
-    /ebe9ae1c8f38c24c3c6d4da1a3c9b90ffce4bf27e36f562bc67b090e9b7c343f/i,
-  );
+  assert.match(migration, /ebe9ae1c8f38c24c3c6d4da1a3c9b90ffce4bf27e36f562bc67b090e9b7c343f/i);
   assert.match(migration, /TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA/i);
   assert.match(migration, /TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb/i);
   assert.match(migration, /p_creation_slot <= v_epoch\.activation_slot/i);
@@ -195,10 +195,7 @@ test("fresh supply authorization never depends on legacy aggregate rows", () => 
   assert.match(migration, /v_net_raw \* 100\) \/ v_mint\.total_supply_raw/i);
   assert.match(migration, /v_trigger\.amount_raw::text/i);
   assert.match(migration, /p_parser_domain text/i);
-  assert.match(
-    migration,
-    /b8b6dbdcce44a2b61c55ba2fd74cd385fae489a95be291504eb8e7b15f88262d/i,
-  );
+  assert.match(migration, /b8b6dbdcce44a2b61c55ba2fd74cd385fae489a95be291504eb8e7b15f88262d/i);
   assert.match(migration, /'parser_not_reviewed'/i);
 });
 
@@ -257,7 +254,10 @@ test("requests are immutable identities, expire from finalized trigger time, and
   assert.match(migration, /settled_lease_generation/i);
   assert.match(migration, /'settlement_lease_fenced'/i);
   assert.match(migration, /head_curve_observed_slot = requested_head_slot/i);
-  assert.match(migration, /head_curve_complete boolean not null check \(not head_curve_complete\)/i);
+  assert.match(
+    migration,
+    /head_curve_complete boolean not null check \(not head_curve_complete\)/i,
+  );
   assert.match(
     migration,
     /head_snapshot_parser_abi_fingerprint[\s\S]*2f5de97b6527d4ec94082069d65abd2bf30523e45bf562aabe1e770e5eb4ad1d/i,
@@ -283,10 +283,10 @@ test("settle and final gate require all roots, descendants, backscans, and no po
   assert.match(migration, /fresh_tail_epoch_id = p_epoch_id/i);
   assert.match(migration, /fresh_tail_request_id = p_request_id/i);
   const finalGate = migration.slice(
-    migration.indexOf("create or replace function public.check_supply_accumulation_fresh_custody_gate("),
     migration.indexOf(
-      "create or replace function public.get_custody_fresh_tail_entry_candidates(",
+      "create or replace function public.check_supply_accumulation_fresh_custody_gate(",
     ),
+    migration.indexOf("create or replace function public.get_custody_fresh_tail_entry_candidates("),
   );
   assert.match(finalGate, /p_claim_id is not null[\s\S]*c\.status = 'submitted'/i);
   assert.match(finalGate, /nullif\(btrim\(coalesce\(c\.bot_tx_sig, ''\)\), ''\) is not null/i);
@@ -317,10 +317,7 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
     migration,
     /when v_disposition in \([\s\S]*'retry'[\s\S]*'position_not_live'[\s\S]*'disabled_by_policy'[\s\S]*'duplicate_sell_claim'[\s\S]*\) then 'retry'/i,
   );
-  assert.doesNotMatch(
-    migration,
-    /when v_disposition = 'position_not_live' then 'dismissed'/i,
-  );
+  assert.doesNotMatch(migration, /when v_disposition = 'position_not_live' then 'dismissed'/i);
   assert.doesNotMatch(
     migration,
     /when v_disposition = '(?:disabled_by_policy|duplicate_sell_claim)' then 'dismissed'/i,
@@ -358,20 +355,12 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
   );
   assert.match(migration, /when v_status = 'uncertain' then claim_token/i);
   const supplyWriter = migration.slice(
-    migration.indexOf(
-      "create or replace function public.record_custody_fresh_tail_supply_event(",
-    ),
-    migration.indexOf(
-      "create or replace function public.record_custody_fresh_tail_custody_event(",
-    ),
+    migration.indexOf("create or replace function public.record_custody_fresh_tail_supply_event("),
+    migration.indexOf("create or replace function public.record_custody_fresh_tail_custody_event("),
   );
   const custodyWriter = migration.slice(
-    migration.indexOf(
-      "create or replace function public.record_custody_fresh_tail_custody_event(",
-    ),
-    migration.indexOf(
-      "create or replace function public.sync_custody_fresh_tail_scope(",
-    ),
+    migration.indexOf("create or replace function public.record_custody_fresh_tail_custody_event("),
+    migration.indexOf("create or replace function public.sync_custody_fresh_tail_scope("),
   );
   assert.match(
     supplyWriter,

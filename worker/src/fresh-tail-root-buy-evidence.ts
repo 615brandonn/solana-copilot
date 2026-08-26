@@ -32,7 +32,7 @@ function publicKeyText(value: unknown): string {
     return new PublicKey(
       typeof value === "string"
         ? value
-        : (value as { toBase58?: () => string } | null)?.toBase58?.() ?? String(value ?? ""),
+        : ((value as { toBase58?: () => string } | null)?.toBase58?.() ?? String(value ?? "")),
     ).toBase58();
   } catch {
     return String(value ?? "");
@@ -97,9 +97,7 @@ function stableJson(value: unknown): string {
  * transaction is a buy; the reviewed fresh event decoder owns that decision
  * once and attaches its ABI fingerprint to the evidence.
  */
-export function fingerprintFreshFinalizedParsedTransaction(
-  tx: ParsedTransactionWithMeta,
-): string {
+export function fingerprintFreshFinalizedParsedTransaction(tx: ParsedTransactionWithMeta): string {
   const message: any = tx.transaction.message;
   const accountKeys = (message?.accountKeys ?? []).map((entry: any) =>
     publicKeyText(entry?.pubkey ?? entry),

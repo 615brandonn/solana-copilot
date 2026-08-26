@@ -15,10 +15,7 @@ import {
   type FreshTailObserverConfig,
   type FreshTailSolPriceQuote,
 } from "./fresh-tail-observer.js";
-import {
-  createSupabaseFreshTailStore,
-  type FreshTailDbClient,
-} from "./fresh-tail-store.js";
+import { createSupabaseFreshTailStore, type FreshTailDbClient } from "./fresh-tail-store.js";
 import { safeDiagnostic } from "./diagnostics.js";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
@@ -50,33 +47,32 @@ function baseSupabaseUrl(value: string): string {
   return normalized;
 }
 
-const db = createClient(
-  baseSupabaseUrl(env.BOT_SUPABASE_URL),
-  env.BOT_SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: { persistSession: false, autoRefreshToken: false },
-    realtime: { transport: WebSocket as unknown as typeof globalThis.WebSocket },
-    global: {
-      fetch: (input, init) => {
-        const headers = new Headers(init?.headers);
-        headers.set("apikey", env.BOT_SUPABASE_SERVICE_ROLE_KEY);
-        if (
-          env.BOT_SUPABASE_SERVICE_ROLE_KEY.startsWith("sb_") &&
-          headers.get("Authorization") === `Bearer ${env.BOT_SUPABASE_SERVICE_ROLE_KEY}`
-        ) {
-          headers.delete("Authorization");
-        }
-        const timeout = AbortSignal.timeout(SUPABASE_TIMEOUT_MS);
-        const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
-        return fetch(input as Parameters<typeof fetch>[0], {
+const db = createClient(baseSupabaseUrl(env.BOT_SUPABASE_URL), env.BOT_SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+  realtime: { transport: WebSocket as unknown as typeof globalThis.WebSocket },
+  global: {
+    fetch: (input, init) => {
+      const headers = new Headers(init?.headers);
+      headers.set("apikey", env.BOT_SUPABASE_SERVICE_ROLE_KEY);
+      if (
+        env.BOT_SUPABASE_SERVICE_ROLE_KEY.startsWith("sb_") &&
+        headers.get("Authorization") === `Bearer ${env.BOT_SUPABASE_SERVICE_ROLE_KEY}`
+      ) {
+        headers.delete("Authorization");
+      }
+      const timeout = AbortSignal.timeout(SUPABASE_TIMEOUT_MS);
+      const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+      return fetch(
+        input as Parameters<typeof fetch>[0],
+        {
           ...init,
           headers,
           signal,
-        } as Parameters<typeof fetch>[1]) as unknown as Promise<Response>;
-      },
+        } as Parameters<typeof fetch>[1],
+      ) as unknown as Promise<Response>;
     },
   },
-);
+});
 
 function wallet(value: unknown): string | null {
   if (typeof value !== "string" || !value.trim()) return null;
@@ -130,9 +126,10 @@ function jupiterSolPrice(payload: unknown): number | null {
   if (!payload || typeof payload !== "object") return null;
   const row = payload as Record<string, unknown>;
   const direct = row[WSOL_MINT];
-  const nested = row.data && typeof row.data === "object"
-    ? (row.data as Record<string, unknown>)[WSOL_MINT]
-    : undefined;
+  const nested =
+    row.data && typeof row.data === "object"
+      ? (row.data as Record<string, unknown>)[WSOL_MINT]
+      : undefined;
   for (const candidate of [direct, nested]) {
     if (!candidate || typeof candidate !== "object") continue;
     const record = candidate as Record<string, unknown>;
@@ -205,10 +202,7 @@ function delay(ms: number): Promise<void> {
 
 async function main(): Promise<void> {
   const rpc = new Connection(env.RPC_URL, { commitment: "finalized" });
-  const store = createSupabaseFreshTailStore(
-    db as unknown as FreshTailDbClient,
-    env.HELIX_USER_ID,
-  );
+  const store = createSupabaseFreshTailStore(db as unknown as FreshTailDbClient, env.HELIX_USER_ID);
   // This identity is intentionally different after every process restart.
   // Lease continuation is possible only through this process's prior CAS token.
   const workerId = `${hostname()}:${process.pid}:${randomUUID()}`;

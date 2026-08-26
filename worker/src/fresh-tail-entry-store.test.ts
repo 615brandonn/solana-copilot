@@ -64,8 +64,7 @@ function candidate(overrides: Record<string, unknown> = {}) {
     creationParserAbiFingerprint:
       "ebe9ae1c8f38c24c3c6d4da1a3c9b90ffce4bf27e36f562bc67b090e9b7c343f",
     eventParserDomain: "pump_root_buy_v1",
-    eventParserAbiFingerprint:
-      "b8b6dbdcce44a2b61c55ba2fd74cd385fae489a95be291504eb8e7b15f88262d",
+    eventParserAbiFingerprint: "b8b6dbdcce44a2b61c55ba2fd74cd385fae489a95be291504eb8e7b15f88262d",
     headSnapshotParserAbiFingerprint:
       "2f5de97b6527d4ec94082069d65abd2bf30523e45bf562aabe1e770e5eb4ad1d",
     headCurveStateFingerprint: "b".repeat(64),
@@ -116,14 +115,8 @@ test("loads only a pinned, internally consistent fresh custody certificate", asy
   assert.equal(loaded.tokenMint, MINT);
   assert.equal(loaded.netAcquiredRaw, "100000000000000");
   assert.deepEqual(parameters, { p_user_id: USER_ID, p_limit: 1 });
-  assert.equal(
-    freshTailCandidateIsUsable(loaded, Date.parse("2026-08-26T00:00:05.000Z")),
-    true,
-  );
-  assert.equal(
-    freshTailCandidateIsUsable(loaded, Date.parse("2026-08-26T00:00:07.001Z")),
-    false,
-  );
+  assert.equal(freshTailCandidateIsUsable(loaded, Date.parse("2026-08-26T00:00:05.000Z")), true);
+  assert.equal(freshTailCandidateIsUsable(loaded, Date.parse("2026-08-26T00:00:07.001Z")), false);
 });
 
 test("malformed, stale, unreviewed, and sub-threshold candidates fail closed", async () => {
@@ -169,10 +162,15 @@ test("recheck binds every immutable candidate identity and exact claim", async (
     }),
     USER_ID,
   );
-  const parsed = (await store.recheck((await createFreshTailEntryStore(
-    fakeClient(() => ({ ok: true, reason: "loaded", candidates: [loadedCandidate] })),
-    USER_ID,
-  ).loadCandidates())[0]!, null))!;
+  const parsed = (await store.recheck(
+    (
+      await createFreshTailEntryStore(
+        fakeClient(() => ({ ok: true, reason: "loaded", candidates: [loadedCandidate] })),
+        USER_ID,
+      ).loadCandidates()
+    )[0]!,
+    null,
+  ))!;
   assert.equal(gateParameters?.p_claim_id, null);
   const binding = await store.bindClaim(parsed, CLAIM_ID, POSITION_ID);
   assert.equal(binding.positionId, POSITION_ID);
@@ -222,10 +220,12 @@ test("records only the exact prepared signature and raw landed receipt", async (
     }),
     USER_ID,
   );
-  const parsed = (await createFreshTailEntryStore(
-    fakeClient(() => ({ ok: true, reason: "loaded", candidates: [candidate()] })),
-    USER_ID,
-  ).loadCandidates())[0]!;
+  const parsed = (
+    await createFreshTailEntryStore(
+      fakeClient(() => ({ ok: true, reason: "loaded", candidates: [candidate()] })),
+      USER_ID,
+    ).loadCandidates()
+  )[0]!;
   const receipt = await store.recordReceipt(
     parsed,
     CLAIM_ID,
@@ -289,10 +289,12 @@ test("restart recovery records or replays the frozen receipt RPC without a candi
 });
 
 test("lost bind responses remain distinguishable from authoritative binding rejection", async () => {
-  const parsed = (await createFreshTailEntryStore(
-    fakeClient(() => ({ ok: true, reason: "loaded", candidates: [candidate()] })),
-    USER_ID,
-  ).loadCandidates())[0]!;
+  const parsed = (
+    await createFreshTailEntryStore(
+      fakeClient(() => ({ ok: true, reason: "loaded", candidates: [candidate()] })),
+      USER_ID,
+    ).loadCandidates()
+  )[0]!;
   const transportFailure = createFreshTailEntryStore(
     fakeClient(() => {
       throw new Error("connection reset after commit");

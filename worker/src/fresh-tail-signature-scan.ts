@@ -120,12 +120,7 @@ export async function scanFreshTailFinalizedSignatures(
   const boundarySlot = positiveSlot(request.boundary.slot);
   const pageSize = boundedInteger(request.pageSize, DEFAULT_PAGE_SIZE, 1, 1_000);
   const maxPages = boundedInteger(request.maxPages, DEFAULT_MAX_PAGES, 1, 64);
-  const timeoutMs = boundedInteger(
-    request.rpcCallTimeoutMs,
-    DEFAULT_RPC_TIMEOUT_MS,
-    250,
-    30_000,
-  );
+  const timeoutMs = boundedInteger(request.rpcCallTimeoutMs, DEFAULT_RPC_TIMEOUT_MS, 250, 30_000);
   const nowMs = request.nowMs ?? Date.now;
   const startedAtMs = Number(nowMs());
   const deadlineMs = Number(request.deadlineMs ?? startedAtMs + DEFAULT_OPERATION_BUDGET_MS);

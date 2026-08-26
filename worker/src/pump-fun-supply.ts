@@ -186,8 +186,7 @@ export function decodeReviewedPumpFunSupplyAccounts(
       quoteMint !== SystemProgram.programId.toBase58() ||
       (expected.creator && expected.creator !== creator) ||
       (expected.isMayhemMode !== undefined && expected.isMayhemMode !== isMayhemMode) ||
-      (expected.isCashbackEnabled !== undefined &&
-        expected.isCashbackEnabled !== isCashbackEnabled)
+      (expected.isCashbackEnabled !== undefined && expected.isCashbackEnabled !== isCashbackEnabled)
     ) {
       return null;
     }

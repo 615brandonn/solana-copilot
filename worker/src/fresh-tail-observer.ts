@@ -51,10 +51,7 @@ import {
   PUMP_FUN_CREATE_PROOF_ABI,
   type PumpFunCreateProofFailureCode,
 } from "./pump-fun-create-proof.js";
-import {
-  loadPumpFunSupplySnapshot,
-  type PumpFunSupplySnapshot,
-} from "./pump-fun-supply.js";
+import { loadPumpFunSupplySnapshot, type PumpFunSupplySnapshot } from "./pump-fun-supply.js";
 
 const DEFAULT_CYCLE_BUDGET_MS = 45_000;
 const DEFAULT_LEASE_SECONDS = 75;
@@ -691,11 +688,7 @@ export class FreshTailObserver {
     const requestCandidates: RequestCandidate[] = [];
     for (const event of decoded.supplyEvents) {
       this.assertLease();
-      const valuation = await this.valuationFor(
-        event,
-        decoded.pumpTradeEventEvidence,
-        deadlineMs,
-      );
+      const valuation = await this.valuationFor(event, decoded.pumpTradeEventEvidence, deadlineMs);
       const result = await this.store.recordSupplyEvent(
         this.epoch!.epochId,
         this.lease!,
@@ -827,7 +820,9 @@ export class FreshTailObserver {
       }
     }
 
-    for (const [mint, contract] of [...contracts.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    for (const [mint, contract] of [...contracts.entries()].sort(([a], [b]) =>
+      a.localeCompare(b),
+    )) {
       if (poisonedMints.has(mint)) continue;
       const decoded = decodeFreshTailFinalizedTransaction(transaction, contract, root, "root");
       if (!decoded.ok) {
@@ -950,7 +945,10 @@ export class FreshTailObserver {
         block = await Promise.race([
           this.rpc.getBlockSignatures(slot, "finalized"),
           new Promise<never>((_resolve, reject) =>
-            setTimeout(() => reject(new Error("block signature RPC timed out")), this.rpcCallTimeoutMs),
+            setTimeout(
+              () => reject(new Error("block signature RPC timed out")),
+              this.rpcCallTimeoutMs,
+            ),
           ),
         ]);
       } catch (error) {
@@ -1001,7 +999,10 @@ export class FreshTailObserver {
       );
     }
     const rootsByWallet = new Map(work.roots.map((root) => [root.wallet, root.ordinal]));
-    if (rootsByWallet.size !== 3 || rootCursors.some((cursor) => !rootsByWallet.has(cursor.wallet))) {
+    if (
+      rootsByWallet.size !== 3 ||
+      rootCursors.some((cursor) => !rootsByWallet.has(cursor.wallet))
+    ) {
       throw new FreshTailObserverError(
         "root_cursor_contract_invalid",
         false,
@@ -1256,22 +1257,17 @@ export class FreshTailObserver {
       persistCursor: async (write) => {
         requireMutation(
           "record_backscan_cursor",
-          await this.store.recordBackscanCursor(
-            this.epoch!.epochId,
-            this.lease!,
-            range.rangeId,
-            {
-              expectedLastSignature: write.expectedLastSignature,
-              nextLastSignature: write.nextLastSignature,
-              nextLastSlot: write.nextLastSlot,
-              lastBlockTimeSeconds: write.lastBlockTimeSeconds,
-              firstAvailableBlock: write.firstAvailableBlock,
-              coveredHead: write.coveredHead,
-              coverageRevision: write.coverageRevision,
-              backlogDetected: write.backlogDetected,
-              lastError: write.lastError,
-            },
-          ),
+          await this.store.recordBackscanCursor(this.epoch!.epochId, this.lease!, range.rangeId, {
+            expectedLastSignature: write.expectedLastSignature,
+            nextLastSignature: write.nextLastSignature,
+            nextLastSlot: write.nextLastSlot,
+            lastBlockTimeSeconds: write.lastBlockTimeSeconds,
+            firstAvailableBlock: write.firstAvailableBlock,
+            coveredHead: write.coveredHead,
+            coverageRevision: write.coverageRevision,
+            backlogDetected: write.backlogDetected,
+            lastError: write.lastError,
+          }),
         );
       },
     });
@@ -1327,7 +1323,8 @@ export class FreshTailObserver {
         .filter((cursor) => cursor.role === "descendant")
         .sort(
           (left, right) =>
-            left.scopeMint.localeCompare(right.scopeMint) || left.wallet.localeCompare(right.wallet),
+            left.scopeMint.localeCompare(right.scopeMint) ||
+            left.wallet.localeCompare(right.wallet),
         );
       let progressed = false;
       for (const cursor of descendants) {
@@ -1385,15 +1382,18 @@ export class FreshTailObserver {
   }
 
   private requestCannotRewind(work: FreshTailWork, request: FreshTailWorkRequest): boolean {
-    return work.cursors.some(
-      (cursor) =>
-        (cursor.role === "root" || cursor.scopeMint === request.tokenMint) &&
-        cursorIsPastHead(cursor, request.requestedHeadSlot),
-    ) || work.backscanRanges.some(
-      (range) =>
-        range.tokenMint === request.tokenMint &&
-        ((range.coveredThroughSlot ?? 0) > request.requestedHeadSlot ||
-          (range.lastSlot ?? 0) > request.requestedHeadSlot),
+    return (
+      work.cursors.some(
+        (cursor) =>
+          (cursor.role === "root" || cursor.scopeMint === request.tokenMint) &&
+          cursorIsPastHead(cursor, request.requestedHeadSlot),
+      ) ||
+      work.backscanRanges.some(
+        (range) =>
+          range.tokenMint === request.tokenMint &&
+          ((range.coveredThroughSlot ?? 0) > request.requestedHeadSlot ||
+            (range.lastSlot ?? 0) > request.requestedHeadSlot),
+      )
     );
   }
 
@@ -1445,9 +1445,7 @@ export class FreshTailObserver {
       const currentRequest = refreshed.requests.find(
         (candidate) => candidate.requestId === request.requestId,
       );
-      const mint = refreshed.mints.find(
-        (candidate) => candidate.tokenMint === request.tokenMint,
-      );
+      const mint = refreshed.mints.find((candidate) => candidate.tokenMint === request.tokenMint);
       if (
         !currentRequest ||
         !mint ||
@@ -1479,9 +1477,7 @@ export class FreshTailObserver {
           `fresh request settlement failed: ${result.reason}`,
         );
       }
-      completed.add(
-        `${request.requestId}:${mint.scopeRevision}:${this.lease!.leaseGeneration}`,
-      );
+      completed.add(`${request.requestId}:${mint.scopeRevision}:${this.lease!.leaseGeneration}`);
       settled += 1;
     }
     throw new FreshTailObserverError(

@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isDeepStrictEqual } from "node:util";
-import {
-  SellClaimRecoveryStore,
-  parseSellRecoveryClaim,
-} from "./sell-claim-recovery-store.js";
+import { SellClaimRecoveryStore, parseSellRecoveryClaim } from "./sell-claim-recovery-store.js";
 
 const USER = "00000000-0000-4000-8000-000000000001";
 const CLAIM = "00000000-0000-4000-8000-000000000002";
@@ -85,7 +82,9 @@ class FakeClient {
 }
 
 function hasTrace(query: FakeQuery, method: string, ...args: unknown[]): boolean {
-  return query.trace.some((entry) => entry.method === method && isDeepStrictEqual(entry.args, args));
+  return query.trace.some(
+    (entry) => entry.method === method && isDeepStrictEqual(entry.args, args),
+  );
 }
 
 function signedClaim(status: "submitted" | "uncertain" = "submitted") {
@@ -231,7 +230,10 @@ test("failure and uncertainty updates retain exact CAS ownership", async () => {
   const client = new FakeClient();
   client.queryResponse = { data: { id: CLAIM }, error: null };
   const store = new SellClaimRecoveryStore(client as never, USER);
-  assert.equal(await store.markFailure(parseSellRecoveryClaim(signedClaim()), "finalized-failure"), true);
+  assert.equal(
+    await store.markFailure(parseSellRecoveryClaim(signedClaim()), "finalized-failure"),
+    true,
+  );
   let query = client.queries[0]!;
   assert.ok(hasTrace(query, "eq", "status", "submitted"));
   assert.ok(hasTrace(query, "eq", "bot_tx_sig", SIG));

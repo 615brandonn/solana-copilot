@@ -65,9 +65,7 @@ test("root activation floor is exclusive and RPC proof is finalized at H", async
 
 test("child discovery floor is inclusive, including every same-slot signature", async () => {
   const result = await scanFreshTailFinalizedSignatures(
-    fakeRpc([
-      [row("later", 104), row("same-b", 101), row("same-a", 101), row("older", 100)],
-    ]),
+    fakeRpc([[row("later", 104), row("same-b", 101), row("same-a", 101), row("older", 100)]]),
     {
       wallet,
       boundary: { kind: "floor", slot: 101, inclusive: true },
@@ -93,7 +91,11 @@ test("exact cursor resumes only from the exact signature and never a slot fallba
     },
   );
   assert.equal(success.ok, true);
-  if (success.ok) assert.deepEqual(success.signatures.map((item) => item.signature), ["new"]);
+  if (success.ok)
+    assert.deepEqual(
+      success.signatures.map((item) => item.signature),
+      ["new"],
+    );
 
   const missing = await scanFreshTailFinalizedSignatures(
     fakeRpc([[row("new", 105), row("same-slot-sibling", 103), row("older", 102)], []]),
@@ -108,28 +110,25 @@ test("exact cursor resumes only from the exact signature and never a slot fallba
 });
 
 test("floor exhaustion requires firstAvailableBlock at or before the floor", async () => {
-  const complete = await scanFreshTailFinalizedSignatures(
-    fakeRpc([[row("only", 102)], []], 99),
-    {
-      wallet,
-      boundary: { kind: "floor", slot: 100, inclusive: false },
-      finalizedHeadSlot: 102,
-    },
-  );
+  const complete = await scanFreshTailFinalizedSignatures(fakeRpc([[row("only", 102)], []], 99), {
+    wallet,
+    boundary: { kind: "floor", slot: 100, inclusive: false },
+    finalizedHeadSlot: 102,
+  });
   assert.equal(complete.ok, true);
   if (complete.ok) {
     assert.equal(complete.firstAvailableBlock, 99);
-    assert.deepEqual(complete.signatures.map((item) => item.signature), ["only"]);
+    assert.deepEqual(
+      complete.signatures.map((item) => item.signature),
+      ["only"],
+    );
   }
 
-  const pruned = await scanFreshTailFinalizedSignatures(
-    fakeRpc([[row("only", 102)], []], 101),
-    {
-      wallet,
-      boundary: { kind: "floor", slot: 100, inclusive: false },
-      finalizedHeadSlot: 102,
-    },
-  );
+  const pruned = await scanFreshTailFinalizedSignatures(fakeRpc([[row("only", 102)], []], 101), {
+    wallet,
+    boundary: { kind: "floor", slot: 100, inclusive: false },
+    finalizedHeadSlot: 102,
+  });
   assert.equal(pruned.ok, false);
   if (!pruned.ok) assert.equal(pruned.code, "history_pruned");
 });
@@ -145,7 +144,10 @@ test("rows finalized after sampled H are validated but deferred", async () => {
   );
   assert.equal(result.ok, true);
   if (result.ok) {
-    assert.deepEqual(result.signatures.map((item) => item.signature), ["at-head"]);
+    assert.deepEqual(
+      result.signatures.map((item) => item.signature),
+      ["at-head"],
+    );
     assert.equal(result.checkpoint?.signature, "at-head");
   }
 });
@@ -191,15 +193,12 @@ test("duplicates, invalid order, and page budget exhaustion fail closed", async 
   assert.equal(reordered.ok, false);
   if (!reordered.ok) assert.equal(reordered.code, "page_conflict");
 
-  const capped = await scanFreshTailFinalizedSignatures(
-    fakeRpc([[row("new", 103)]]),
-    {
-      wallet,
-      boundary: { kind: "floor", slot: 100, inclusive: false },
-      finalizedHeadSlot: 103,
-      maxPages: 1,
-    },
-  );
+  const capped = await scanFreshTailFinalizedSignatures(fakeRpc([[row("new", 103)]]), {
+    wallet,
+    boundary: { kind: "floor", slot: 100, inclusive: false },
+    finalizedHeadSlot: 103,
+    maxPages: 1,
+  });
   assert.equal(capped.ok, false);
   if (!capped.ok) assert.equal(capped.code, "page_limit");
 });

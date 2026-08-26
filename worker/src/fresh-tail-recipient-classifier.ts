@@ -12,10 +12,7 @@ const KNOWN_UNWATCHABLE_PROGRAMS = new Map<string, string>([
   ["pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", "pump_swap_program"],
 ]);
 
-export type FreshTailRecipientClassifierConnection = Pick<
-  Connection,
-  "getAccountInfoAndContext"
->;
+export type FreshTailRecipientClassifierConnection = Pick<Connection, "getAccountInfoAndContext">;
 
 export type FreshTailRecipientClassificationResult =
   | { ok: true; recipient: FreshTailRecipientClassification }

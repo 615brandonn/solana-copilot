@@ -39,5 +39,8 @@ test("the exit executor forwards durable preparation and final authorization to 
   const body = source.slice(start, end);
   assert.match(body, /onPrepared\?: \(prepared: PreparedSellContext\)/);
   assert.match(body, /beforeSubmit\?: ExecuteInput\["beforeSubmit"\]/);
-  assert.match(body, /onPrepared: async \(prepared\)[\s\S]*await onPrepared\?\.[\s\S]*beforeSubmit,/);
+  assert.match(
+    body,
+    /onPrepared: async \(prepared\)[\s\S]*await onPrepared\?\.[\s\S]*beforeSubmit,/,
+  );
 });

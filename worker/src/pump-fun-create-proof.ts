@@ -26,9 +26,7 @@ import {
   type VerifiedFreshRootBuyEvidence,
 } from "./fresh-tail-root-buy-evidence.js";
 
-export const PUMP_FUN_CREATE_DISCRIMINATOR = Uint8Array.from([
-  24, 30, 200, 40, 5, 28, 7, 119,
-]);
+export const PUMP_FUN_CREATE_DISCRIMINATOR = Uint8Array.from([24, 30, 200, 40, 5, 28, 7, 119]);
 export const PUMP_FUN_FINALIZED_IDL_SHA256 =
   "ecf91ed5050c2c8e3e618bd330091f56d7433789eff724dfcc81fd47d1bab7d4";
 export const PUMP_FUN_CREATE_PROOF_ABI =
@@ -37,12 +35,8 @@ export const PUMP_FUN_CREATE_V2_DISCRIMINATOR = Uint8Array.from([
   214, 144, 76, 236, 95, 139, 49, 180,
 ]);
 
-const PUMP_FUN_EVENT_AUTHORITY = new PublicKey(
-  "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
-);
-const METADATA_PROGRAM_ID = new PublicKey(
-  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
-);
+const PUMP_FUN_EVENT_AUTHORITY = new PublicKey("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
+const METADATA_PROGRAM_ID = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 const CLASSIC_CREATE_ACCOUNT_COUNT = 14;
 const V2_CREATE_ACCOUNT_COUNT = 16;
 const MAYHEM_PROGRAM_ID = new PublicKey("MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e");
@@ -213,7 +207,7 @@ function publicKeyString(value: unknown): string | null {
     const text =
       typeof value === "string"
         ? value
-        : (value as { toBase58?: () => string } | null)?.toBase58?.() ?? String(value ?? "");
+        : ((value as { toBase58?: () => string } | null)?.toBase58?.() ?? String(value ?? ""));
     return new PublicKey(text).toBase58();
   } catch {
     return null;
@@ -237,10 +231,7 @@ function decodedInstructionData(value: unknown): Uint8Array | null {
   }
 }
 
-function readBorshString(
-  data: Uint8Array,
-  start: number,
-): { value: string; next: number } | null {
+function readBorshString(data: Uint8Array, start: number): { value: string; next: number } | null {
   if (start + 4 > data.length) return null;
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const length = view.getUint32(start, true);
@@ -256,7 +247,9 @@ function readBorshString(
   }
 }
 
-function decodeCreateArguments(data: Uint8Array): Omit<ParsedCreate, "bondingCurve" | "tokenProgram"> | null {
+function decodeCreateArguments(
+  data: Uint8Array,
+): Omit<ParsedCreate, "bondingCurve" | "tokenProgram"> | null {
   const classic = sameBytes(data.subarray(0, 8), PUMP_FUN_CREATE_DISCRIMINATOR);
   const v2 = sameBytes(data.subarray(0, 8), PUMP_FUN_CREATE_V2_DISCRIMINATOR);
   if (!classic && !v2) return null;
@@ -276,7 +269,10 @@ function decodeCreateArguments(data: Uint8Array): Omit<ParsedCreate, "bondingCur
     offset += 32;
     const isMayhemMode = v2 ? data[offset++] : 0;
     const isCashbackEnabled = v2 ? data[offset++] : 0;
-    if ((isMayhemMode !== 0 && isMayhemMode !== 1) || (isCashbackEnabled !== 0 && isCashbackEnabled !== 1)) {
+    if (
+      (isMayhemMode !== 0 && isMayhemMode !== 1) ||
+      (isCashbackEnabled !== 0 && isCashbackEnabled !== 1)
+    ) {
       return null;
     }
     return {
@@ -338,7 +334,10 @@ function instructionProgramId(instruction: unknown, accountKeys: readonly string
   return Number.isSafeInteger(index) && index >= 0 ? (accountKeys[index] ?? null) : null;
 }
 
-function instructionAccounts(instruction: unknown, accountKeys: readonly string[]): string[] | null {
+function instructionAccounts(
+  instruction: unknown,
+  accountKeys: readonly string[],
+): string[] | null {
   const raw = (instruction as { accounts?: unknown })?.accounts;
   if (!Array.isArray(raw)) return null;
   const resolved = raw.map((entry) => {
@@ -374,10 +373,7 @@ function expectedCreateAccounts(mint: PublicKey, user: PublicKey): string[] {
     TOKEN_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID,
   );
-  const global = PublicKey.findProgramAddressSync(
-    [Buffer.from("global")],
-    PUMP_FUN_PROGRAM_ID,
-  )[0];
+  const global = PublicKey.findProgramAddressSync([Buffer.from("global")], PUMP_FUN_PROGRAM_ID)[0];
   const metadata = PublicKey.findProgramAddressSync(
     [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mint.toBuffer()],
     METADATA_PROGRAM_ID,
@@ -491,7 +487,10 @@ export function parsePumpFunCreateTransaction(
         ? V2_CREATE_ACCOUNT_COUNT
         : CLASSIC_CREATE_ACCOUNT_COUNT;
     if (!args || !accounts || accounts.length !== accountCount) {
-      return { kind: "malformed", reason: "Pump create instruction does not match the reviewed ABI" };
+      return {
+        kind: "malformed",
+        reason: "Pump create instruction does not match the reviewed ABI",
+      };
     }
     if (accounts[0] !== mint) {
       return { kind: "malformed", reason: "Pump create instruction names a different mint" };
@@ -520,10 +519,16 @@ export function parsePumpFunCreateTransaction(
       !signerKeys.has(user!) ||
       requiredWritable.some((account) => !account || !writableKeys.has(account))
     ) {
-      return { kind: "malformed", reason: "Pump create mint/creator signer contract does not match" };
+      return {
+        kind: "malformed",
+        reason: "Pump create mint/creator signer contract does not match",
+      };
     }
     if (args.creator !== user) {
-      return { kind: "malformed", reason: "Pump create creator argument does not match its signer" };
+      return {
+        kind: "malformed",
+        reason: "Pump create creator argument does not match its signer",
+      };
     }
     const parsed: ParsedCreate = {
       ...args,
@@ -666,10 +671,7 @@ async function loadEpochSignatures(
         return deadlineFailure("the first-available-block proof");
       }
       try {
-        firstAvailable = await solanaRpcWithTimeout(
-          rpc.getFirstAvailableBlock(),
-          floorTimeoutMs,
-        );
+        firstAvailable = await solanaRpcWithTimeout(rpc.getFirstAvailableBlock(), floorTimeoutMs);
       } catch (error) {
         return rpcFailureOrDeadline(deadline, "first available block check", error);
       }
@@ -765,11 +767,7 @@ export async function attestFreshPumpFunCreate(
   const nowMs = request.nowMs ?? Date.now;
   const startedAtMs = Number(nowMs());
   const deadlineMs = Number(request.deadlineMs ?? startedAtMs + DEFAULT_OPERATION_BUDGET_MS);
-  if (
-    !Number.isSafeInteger(startedAtMs) ||
-    startedAtMs <= 0 ||
-    !Number.isSafeInteger(deadlineMs)
-  ) {
+  if (!Number.isSafeInteger(startedAtMs) || startedAtMs <= 0 || !Number.isSafeInteger(deadlineMs)) {
     return failure("invalid_request", "fresh Pump proof clock/deadline is invalid");
   }
   const deadline: PumpFunCreateDeadline = { deadlineMs, rpcCallTimeoutMs: timeoutMs, nowMs };
@@ -788,14 +786,7 @@ export async function attestFreshPumpFunCreate(
   const headFailure = await verifyBlockBoundary(rpc, request.requestedHead, "head", deadline);
   if (headFailure) return headFailure;
 
-  const loaded = await loadEpochSignatures(
-    rpc,
-    mint,
-    activationSlot,
-    headSlot,
-    maxPages,
-    deadline,
-  );
+  const loaded = await loadEpochSignatures(rpc, mint, activationSlot, headSlot, maxPages, deadline);
   if (!("rows" in loaded)) return loaded;
   if (loaded.rows.length === 0) {
     return failure("create_not_found", "mint has no finalized post-activation transactions");
@@ -887,7 +878,10 @@ export async function attestFreshPumpFunCreate(
       }
       if (parsed.kind !== "valid") continue;
       if (tx.slot <= activationSlot || tx.slot > headSlot) {
-        return failure("malformed_create_instruction", "Pump create falls outside proof boundaries");
+        return failure(
+          "malformed_create_instruction",
+          "Pump create falls outside proof boundaries",
+        );
       }
       if (tx.slot > triggerSlot) {
         return failure(
@@ -907,7 +901,10 @@ export async function attestFreshPumpFunCreate(
   }
 
   if (!create) {
-    return failure("create_not_found", "reviewed Pump create instruction was not found after activation");
+    return failure(
+      "create_not_found",
+      "reviewed Pump create instruction was not found after activation",
+    );
   }
   if (!triggerTransaction) {
     return failure(
@@ -946,7 +943,11 @@ export async function attestFreshPumpFunCreate(
     return rpcFailureOrDeadline(deadline, "finalized creation block load", error);
   }
   if (!creationBlock) {
-    return failure("creation_block_unavailable", "finalized Pump creation block is unavailable", true);
+    return failure(
+      "creation_block_unavailable",
+      "finalized Pump creation block is unavailable",
+      true,
+    );
   }
   const creationBlockhash =
     typeof creationBlock.blockhash === "string" ? creationBlock.blockhash.trim() : "";
@@ -995,10 +996,7 @@ export async function attestFreshPumpFunCreate(
       "Pump curve is already completed or graduated and is not a fresh pre-graduation candidate",
     );
   }
-  if (
-    snapshot.totalSupplyRaw !== PUMP_FUN_STANDARD_TOTAL_SUPPLY_RAW ||
-    snapshot.decimals !== 6
-  ) {
+  if (snapshot.totalSupplyRaw !== PUMP_FUN_STANDARD_TOTAL_SUPPLY_RAW || snapshot.decimals !== 6) {
     return failure(
       "curve_state_invalid",
       "fresh Pump launch does not have the frozen 1B-token/6-decimal supply contract",
@@ -1034,9 +1032,7 @@ export async function attestFreshPumpFunCreate(
   return {
     ok: true,
     proof: {
-      fingerprint: createHash("sha256")
-        .update(JSON.stringify(stableIdentityFields))
-        .digest("hex"),
+      fingerprint: createHash("sha256").update(JSON.stringify(stableIdentityFields)).digest("hex"),
       ...stableIdentityFields,
       stateObservedSlot: snapshot.observedSlot,
       requestedHeadSlot: headSlot,

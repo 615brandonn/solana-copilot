@@ -122,10 +122,7 @@ import {
   type SellTriggerKind,
 } from "./sell-claim-policy.js";
 import { decideSellClaimRecovery } from "./sell-claim-recovery-policy.js";
-import {
-  SellClaimRecoveryStore,
-  type SellRecoveryClaim,
-} from "./sell-claim-recovery-store.js";
+import { SellClaimRecoveryStore, type SellRecoveryClaim } from "./sell-claim-recovery-store.js";
 import { authoritativeCoordinatedTargetLinks } from "./target-link-backfill.js";
 import { targetTerminalOutflowExitPct } from "./target-outflow-policy.js";
 import { quoteTokenSpendUsd } from "./token-spend-quote.js";
@@ -757,14 +754,12 @@ async function main() {
           let historyNullAfterExpiryRecheck = false;
           let exactReceiptMatchesPrepared = false;
           let receipt: ConfirmedTokenDebit | null = null;
-          let position:
-            | {
-                id: string;
-                token_mint: string;
-                decimals: number | null;
-                entry_price_usd: number | null;
-              }
-            | null = null;
+          let position: {
+            id: string;
+            token_mint: string;
+            decimals: number | null;
+            entry_price_usd: number | null;
+          } | null = null;
 
           const isPreparedV1 =
             claim.recoveryVersion === 1 &&
@@ -859,11 +854,7 @@ async function main() {
             claim.status === "submitted" &&
             claim.botTxSig
           ) {
-            await sellClaimRecoveryStore.markUncertain(
-              claim.id,
-              claim.botTxSig,
-              decision.reason,
-            );
+            await sellClaimRecoveryStore.markUncertain(claim.id, claim.botTxSig, decision.reason);
             continue;
           }
           if (
@@ -1108,7 +1099,10 @@ async function main() {
     const freshTailBound = freshTailBindingParts.every(
       (value) => typeof value === "string" && value.length > 0,
     );
-    if (!freshTailBound && freshTailBindingParts.some((value) => value !== null && value !== undefined)) {
+    if (
+      !freshTailBound &&
+      freshTailBindingParts.some((value) => value !== null && value !== undefined)
+    ) {
       return null;
     }
     const statuses = await solanaRpcWithTimeout(
@@ -1172,10 +1166,7 @@ async function main() {
       let exactReceivedRaw = claim.received_amount_raw ?? null;
       let exactReceivedDecimals = claim.received_token_decimals ?? null;
       if (exactReceivedRaw !== null || exactReceivedDecimals !== null) {
-        if (
-          exactReceivedRaw !== receipt.amountRaw ||
-          exactReceivedDecimals !== receipt.decimals
-        ) {
+        if (exactReceivedRaw !== receipt.amountRaw || exactReceivedDecimals !== receipt.decimals) {
           return null;
         }
       } else {
@@ -1194,10 +1185,7 @@ async function main() {
         exactReceivedRaw = recoveredReceipt.receivedAmountRaw;
         exactReceivedDecimals = recoveredReceipt.receivedTokenDecimals;
       }
-      receivedAmountForLedger = rawAmountToUiString(
-        exactReceivedRaw,
-        exactReceivedDecimals,
-      );
+      receivedAmountForLedger = rawAmountToUiString(exactReceivedRaw, exactReceivedDecimals);
       receivedUiForMath = Number(receivedAmountForLedger);
     }
     if (!Number.isFinite(receivedUiForMath) || receivedUiForMath <= 0) return null;
@@ -1212,36 +1200,36 @@ async function main() {
       : await retryDb<{ id: string; amount_remaining_raw?: string | null } | null>(
           "recover prepared supply position",
           () =>
-          db
-            .from("positions")
-            .upsert(
-              {
-                id: claim.planned_position_id,
-                user_id: cfg.user_id,
-                token_mint: claim.token_mint,
-                entry_price_usd: entryPriceUsd,
-                bot_cost_basis_usd: nominalBuyUsd,
-                amount_tokens: receivedAmountForLedger,
-                amount_remaining: receivedAmountForLedger,
-                ...(freshTailBound
-                  ? { amount_remaining_raw: claim.received_amount_raw ?? receipt.amountRaw }
-                  : {}),
-                decimals: tokenDecimals,
-                mirrored_sold_fraction: 0,
-                tp_taken: false,
-                entry_tx_sig: claim.bot_tx_sig,
-                entry_slot: sourceSlot,
-                entry_mode: "regular",
-                coordinated_exit_triggered: false,
-                follower_seller_exit_triggered: false,
-                root_buy_count: Math.max(1, contributingWallets.length),
-                last_root_buy_at: observedAt,
-                last_root_buy_wallet: claim.source_wallet,
-              },
-              { onConflict: "id" },
-            )
-            .select("id,amount_remaining_raw")
-            .maybeSingle(),
+            db
+              .from("positions")
+              .upsert(
+                {
+                  id: claim.planned_position_id,
+                  user_id: cfg.user_id,
+                  token_mint: claim.token_mint,
+                  entry_price_usd: entryPriceUsd,
+                  bot_cost_basis_usd: nominalBuyUsd,
+                  amount_tokens: receivedAmountForLedger,
+                  amount_remaining: receivedAmountForLedger,
+                  ...(freshTailBound
+                    ? { amount_remaining_raw: claim.received_amount_raw ?? receipt.amountRaw }
+                    : {}),
+                  decimals: tokenDecimals,
+                  mirrored_sold_fraction: 0,
+                  tp_taken: false,
+                  entry_tx_sig: claim.bot_tx_sig,
+                  entry_slot: sourceSlot,
+                  entry_mode: "regular",
+                  coordinated_exit_triggered: false,
+                  follower_seller_exit_triggered: false,
+                  root_buy_count: Math.max(1, contributingWallets.length),
+                  last_root_buy_at: observedAt,
+                  last_root_buy_wallet: claim.source_wallet,
+                },
+                { onConflict: "id" },
+              )
+              .select("id,amount_remaining_raw")
+              .maybeSingle(),
         );
     if (!position) return null;
     if (
@@ -3778,14 +3766,11 @@ async function main() {
       configuredRoots.length === 3 &&
       configuredRoots.every((root, index) => root === candidateRoots[index]) &&
       candidate.thresholdPct === Number(cfg.supply_accumulation_threshold_pct ?? 10) &&
-      candidate.minMarketCapUsd ===
-        Number(cfg.supply_accumulation_min_market_cap_usd ?? 2_000) &&
-      candidate.maxMarketCapUsd ===
-        Number(cfg.supply_accumulation_max_market_cap_usd ?? 20_000) &&
+      candidate.minMarketCapUsd === Number(cfg.supply_accumulation_min_market_cap_usd ?? 2_000) &&
+      candidate.maxMarketCapUsd === Number(cfg.supply_accumulation_max_market_cap_usd ?? 20_000) &&
       Number.isFinite(triggerAt) &&
       Number.isFinite(windowAt) &&
-      triggerAt - windowAt ===
-        Number(cfg.supply_accumulation_window_seconds ?? 600) * 1_000 &&
+      triggerAt - windowAt === Number(cfg.supply_accumulation_window_seconds ?? 600) * 1_000 &&
       event.wallet === candidate.targetWallet &&
       event.tokenMint === candidate.tokenMint &&
       event.txSig === candidate.txSig &&
@@ -4147,9 +4132,7 @@ async function main() {
       configuredCap,
     );
     if (
-      currentViewCaps.some(
-        (marketCap) => marketCap === undefined || marketCap < configuredFloor,
-      ) ||
+      currentViewCaps.some((marketCap) => marketCap === undefined || marketCap < configuredFloor) ||
       !caps?.belowCap ||
       caps.currentMarketCapUsd < configuredFloor ||
       !freshTailCandidateIsUsable(finalCertificate) ||
@@ -4798,9 +4781,7 @@ async function main() {
     );
   }
 
-  async function processFreshTailEntryCandidate(
-    candidate: FreshTailEntryCandidate,
-  ): Promise<void> {
+  async function processFreshTailEntryCandidate(candidate: FreshTailEntryCandidate): Promise<void> {
     const event = freshTailCandidateEvent(candidate);
     if (
       !freshTailCandidateIsUsable(candidate) ||
@@ -7121,36 +7102,36 @@ async function main() {
       const pos = await retryDb<{ id: string; amount_remaining_raw?: string | null } | null>(
         "save landed copy-buy position",
         () =>
-        db
-          .from("positions")
-          .upsert(
-            {
-              id: positionId,
-              user_id: cfg.user_id,
-              token_mint: event.tokenMint,
-              entry_price_usd: entryPrice,
-              ...(supplyEntry ? { bot_cost_basis_usd: buyUsd } : {}),
-              amount_tokens: receivedAmountForLedger,
-              amount_remaining: receivedAmountForLedger,
-              ...(receivedAmountRawForPosition
-                ? { amount_remaining_raw: receivedAmountRawForPosition }
-                : {}),
-              decimals: event.decimals,
-              mirrored_sold_fraction: 0,
-              tp_taken: false,
-              entry_tx_sig: result.txSig,
-              entry_slot: event.slot,
-              entry_mode: options.entryMode,
-              coordinated_exit_triggered: false,
-              follower_seller_exit_triggered: false,
-              root_buy_count: options.coordinatedWallets?.length ?? 1,
-              last_root_buy_at: targetBuyAt,
-              last_root_buy_wallet: event.wallet,
-            },
-            { onConflict: "id" },
-          )
-          .select("id,amount_remaining_raw")
-          .maybeSingle(),
+          db
+            .from("positions")
+            .upsert(
+              {
+                id: positionId,
+                user_id: cfg.user_id,
+                token_mint: event.tokenMint,
+                entry_price_usd: entryPrice,
+                ...(supplyEntry ? { bot_cost_basis_usd: buyUsd } : {}),
+                amount_tokens: receivedAmountForLedger,
+                amount_remaining: receivedAmountForLedger,
+                ...(receivedAmountRawForPosition
+                  ? { amount_remaining_raw: receivedAmountRawForPosition }
+                  : {}),
+                decimals: event.decimals,
+                mirrored_sold_fraction: 0,
+                tp_taken: false,
+                entry_tx_sig: result.txSig,
+                entry_slot: event.slot,
+                entry_mode: options.entryMode,
+                coordinated_exit_triggered: false,
+                follower_seller_exit_triggered: false,
+                root_buy_count: options.coordinatedWallets?.length ?? 1,
+                last_root_buy_at: targetBuyAt,
+                last_root_buy_wallet: event.wallet,
+              },
+              { onConflict: "id" },
+            )
+            .select("id,amount_remaining_raw")
+            .maybeSingle(),
       );
       if (!pos) {
         throw new Error(

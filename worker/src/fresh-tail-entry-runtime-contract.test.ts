@@ -20,7 +20,10 @@ function occurrences(source: string, needle: string): number[] {
 }
 
 test("fresh-tail polling is entry-enabled, non-overlapping, and serialized by mint", () => {
-  const startup = section("let freshTailEntryPollRunning", "const runFollowerBalanceReconciliation");
+  const startup = section(
+    "let freshTailEntryPollRunning",
+    "const runFollowerBalanceReconciliation",
+  );
   assert.match(startup, /!cfg\.enabled/);
   assert.match(startup, /automaticEntryStrategy\(cfg\) !== "supply_accumulation"/);
   assert.match(startup, /freshTailEntryStore\.loadCandidates\(25\)/);
@@ -75,7 +78,10 @@ test("both preclaim and prepared-claim gates require a fresh certificate and dua
   assert.match(validation, /strictestPumpFunMarketCaps\(/);
   assert.match(validation, /!caps\?\.belowCap/);
 
-  const curveViews = section("async function loadFreshTailCurveViews", "async function loadSupplyCurveViews");
+  const curveViews = section(
+    "async function loadFreshTailCurveViews",
+    "async function loadSupplyCurveViews",
+  );
   assert.match(
     curveViews,
     /commitment: "confirmed"[\s\S]*minContextSlot: candidate\.requestedHeadSlot/,
@@ -138,7 +144,10 @@ test("fresh landing and recovery use the exact frozen receipt before numeric led
   const recoveryRpcAt = recovery.indexOf("freshTailEntryStore.recordBoundReceipt(");
   const recoveryStringAt = recovery.indexOf("rawAmountToUiString(", recoveryRpcAt);
   assert.ok(
-    storedRawAt >= 0 && exactChainAt > storedRawAt && recoveryRpcAt > exactChainAt && recoveryStringAt > recoveryRpcAt,
+    storedRawAt >= 0 &&
+      exactChainAt > storedRawAt &&
+      recoveryRpcAt > exactChainAt &&
+      recoveryStringAt > recoveryRpcAt,
   );
   assert.match(recovery, /amount_tokens: receivedAmountForLedger/);
   assert.match(recovery, /amount_remaining: receivedAmountForLedger/);

@@ -89,14 +89,14 @@ test("a missing signature is released only after expiry and a second history nul
 });
 
 test("only finalized chain failure releases a recorded signature", () => {
-  assert.deepEqual(
-    decideSellClaimRecovery({ ...BASE, chainEvidence: "finalized_failure" }),
-    { action: "release_for_retry", reason: "transaction_failed_finalized" },
-  );
-  assert.deepEqual(
-    decideSellClaimRecovery({ ...BASE, chainEvidence: "pending_failure" }),
-    { action: "quarantine", reason: "failure_not_finalized" },
-  );
+  assert.deepEqual(decideSellClaimRecovery({ ...BASE, chainEvidence: "finalized_failure" }), {
+    action: "release_for_retry",
+    reason: "transaction_failed_finalized",
+  });
+  assert.deepEqual(decideSellClaimRecovery({ ...BASE, chainEvidence: "pending_failure" }), {
+    action: "quarantine",
+    reason: "failure_not_finalized",
+  });
 });
 
 test("only a finalized exact receipt crosses the atomic-apply boundary", () => {

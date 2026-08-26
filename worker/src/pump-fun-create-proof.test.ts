@@ -178,29 +178,27 @@ function realV2AttestationFixture(mintDataOverride?: Buffer) {
       return { blockhash: "v2-creation-block", signatures: [fixture.signature] } as any;
     },
     async getSignaturesForAddress() {
-      return (
+      return ([
         [
-          [
-            {
-              signature: triggerSignature,
-              slot: triggerSlot,
-              blockTime: triggerTx.blockTime,
-              err: null,
-              memo: null,
-              confirmationStatus: "finalized",
-            },
-            {
-              signature: fixture.signature,
-              slot: fixture.slot,
-              blockTime: fixture.blockTime,
-              err: null,
-              memo: null,
-              confirmationStatus: "finalized",
-            },
-          ],
-          [],
-        ][signaturePage++] ?? []
-      ) as any;
+          {
+            signature: triggerSignature,
+            slot: triggerSlot,
+            blockTime: triggerTx.blockTime,
+            err: null,
+            memo: null,
+            confirmationStatus: "finalized",
+          },
+          {
+            signature: fixture.signature,
+            slot: fixture.slot,
+            blockTime: fixture.blockTime,
+            err: null,
+            memo: null,
+            confirmationStatus: "finalized",
+          },
+        ],
+        [],
+      ][signaturePage++] ?? []) as any;
     },
     async getFirstAvailableBlock() {
       return 1;
@@ -301,10 +299,7 @@ function createAccounts(): PublicKey[] {
     TOKEN_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID,
   );
-  const global = PublicKey.findProgramAddressSync(
-    [Buffer.from("global")],
-    PUMP_FUN_PROGRAM_ID,
-  )[0];
+  const global = PublicKey.findProgramAddressSync([Buffer.from("global")], PUMP_FUN_PROGRAM_ID)[0];
   const metadata = PublicKey.findProgramAddressSync(
     [Buffer.from("metadata"), metadataProgram.toBuffer(), mint.toBuffer()],
     metadataProgram,
@@ -524,8 +519,7 @@ function request(
 ) {
   const triggerSlot = options.triggerSlot ?? TRIGGER_SLOT;
   const triggerTxSig = options.triggerTxSig ?? TRIGGER_SIG;
-  const triggerTx =
-    options.triggerTx ?? parsedTx({ signature: triggerTxSig, slot: triggerSlot });
+  const triggerTx = options.triggerTx ?? parsedTx({ signature: triggerTxSig, slot: triggerSlot });
   return {
     mint: mint.toBase58(),
     activation: { slot: ACTIVATION_SLOT, blockhash: ACTIVATION_HASH },
@@ -562,9 +556,7 @@ test("strict parser accepts the reviewed Pump create ABI", () => {
 });
 
 test("strict parser accepts two independently captured finalized CreateV2 fixtures", () => {
-  assert.deepEqual([...PUMP_FUN_CREATE_V2_DISCRIMINATOR], [
-    214, 144, 76, 236, 95, 139, 49, 180,
-  ]);
+  assert.deepEqual([...PUMP_FUN_CREATE_V2_DISCRIMINATOR], [214, 144, 76, 236, 95, 139, 49, 180]);
   for (const fixture of REAL_V2_FIXTURES) {
     const result = parsePumpFunCreateTransaction(realV2CreateTx(fixture), fixture.mint);
     assert.equal(result.kind, "valid", fixture.mint);
@@ -595,50 +587,52 @@ test("real CreateV2 attestation accepts only the frozen safe Token-2022 mint lay
     Buffer.alloc(36),
   ]);
   const paddedFixture = realV2AttestationFixture();
-  paddedFixture.rpc.getMultipleAccountsInfoAndContext = async () => ({
-    context: { slot: paddedFixture.request.requestedHead.slot },
-    value: [
-      {
-        data: paddedCurve,
-        executable: false,
-        lamports: 1,
-        owner: PUMP_FUN_PROGRAM_ID,
-        rentEpoch: 0,
-      },
-      {
-        data: Buffer.from(REAL_V2_FIXTURES[0].mintData, "base64"),
-        executable: false,
-        lamports: 1,
-        owner: TOKEN_2022_PROGRAM_ID,
-        rentEpoch: 0,
-      },
-    ],
-  }) as any;
+  paddedFixture.rpc.getMultipleAccountsInfoAndContext = async () =>
+    ({
+      context: { slot: paddedFixture.request.requestedHead.slot },
+      value: [
+        {
+          data: paddedCurve,
+          executable: false,
+          lamports: 1,
+          owner: PUMP_FUN_PROGRAM_ID,
+          rentEpoch: 0,
+        },
+        {
+          data: Buffer.from(REAL_V2_FIXTURES[0].mintData, "base64"),
+          executable: false,
+          lamports: 1,
+          owner: TOKEN_2022_PROGRAM_ID,
+          rentEpoch: 0,
+        },
+      ],
+    }) as any;
   const padded = await attestFreshPumpFunCreate(paddedFixture.rpc, paddedFixture.request);
   assert.equal(padded.ok, true, padded.ok ? "" : JSON.stringify(padded));
 
   const nonzeroTail = Buffer.from(paddedCurve);
   nonzeroTail[150] = 1;
   const unknownCurveFixture = realV2AttestationFixture();
-  unknownCurveFixture.rpc.getMultipleAccountsInfoAndContext = async () => ({
-    context: { slot: unknownCurveFixture.request.requestedHead.slot },
-    value: [
-      {
-        data: nonzeroTail,
-        executable: false,
-        lamports: 1,
-        owner: PUMP_FUN_PROGRAM_ID,
-        rentEpoch: 0,
-      },
-      {
-        data: Buffer.from(REAL_V2_FIXTURES[0].mintData, "base64"),
-        executable: false,
-        lamports: 1,
-        owner: TOKEN_2022_PROGRAM_ID,
-        rentEpoch: 0,
-      },
-    ],
-  }) as any;
+  unknownCurveFixture.rpc.getMultipleAccountsInfoAndContext = async () =>
+    ({
+      context: { slot: unknownCurveFixture.request.requestedHead.slot },
+      value: [
+        {
+          data: nonzeroTail,
+          executable: false,
+          lamports: 1,
+          owner: PUMP_FUN_PROGRAM_ID,
+          rentEpoch: 0,
+        },
+        {
+          data: Buffer.from(REAL_V2_FIXTURES[0].mintData, "base64"),
+          executable: false,
+          lamports: 1,
+          owner: TOKEN_2022_PROGRAM_ID,
+          rentEpoch: 0,
+        },
+      ],
+    }) as any;
   const unknownCurve = await attestFreshPumpFunCreate(
     unknownCurveFixture.rpc,
     unknownCurveFixture.request,
@@ -807,7 +801,6 @@ test("attestor permits separately decoded same-slot root buy only after canonica
 });
 
 test("attestor rejects a creation after the enrollment trigger", async () => {
-
   const afterTriggerCreate = "after-trigger-create";
   const after = await attestFreshPumpFunCreate(
     fakeRpc({
@@ -994,10 +987,7 @@ test("attestor fails closed when an older transaction before creation is unavail
       transactions: new Map([
         [CREATE_SIG, parsedTx({ signature: CREATE_SIG, slot: CREATE_SLOT, create: true })],
         [TRIGGER_SIG, parsedTx({ signature: TRIGGER_SIG, slot: TRIGGER_SLOT })],
-        [
-          olderRow.signature,
-          parsedTx({ signature: olderRow.signature, slot: olderRow.slot + 1 }),
-        ],
+        [olderRow.signature, parsedTx({ signature: olderRow.signature, slot: olderRow.slot + 1 })],
       ]),
     }),
     request(),
@@ -1076,10 +1066,7 @@ test("attestor rejects create identity conflicts and invalid current curve owner
   assert.equal(wrongSlot.ok, false);
   if (!wrongSlot.ok) assert.equal(wrongSlot.code, "transaction_identity_conflict");
 
-  const wrongOwner = await attestFreshPumpFunCreate(
-    fakeRpc({ curveOwner: key(8) }),
-    request(),
-  );
+  const wrongOwner = await attestFreshPumpFunCreate(fakeRpc({ curveOwner: key(8) }), request());
   assert.equal(wrongOwner.ok, false);
   if (!wrongOwner.ok) {
     assert.equal(wrongOwner.code, "curve_state_invalid");
@@ -1106,10 +1093,7 @@ test("attestor enforces one absolute deadline across sequential RPC calls", asyn
 test("attestor reports deadline_exceeded when an RPC hangs through the remaining budget", async () => {
   const rpc = fakeRpc() as any;
   rpc.getBlock = async () => await new Promise(() => {});
-  const result = await attestFreshPumpFunCreate(
-    rpc,
-    request({ deadlineMs: Date.now() + 20 }),
-  );
+  const result = await attestFreshPumpFunCreate(rpc, request({ deadlineMs: Date.now() + 20 }));
   assert.equal(result.ok, false);
   if (!result.ok) {
     assert.equal(result.code, "deadline_exceeded");

@@ -157,25 +157,15 @@ export function parseSellRecoveryClaim(value: unknown): SellRecoveryClaim {
         ? null
         : decimals(key(source, "tokenDecimals", "token_decimals"), "claim tokenDecimals"),
     executedSellAmountRaw: rawOrNull("executedSellAmountRaw", "executed_sell_amount_raw"),
-    preparedWalletBalanceRaw: rawOrNull(
-      "preparedWalletBalanceRaw",
-      "prepared_wallet_balance_raw",
-    ),
-    positionAmountBeforeRaw: rawOrNull(
-      "positionAmountBeforeRaw",
-      "position_amount_before_raw",
-    ),
+    preparedWalletBalanceRaw: rawOrNull("preparedWalletBalanceRaw", "prepared_wallet_balance_raw"),
+    positionAmountBeforeRaw: rawOrNull("positionAmountBeforeRaw", "position_amount_before_raw"),
     recentBlockhash: nullableString(
       key(source, "recentBlockhash", "recent_blockhash"),
       "claim recentBlockhash",
     ),
     lastValidBlockHeight: rawOrNull("lastValidBlockHeight", "last_valid_block_height"),
     receiptPreAmountRaw: rawOrNull("receiptPreAmountRaw", "receipt_pre_amount_raw"),
-    receiptPostAmountRaw: rawOrNull(
-      "receiptPostAmountRaw",
-      "receipt_post_amount_raw",
-      true,
-    ),
+    receiptPostAmountRaw: rawOrNull("receiptPostAmountRaw", "receipt_post_amount_raw", true),
     tradeId: nullableString(key(source, "tradeId", "trade_id"), "claim tradeId"),
     submissionStartedAt: nullableString(
       key(source, "submissionStartedAt", "submission_started_at"),
@@ -218,16 +208,14 @@ export class SellClaimRecoveryStore {
     const blockhash = requiredString(attempt.recentBlockhash, "prepared sell blockhash");
     const soldRaw = exactRaw(attempt.executedSellAmountRaw, "prepared sell amount");
     const walletRaw = exactRaw(attempt.preparedWalletBalanceRaw, "prepared wallet balance");
-    const positionRaw = exactRaw(
-      attempt.positionAmountBeforeRaw,
-      "prepared position balance",
-    );
+    const positionRaw = exactRaw(attempt.positionAmountBeforeRaw, "prepared position balance");
     const tokenDecimals = decimals(attempt.tokenDecimals, "prepared sell decimals");
     const lastHeight =
       attempt.lastValidBlockHeight === undefined
         ? null
         : Number(exactRaw(BigInt(attempt.lastValidBlockHeight), "prepared last valid height"));
-    if (BigInt(soldRaw) > BigInt(walletRaw)) throw new Error("prepared sell exceeds wallet balance");
+    if (BigInt(soldRaw) > BigInt(walletRaw))
+      throw new Error("prepared sell exceeds wallet balance");
     if (BigInt(soldRaw) > BigInt(positionRaw)) {
       throw new Error("prepared sell exceeds position balance");
     }
@@ -309,7 +297,8 @@ export class SellClaimRecoveryStore {
       .order("created_at", { ascending: true })
       .order("id", { ascending: true })
       .limit(MAX_UNRESOLVED + 1);
-    if (response.error) throw new Error(`load unresolved sell claims failed: ${response.error.message}`);
+    if (response.error)
+      throw new Error(`load unresolved sell claims failed: ${response.error.message}`);
     if (!Array.isArray(response.data)) throw new Error("unresolved sell claims are malformed");
     if (response.data.length > MAX_UNRESOLVED) {
       throw new Error("unresolved sell claims exceed the safe recovery bound");

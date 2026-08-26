@@ -74,8 +74,7 @@ function validSignatureRow(row: ConfirmedSignatureInfo): boolean {
     positiveSlot(row.slot) !== null &&
     row.confirmationStatus === "finalized" &&
     row.err !== undefined &&
-    (row.blockTime === null ||
-      (Number.isSafeInteger(row.blockTime) && Number(row.blockTime) > 0))
+    (row.blockTime === null || (Number.isSafeInteger(row.blockTime) && Number(row.blockTime) > 0))
   );
 }
 
@@ -90,12 +89,7 @@ export async function loadFreshTailFinalizedTransactions(
   request: FreshTailTransactionLoadRequest,
 ): Promise<FreshTailTransactionLoadResult> {
   const batchSize = boundedInteger(request.batchSize, DEFAULT_BATCH_SIZE, 1, 50);
-  const timeoutMs = boundedInteger(
-    request.rpcCallTimeoutMs,
-    DEFAULT_RPC_TIMEOUT_MS,
-    250,
-    30_000,
-  );
+  const timeoutMs = boundedInteger(request.rpcCallTimeoutMs, DEFAULT_RPC_TIMEOUT_MS, 250, 30_000);
   const nowMs = request.nowMs ?? Date.now;
   const startedAtMs = Number(nowMs());
   const deadlineMs = Number(request.deadlineMs ?? startedAtMs + DEFAULT_OPERATION_BUDGET_MS);
@@ -178,10 +172,7 @@ export async function loadFreshTailFinalizedTransactions(
       }
       bySignature.set(signature, tx);
     }
-    if (
-      bySignature.size !== batch.length ||
-      batch.some((row) => !bySignature.has(row.signature))
-    ) {
+    if (bySignature.size !== batch.length || batch.some((row) => !bySignature.has(row.signature))) {
       return failure(
         "transaction_identity_conflict",
         "fresh-tail transaction batch does not match the requested signature set",

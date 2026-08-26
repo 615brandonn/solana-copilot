@@ -23,8 +23,7 @@ export type FreshTailLaneCursor = {
   coverageRevision: number;
 };
 
-export type FreshTailLaneConnection = FreshTailSignatureConnection &
-  FreshTailTransactionConnection;
+export type FreshTailLaneConnection = FreshTailSignatureConnection & FreshTailTransactionConnection;
 
 export type FreshTailLaneResult = {
   processedSignatures: number;

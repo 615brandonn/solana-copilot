@@ -5,16 +5,9 @@ import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
-import {
-  PublicKey,
-  SystemProgram,
-  type ParsedTransactionWithMeta,
-} from "@solana/web3.js";
+import { PublicKey, SystemProgram, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import bs58 from "bs58";
-import {
-  FRESH_TAIL_PARSER_ABIS,
-  type FreshTailParserDomain,
-} from "./fresh-tail-parser-abis.js";
+import { FRESH_TAIL_PARSER_ABIS, type FreshTailParserDomain } from "./fresh-tail-parser-abis.js";
 import {
   buildVerifiedFreshRootBuyEvidence,
   type VerifiedFreshRootBuyEvidence,
@@ -25,12 +18,8 @@ import {
   pumpFunBondingCurveAddress,
 } from "./pump-fun-supply.js";
 
-const PUMP_EVENT_AUTHORITY = new PublicKey(
-  "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
-);
-const PUMP_FEE_PROGRAM = new PublicKey(
-  "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
-);
+const PUMP_EVENT_AUTHORITY = new PublicKey("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
+const PUMP_FEE_PROGRAM = new PublicKey("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
 const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 
 const BUY_DISCRIMINATOR = "66063d1201daebea";
@@ -97,17 +86,9 @@ export type FreshTailSupplyEvent = FreshTailEventCommon & {
   classificationReliable: true;
 };
 
-export type FreshTailCustodyEventDraft = Omit<
-  FreshTailEventCommon,
-  "payloadFingerprint"
-> & {
+export type FreshTailCustodyEventDraft = Omit<FreshTailEventCommon, "payloadFingerprint"> & {
   ledger: "custody";
-  eventKind:
-    | "TARGET_BUY"
-    | "TRANSFER"
-    | "SELL"
-    | "UNRESOLVED_OUTFLOW"
-    | "TERMINAL_OUTFLOW";
+  eventKind: "TARGET_BUY" | "TRANSFER" | "SELL" | "UNRESOLVED_OUTFLOW" | "TERMINAL_OUTFLOW";
   sourceWallet: string;
   sourcePreRaw: string;
   sourcePostRaw: string;
@@ -117,10 +98,7 @@ export type FreshTailCustodyEventDraft = Omit<
   recipients: FreshTailRawRecipient[];
 };
 
-export type FreshTailCustodyEvent = Omit<
-  FreshTailCustodyEventDraft,
-  "recipients"
-> & {
+export type FreshTailCustodyEvent = Omit<FreshTailCustodyEventDraft, "recipients"> & {
   payloadFingerprint: string;
   recipients: FreshTailRecipientClassification[];
 };
@@ -230,10 +208,7 @@ type PumpTradeEventParse =
   | { kind: "valid"; event: FreshTailPumpTradeEventEvidence }
   | { kind: "conflict"; reason: string };
 
-function failure(
-  code: FreshTailDecodeFailureCode,
-  reason: string,
-): FreshTailDecodeResult {
+function failure(code: FreshTailDecodeFailureCode, reason: string): FreshTailDecodeResult {
   return { ok: false, code, reason, retryable: false };
 }
 
@@ -242,8 +217,7 @@ function keyText(value: unknown): string | null {
     return new PublicKey(
       typeof value === "string"
         ? value
-        : (value as { toBase58?: () => string } | null)?.toBase58?.() ??
-            String(value ?? ""),
+        : ((value as { toBase58?: () => string } | null)?.toBase58?.() ?? String(value ?? "")),
     ).toBase58();
   } catch {
     return null;
@@ -305,7 +279,10 @@ function messageAccounts(tx: ParsedTransactionWithMeta): AccountEntry[] | null {
   return result;
 }
 
-function instructionView(instruction: unknown, accountKeys: readonly string[]): InstructionView | null {
+function instructionView(
+  instruction: unknown,
+  accountKeys: readonly string[],
+): InstructionView | null {
   const row = instruction as {
     programId?: unknown;
     programIdIndex?: unknown;
@@ -457,10 +434,7 @@ function buildTokenLedger(
     owner.accountIndexes.push(accountIndex);
     owners.set(row.owner, owner);
   }
-  const net = [...owners.values()].reduce(
-    (sum, row) => sum + row.postRaw - row.preRaw,
-    0n,
-  );
+  const net = [...owners.values()].reduce((sum, row) => sum + row.postRaw - row.preRaw, 0n);
   return { owners, accounts, netDeltaRaw: net };
 }
 
@@ -637,9 +611,7 @@ function parsePumpTradeEvent(instruction: InstructionView): PumpTradeEventParse 
       full.realSolReservesLamports < 0n ||
       full.timestampSeconds <= 0n ||
       full.timestampSeconds > BigInt(Number.MAX_SAFE_INTEGER) ||
-      !["buy", "buy_exact_sol_in", "buy_exact_quote_in", "sell"].includes(
-        full.instructionName,
-      )
+      !["buy", "buy_exact_sol_in", "buy_exact_quote_in", "sell"].includes(full.instructionName)
     ) {
       return { kind: "conflict", reason: "Pump TradeEvent values are outside reviewed bounds" };
     }
@@ -762,10 +734,7 @@ function exactAccountContract(
   const buybackRecipient = new PublicKey(accounts[8]!);
   const userKey = new PublicKey(user);
   const userVolume = pda([Buffer.from("user_volume_accumulator"), userKey.toBuffer()]);
-  const sharingConfig = pda(
-    [Buffer.from("sharing-config"), mint.toBuffer()],
-    PUMP_FEE_PROGRAM,
-  );
+  const sharingConfig = pda([Buffer.from("sharing-config"), mint.toBuffer()], PUMP_FEE_PROGRAM);
   const common = [
     global,
     contract.mint,
@@ -981,7 +950,9 @@ function supplyEvent(
   };
 }
 
-function custodyDraft(input: Omit<FreshTailCustodyEventDraft, "eventKey">): FreshTailCustodyEventDraft {
+function custodyDraft(
+  input: Omit<FreshTailCustodyEventDraft, "eventKey">,
+): FreshTailCustodyEventDraft {
   return {
     eventKey: eventKey(
       input.txSig,
@@ -1114,9 +1085,7 @@ export function decodeFreshTailFinalizedTransaction(
   if (conflict?.kind === "conflict") {
     return failure("pump_instruction_conflict", conflict.reason);
   }
-  const trades = parsedTrades.flatMap((result) =>
-    result.kind === "valid" ? [result.trade] : [],
-  );
+  const trades = parsedTrades.flatMap((result) => (result.kind === "valid" ? [result.trade] : []));
   const parsedTradeEvents = instructionSet.views.map(parsePumpTradeEvent);
   const eventConflict = parsedTradeEvents.find((result) => result.kind === "conflict");
   if (eventConflict?.kind === "conflict") {
@@ -1153,13 +1122,7 @@ export function decodeFreshTailFinalizedTransaction(
       );
     }
     const grossRaw = -curveDelta;
-    const boundTradeEvent = bindTradeEvent(
-      trade,
-      tradeEvents,
-      contract,
-      blockTime,
-      grossRaw,
-    );
+    const boundTradeEvent = bindTradeEvent(trade, tradeEvents, contract, blockTime, grossRaw);
     if (typeof boundTradeEvent === "string") {
       return failure("pump_instruction_conflict", boundTradeEvent);
     }
@@ -1169,9 +1132,7 @@ export function decodeFreshTailFinalizedTransaction(
         "legacy Pump buy amount does not equal the exact curve outflow",
       );
     }
-    const negativeOwners = [...ledger.owners.values()].filter(
-      (row) => row.postRaw < row.preRaw,
-    );
+    const negativeOwners = [...ledger.owners.values()].filter((row) => row.postRaw < row.preRaw);
     if (
       ledger.netDeltaRaw !== 0n ||
       negativeOwners.length !== 1 ||
@@ -1183,10 +1144,7 @@ export function decodeFreshTailFinalizedTransaction(
         "root Pump buy has an extra source or acquires less than the root final delta",
       );
     }
-    const recipients = positiveRecipients(
-      ledger,
-      new Set([contract.bondingCurve, observedWallet]),
-    );
+    const recipients = positiveRecipients(ledger, new Set([contract.bondingCurve, observedWallet]));
     const forwardedRaw = recipients.reduce(
       (sum, recipient) => sum + BigInt(recipient.amountRaw),
       0n,
@@ -1268,13 +1226,7 @@ export function decodeFreshTailFinalizedTransaction(
   const outflowRaw = -observedDelta;
 
   if (trade?.side === "sell") {
-    const boundTradeEvent = bindTradeEvent(
-      trade,
-      tradeEvents,
-      contract,
-      blockTime,
-      outflowRaw,
-    );
+    const boundTradeEvent = bindTradeEvent(trade, tradeEvents, contract, blockTime, outflowRaw);
     if (typeof boundTradeEvent === "string") {
       return failure("pump_instruction_conflict", boundTradeEvent);
     }
@@ -1339,14 +1291,7 @@ export function decodeFreshTailFinalizedTransaction(
 
   if (
     ledger.netDeltaRaw === -outflowRaw &&
-    isExactTokenBurn(
-      instructionSet.views,
-      accounts,
-      ledger,
-      contract,
-      observedWallet,
-      outflowRaw,
-    )
+    isExactTokenBurn(instructionSet.views, accounts, ledger, contract, observedWallet, outflowRaw)
   ) {
     return {
       ok: true,
@@ -1375,14 +1320,9 @@ export function decodeFreshTailFinalizedTransaction(
     };
   }
 
-  const negativeOwners = [...ledger.owners.values()].filter(
-    (row) => row.postRaw < row.preRaw,
-  );
+  const negativeOwners = [...ledger.owners.values()].filter((row) => row.postRaw < row.preRaw);
   const recipients = positiveRecipients(ledger, new Set([observedWallet]));
-  const receivedRaw = recipients.reduce(
-    (sum, recipient) => sum + BigInt(recipient.amountRaw),
-    0n,
-  );
+  const receivedRaw = recipients.reduce((sum, recipient) => sum + BigInt(recipient.amountRaw), 0n);
   if (
     ledger.netDeltaRaw === 0n &&
     signerKeys.has(observedWallet) &&
@@ -1490,16 +1430,13 @@ export function discoverFreshTailRootPumpBuys(
       retryable: false,
     };
   }
-  const events = parsedEvents.flatMap((event) =>
-    event.kind === "valid" ? [event.event] : [],
-  );
+  const events = parsedEvents.flatMap((event) => (event.kind === "valid" ? [event.event] : []));
   const candidates = new Map<string, FreshTailMintContract>();
   for (const instruction of instructionSet.views) {
     if (instruction.programId !== PUMP_FUN_PROGRAM_ID.toBase58() || !instruction.data) continue;
     const discriminator = instruction.data.subarray(0, 8).toString("hex");
     const legacy =
-      discriminator === BUY_DISCRIMINATOR ||
-      discriminator === BUY_EXACT_SOL_IN_DISCRIMINATOR;
+      discriminator === BUY_DISCRIMINATOR || discriminator === BUY_EXACT_SOL_IN_DISCRIMINATOR;
     const v2 =
       discriminator === BUY_V2_DISCRIMINATOR ||
       discriminator === BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR;

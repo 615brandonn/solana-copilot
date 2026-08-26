@@ -27,17 +27,11 @@ export type SellClaimRecoveryDecision = {
  * no longer land. `apply_exact_receipt` still requires one database transaction
  * to write the position, trade and terminal claim together.
  */
-export function decideSellClaimRecovery(
-  input: SellClaimRecoveryInput,
-): SellClaimRecoveryDecision {
+export function decideSellClaimRecovery(input: SellClaimRecoveryInput): SellClaimRecoveryDecision {
   if (input.status === "landed" || input.status === "failed_pre_submit") {
     return { action: "none", reason: "claim_terminal" };
   }
-  if (
-    input.status !== "claimed" &&
-    input.status !== "submitted" &&
-    input.status !== "uncertain"
-  ) {
+  if (input.status !== "claimed" && input.status !== "submitted" && input.status !== "uncertain") {
     return { action: "quarantine", reason: "unknown_claim_status" };
   }
 

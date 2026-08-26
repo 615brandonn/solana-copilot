@@ -415,10 +415,7 @@ test("real current V2 buy produces exact Supply, logical target, transfer, and T
 
 test("unenrolled root discovery derives and rebinds exact V2 and legacy-buy contracts", () => {
   for (const fixture of [REAL_V2_FORWARDED_BUY, REAL_LEGACY_BUY]) {
-    const discovered = discoverFreshTailRootPumpBuys(
-      transaction(fixture),
-      fixture.signers[0]!,
-    );
+    const discovered = discoverFreshTailRootPumpBuys(transaction(fixture), fixture.signers[0]!);
     assert.equal(discovered.ok, true);
     if (!discovered.ok) continue;
     assert.equal(discovered.discoveries.length, 1);
@@ -439,7 +436,10 @@ test("real current V2 sell is Supply-only for a root and Custody-only for a desc
   );
   assert.equal(root.ok, true);
   if (!root.ok) return;
-  assert.deepEqual(root.supplyEvents.map((event) => event.side), ["SELL"]);
+  assert.deepEqual(
+    root.supplyEvents.map((event) => event.side),
+    ["SELL"],
+  );
   assert.deepEqual(root.custodyEvents, []);
   assert.equal(root.pumpTradeEventEvidence?.instructionName, "sell");
 
@@ -467,10 +467,10 @@ test("real Token-2022 mint using legacy buy ABI remains exactly reviewed", () =>
   if (!decoded.ok) return;
   assert.equal(decoded.rootBuyEvidence?.grossAmountRaw, "1794107360845");
   assert.equal(decoded.pumpTradeEventEvidence?.instructionName, "buy");
-  assert.deepEqual(decoded.custodyEvents.map((event) => event.eventKind), [
-    "TARGET_BUY",
-    "TRANSFER",
-  ]);
+  assert.deepEqual(
+    decoded.custodyEvents.map((event) => event.eventKind),
+    ["TARGET_BUY", "TRANSFER"],
+  );
 });
 
 test("missing or mutated exact trade evidence fails closed", () => {
@@ -628,16 +628,12 @@ test("exact token burn is terminal while unexplained loss is unresolved", () => 
 test("all frozen parser domains have explicit stable 64-hex identities", () => {
   assert.deepEqual(FRESH_TAIL_PARSER_ABIS, {
     pump_root_buy_v1: "b8b6dbdcce44a2b61c55ba2fd74cd385fae489a95be291504eb8e7b15f88262d",
-    custody_target_buy_v1:
-      "bd230909bd66718382a71c387324fefc840aa108089afcc01b61cb7115948f0c",
+    custody_target_buy_v1: "bd230909bd66718382a71c387324fefc840aa108089afcc01b61cb7115948f0c",
     supply_sell_v1: "d6a4aa7b14969befcfa858192c539b2cbb4738db4a739f1230b4c82c001c4412",
-    custody_transfer_v1:
-      "c50f0e09f75de355db936a95832046bc61f1d5b16eff81040528eadfc305422d",
+    custody_transfer_v1: "c50f0e09f75de355db936a95832046bc61f1d5b16eff81040528eadfc305422d",
     custody_sell_v1: "f39f4582dbe8bd04f91375a61be0b83b750658cca7c51354cbeb335a86dab401",
-    custody_unresolved_v1:
-      "8e6fe7600bfc983a35faa7cf1f6c79cdac5337080c551fa8accca4d62856995c",
-    custody_terminal_v1:
-      "0858d3736e2eb29b82a1a9ef17b51246880561047aeb1ce8a12b701e3529aac4",
+    custody_unresolved_v1: "8e6fe7600bfc983a35faa7cf1f6c79cdac5337080c551fa8accca4d62856995c",
+    custody_terminal_v1: "0858d3736e2eb29b82a1a9ef17b51246880561047aeb1ce8a12b701e3529aac4",
   });
 });
 

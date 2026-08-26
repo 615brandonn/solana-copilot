@@ -6,6 +6,7 @@ const sql = readFileSync(
   new URL("../../supabase/sell-claim-recovery-migration.sql", import.meta.url),
   "utf8",
 );
+const schema = readFileSync(new URL("../../supabase/schema.sql", import.meta.url), "utf8");
 
 function functionBody(name: string, nextMarker: string): string {
   const start = sql.indexOf(`create or replace function public.${name}`);
@@ -13,6 +14,15 @@ function functionBody(name: string, nextMarker: string): string {
   assert.ok(start >= 0 && end > start, `${name} function body was not found`);
   return sql.slice(start, end);
 }
+
+test("canonical schema contains the exact sell recovery migration", () => {
+  const begin = "-- SELL_CLAIM_RECOVERY_CANONICAL_MIRROR_BEGIN\n";
+  const end = "-- SELL_CLAIM_RECOVERY_CANONICAL_MIRROR_END";
+  const start = schema.indexOf(begin);
+  const finish = schema.indexOf(end, start + begin.length);
+  assert.ok(start >= 0 && finish > start, "sell recovery canonical markers are missing");
+  assert.equal(schema.slice(start + begin.length, finish), sql);
+});
 
 test("migration records the immutable prepared signature, expiry, and exact raw sizing", () => {
   for (const column of [
@@ -59,10 +69,7 @@ test("prepare RPC takes the position-action lock and publishes one complete atte
     body,
     /update public\.sell_signal_claims set[\s\S]*status = 'submitted'[\s\S]*recovery_version = 1[\s\S]*bot_tx_sig = v_signature[\s\S]*recent_blockhash = v_blockhash[\s\S]*executed_sell_amount_raw = p_executed_sell_amount_raw[\s\S]*position_amount_before_raw = p_position_amount_before_raw[\s\S]*submission_started_at = now\(\)/i,
   );
-  assert.match(
-    body,
-    /status = 'claimed' and bot_tx_sig is null and recovery_version is null/i,
-  );
+  assert.match(body, /status = 'claimed' and bot_tx_sig is null and recovery_version is null/i);
 });
 
 test("apply RPC validates an exact debit and atomically writes trade, position, and claim", () => {

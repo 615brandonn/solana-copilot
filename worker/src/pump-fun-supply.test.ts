@@ -46,7 +46,10 @@ test("reviewed shared loader accepts active Token-2022 Pump state at confirmed/p
       return {
         context: { slot: 441_792_999 },
         value: [
-          { owner: new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"), data: REAL_V2_CURVE_115 },
+          {
+            owner: new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+            data: REAL_V2_CURVE_115,
+          },
           { owner: TOKEN_2022_PROGRAM_ID, data: REAL_V2_MINT_DATA },
         ],
       } as any;

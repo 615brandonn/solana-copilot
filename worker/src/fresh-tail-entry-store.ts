@@ -1,17 +1,11 @@
 import { PublicKey } from "@solana/web3.js";
-import {
-  TOKEN_2022_PROGRAM_ID,
-  TOKEN_PROGRAM_ID,
-} from "@solana/spl-token";
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import bs58 from "bs58";
 import { safeDiagnostic } from "./diagnostics.js";
 
-const PUMP_ROOT_BUY_PARSER_ABI =
-  "b8b6dbdcce44a2b61c55ba2fd74cd385fae489a95be291504eb8e7b15f88262d";
-const PUMP_CREATE_PROOF_ABI =
-  "ebe9ae1c8f38c24c3c6d4da1a3c9b90ffce4bf27e36f562bc67b090e9b7c343f";
-const PUMP_SNAPSHOT_PARSER_ABI =
-  "2f5de97b6527d4ec94082069d65abd2bf30523e45bf562aabe1e770e5eb4ad1d";
+const PUMP_ROOT_BUY_PARSER_ABI = "b8b6dbdcce44a2b61c55ba2fd74cd385fae489a95be291504eb8e7b15f88262d";
+const PUMP_CREATE_PROOF_ABI = "ebe9ae1c8f38c24c3c6d4da1a3c9b90ffce4bf27e36f562bc67b090e9b7c343f";
+const PUMP_SNAPSHOT_PARSER_ABI = "2f5de97b6527d4ec94082069d65abd2bf30523e45bf562aabe1e770e5eb4ad1d";
 const PUMP_STANDARD_SUPPLY_RAW = "1000000000000000";
 const PUMP_STANDARD_DECIMALS = 6;
 
@@ -221,10 +215,7 @@ function parseCandidate(value: unknown): FreshTailEntryCandidate {
     throw new Error("fresh-tail candidate mint decimals changed at the finalized head");
   }
   const totalSupplyRaw = exactRaw(row.totalSupplyRaw, "totalSupplyRaw");
-  const headCurveTotalSupplyRaw = exactRaw(
-    row.headCurveTotalSupplyRaw,
-    "headCurveTotalSupplyRaw",
-  );
+  const headCurveTotalSupplyRaw = exactRaw(row.headCurveTotalSupplyRaw, "headCurveTotalSupplyRaw");
   const headMintSupplyRaw = exactRaw(row.headMintSupplyRaw, "headMintSupplyRaw");
   if (totalSupplyRaw !== headCurveTotalSupplyRaw || totalSupplyRaw !== headMintSupplyRaw) {
     throw new Error("fresh-tail candidate supply changed at the finalized head");
@@ -237,10 +228,7 @@ function parseCandidate(value: unknown): FreshTailEntryCandidate {
   if (tokenProgram !== headTokenProgram) {
     throw new Error("fresh-tail candidate token program changed at the finalized head");
   }
-  const mintLayoutFingerprint = fingerprint(
-    row.mintLayoutFingerprint,
-    "mintLayoutFingerprint",
-  );
+  const mintLayoutFingerprint = fingerprint(row.mintLayoutFingerprint, "mintLayoutFingerprint");
   const headMintLayoutFingerprint = fingerprint(
     row.headMintLayoutFingerprint,
     "headMintLayoutFingerprint",
@@ -292,7 +280,10 @@ function parseCandidate(value: unknown): FreshTailEntryCandidate {
   }
   const amountRaw = exactRaw(row.amountRaw, "amountRaw");
   const netAcquiredRaw = exactRaw(row.netAcquiredRaw, "netAcquiredRaw", true);
-  if (BigInt(amountRaw) > BigInt(totalSupplyRaw) || BigInt(netAcquiredRaw) > BigInt(totalSupplyRaw)) {
+  if (
+    BigInt(amountRaw) > BigInt(totalSupplyRaw) ||
+    BigInt(netAcquiredRaw) > BigInt(totalSupplyRaw)
+  ) {
     throw new Error("fresh-tail candidate raw amounts exceed the mint supply");
   }
   const thresholdPct = finiteNumber(row.thresholdPct, "thresholdPct", 10);
@@ -372,10 +363,7 @@ function parseCandidate(value: unknown): FreshTailEntryCandidate {
       row.headVirtualSolReservesLamports,
       "headVirtualSolReservesLamports",
     ),
-    headRealTokenReservesRaw: exactRaw(
-      row.headRealTokenReservesRaw,
-      "headRealTokenReservesRaw",
-    ),
+    headRealTokenReservesRaw: exactRaw(row.headRealTokenReservesRaw, "headRealTokenReservesRaw"),
     headRealSolReservesLamports: exactRaw(
       row.headRealSolReservesLamports,
       "headRealSolReservesLamports",
@@ -388,11 +376,7 @@ function parseCandidate(value: unknown): FreshTailEntryCandidate {
     headMintDecimals,
     scopeRevision,
     settledRevision,
-    settledLeaseGeneration: safeInteger(
-      row.settledLeaseGeneration,
-      "settledLeaseGeneration",
-      1,
-    ),
+    settledLeaseGeneration: safeInteger(row.settledLeaseGeneration, "settledLeaseGeneration", 1),
   };
 }
 
@@ -479,10 +463,7 @@ export function createFreshTailEntryStore(client: FreshTailEntryDbClient, userId
       positionId: uuid(result.positionId, "positionId"),
       botTxSig: base58Bytes(result.botTxSig, "botTxSig", 64),
       receivedAmountRaw: exactRaw(result.receivedAmountRaw, "receivedAmountRaw"),
-      receivedTokenDecimals: safeInteger(
-        result.receivedTokenDecimals,
-        "receivedTokenDecimals",
-      ),
+      receivedTokenDecimals: safeInteger(result.receivedTokenDecimals, "receivedTokenDecimals"),
       landedAt: iso(result.landedAt, "landedAt"),
       status,
       replay: result.replay,
