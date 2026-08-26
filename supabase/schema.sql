@@ -7805,7 +7805,7 @@ begin
   end if;
 
   perform pg_advisory_xact_lock(hashtext(p_user_id::text), hashtext(v_mint));
-  v_fingerprint := encode(digest(jsonb_build_object(
+  v_fingerprint := encode(extensions.digest(jsonb_build_object(
     'txSig', v_tx_sig,
     'slot', p_slot,
     'targetWallet', v_target,
@@ -9061,7 +9061,7 @@ begin
     order by btrim(wallet)
   );
   v_config_fingerprint := encode(
-    digest(
+    extensions.digest(
       convert_to(
         jsonb_build_object(
           'modeEnabled', v_config.supply_accumulation_mode_enabled,
@@ -9947,6 +9947,9 @@ begin
        'public.get_supply_accumulation_state(uuid,text,timestamp with time zone)'
      ) is null
      or to_regprocedure(
+       'public.record_supply_accumulation_event(uuid,text,text,bigint,timestamp with time zone,text,text,text,text,text,integer,numeric,bigint,boolean,boolean,boolean,jsonb)'
+     ) is null
+     or to_regprocedure(
        'public.materialize_supply_accumulation_market_cap_range()'
      ) is null
      or to_regprocedure(
@@ -9955,6 +9958,16 @@ begin
     raise exception using
       errcode = '42883',
       message = 'run both Supply Accumulation entry and scale-buy migrations before the 20k cap migration';
+  end if;
+end $$;
+
+do $$
+begin
+  if to_regprocedure('extensions.digest(text,text)') is null
+     or to_regprocedure('extensions.digest(bytea,text)') is null then
+    raise exception using
+      errcode = '42883',
+      message = 'pgcrypto digest must be installed in the extensions schema before the 20k cap migration';
   end if;
 end $$;
 
@@ -10515,6 +10528,232 @@ begin
   );
 end $$;
 
+-- Repair the durable event recorder as part of this additive migration. The
+-- deployed SECURITY DEFINER search path intentionally excludes extensions, so
+-- pgcrypto must be schema-qualified instead of relying on ambient resolution.
+create or replace function public.record_supply_accumulation_event(
+  p_user_id uuid,
+  p_event_key text,
+  p_tx_sig text,
+  p_slot bigint,
+  p_event_at timestamptz,
+  p_target_wallet text,
+  p_token_mint text,
+  p_side text,
+  p_amount_raw text,
+  p_total_supply_raw text,
+  p_decimals integer,
+  p_market_cap_usd numeric,
+  p_valuation_slot bigint,
+  p_market_data_reliable boolean,
+  p_is_pump_fun boolean,
+  p_classification_reliable boolean,
+  p_metadata jsonb default '{}'::jsonb
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public, pg_temp
+as $$
+declare
+  v_event_key text := btrim(coalesce(p_event_key, ''));
+  v_tx_sig text := btrim(coalesce(p_tx_sig, ''));
+  v_target text := btrim(coalesce(p_target_wallet, ''));
+  v_mint text := btrim(coalesce(p_token_mint, ''));
+  v_side text := lower(btrim(coalesce(p_side, '')));
+  v_amount_raw numeric(78, 0);
+  v_total_supply_raw numeric(78, 0);
+  v_fingerprint text;
+  v_mode_enabled boolean;
+  v_target_configured boolean := false;
+  v_existing public.supply_accumulation_events%rowtype;
+  v_event_id uuid;
+  v_state jsonb;
+  v_enriched boolean := false;
+  v_supply_mismatch boolean := false;
+begin
+  if coalesce(auth.role(), '') <> 'service_role' then
+    raise exception using
+      errcode = '42501',
+      message = 'service_role is required to record supply accumulation events';
+  end if;
+
+  if p_user_id is null or v_event_key = '' or v_tx_sig = '' or v_target = '' or v_mint = '' then
+    raise exception 'supply accumulation event identity is incomplete';
+  end if;
+  if p_slot is null or p_slot < 0 or p_event_at is null then
+    raise exception 'supply accumulation event chain position is invalid';
+  end if;
+  if v_side not in ('buy', 'sell') then
+    raise exception 'supply accumulation event side is invalid';
+  end if;
+  if coalesce(p_amount_raw, '') !~ '^[0-9]+$'
+     or coalesce(p_total_supply_raw, '') !~ '^[0-9]+$' then
+    raise exception 'supply accumulation raw values must be unsigned integer strings';
+  end if;
+  v_amount_raw := p_amount_raw::numeric(78, 0);
+  v_total_supply_raw := p_total_supply_raw::numeric(78, 0);
+  if v_amount_raw <= 0 or v_total_supply_raw <= 0 or v_amount_raw > v_total_supply_raw then
+    raise exception 'supply accumulation raw values are outside supply bounds';
+  end if;
+  if p_decimals is null or p_decimals < 0 or p_decimals > 18 then
+    raise exception 'supply accumulation decimals are invalid';
+  end if;
+  if p_market_cap_usd is not null and p_market_cap_usd <= 0 then
+    raise exception 'supply accumulation market cap is invalid';
+  end if;
+  if p_market_data_reliable is true
+     and (p_market_cap_usd is null or p_valuation_slot is null) then
+    raise exception 'reliable market data requires market cap and valuation slot';
+  end if;
+  if p_valuation_slot is not null and p_valuation_slot < 0 then
+    raise exception 'supply accumulation valuation slot is invalid';
+  end if;
+  if p_market_data_reliable is null or p_is_pump_fun is null
+     or p_classification_reliable is null then
+    raise exception 'supply accumulation evidence flags are required';
+  end if;
+  if p_metadata is null or jsonb_typeof(p_metadata) <> 'object' then
+    raise exception 'supply accumulation metadata must be an object';
+  end if;
+
+  select
+    supply_accumulation_mode_enabled,
+    v_target = any(
+      array_remove(
+        array_prepend(nullif(btrim(target_wallet), ''), additional_target_wallets),
+        null
+      )
+    )
+  into v_mode_enabled, v_target_configured
+  from public.bot_config
+  where user_id = p_user_id;
+
+  if not found then
+    v_state := public.get_supply_accumulation_state(p_user_id, v_mint, p_event_at);
+    return jsonb_build_object(
+      'applied', false, 'duplicate', false, 'payloadMismatch', false,
+      'reason', 'config_not_found', 'eventId', null, 'state', v_state
+    );
+  end if;
+  if not v_mode_enabled then
+    v_state := public.get_supply_accumulation_state(p_user_id, v_mint, p_event_at);
+    return jsonb_build_object(
+      'applied', false, 'duplicate', false, 'payloadMismatch', false,
+      'reason', 'mode_disabled', 'eventId', null, 'state', v_state
+    );
+  end if;
+  if not v_target_configured then
+    v_state := public.get_supply_accumulation_state(p_user_id, v_mint, p_event_at);
+    return jsonb_build_object(
+      'applied', false, 'duplicate', false, 'payloadMismatch', false,
+      'reason', 'target_not_configured', 'eventId', null, 'state', v_state
+    );
+  end if;
+
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text), hashtext(v_mint));
+  v_fingerprint := encode(extensions.digest(jsonb_build_object(
+    'txSig', v_tx_sig,
+    'slot', p_slot,
+    'targetWallet', v_target,
+    'tokenMint', v_mint,
+    'side', v_side,
+    'amountRaw', v_amount_raw::text,
+    'totalSupplyRaw', v_total_supply_raw::text,
+    'decimals', p_decimals
+  )::text, 'sha256'), 'hex');
+
+  select * into v_existing
+  from public.supply_accumulation_events
+  where user_id = p_user_id and event_key = v_event_key
+  for update;
+
+  if found then
+    if v_existing.request_fingerprint <> v_fingerprint then
+      update public.supply_accumulation_events set
+        quarantined = true,
+        conflict_count = conflict_count + 1,
+        last_conflict_at = now(),
+        metadata = metadata || jsonb_build_object(
+          'payloadConflictObserved', true,
+          'payloadConflictObservedAt', now()
+        )
+      where id = v_existing.id;
+      v_state := public.get_supply_accumulation_state(p_user_id, v_mint, p_event_at);
+      return jsonb_build_object(
+        'applied', false, 'duplicate', true, 'payloadMismatch', true,
+        'reason', 'payload_mismatch', 'eventId', v_existing.id::text, 'state', v_state
+      );
+    end if;
+
+    v_enriched := p_market_data_reliable
+      and (not v_existing.market_data_reliable or v_existing.market_cap_usd is null);
+    update public.supply_accumulation_events set
+      market_cap_usd = case when v_enriched then p_market_cap_usd else market_cap_usd end,
+      valuation_slot = case when v_enriched then p_valuation_slot else valuation_slot end,
+      market_data_reliable = market_data_reliable or v_enriched,
+      metadata = case
+        when metadata @> '{"grossForwarded": true}'::jsonb
+          or p_metadata @> '{"grossForwarded": true}'::jsonb
+        then metadata || p_metadata || '{"grossForwarded": true}'::jsonb
+        else metadata || p_metadata
+      end
+    where id = v_existing.id;
+    v_state := public.get_supply_accumulation_state(p_user_id, v_mint, p_event_at);
+    return jsonb_build_object(
+      'applied', false, 'duplicate', true, 'payloadMismatch', false,
+      'reason', case when v_enriched then 'duplicate_enriched' else 'duplicate' end,
+      'eventId', v_existing.id::text, 'state', v_state
+    );
+  end if;
+
+  select exists (
+    select 1
+    from public.supply_accumulation_events e
+    where e.user_id = p_user_id
+      and e.token_mint = v_mint
+      and not e.quarantined
+      and (
+        e.total_supply_raw <> v_total_supply_raw
+        or e.decimals <> p_decimals
+      )
+  ) into v_supply_mismatch;
+
+  insert into public.supply_accumulation_events (
+    user_id, event_key, request_fingerprint, tx_sig, slot, event_at,
+    target_wallet, token_mint, side, amount_raw, total_supply_raw, decimals,
+    market_cap_usd, valuation_slot, market_data_reliable, is_pump_fun,
+    classification_reliable, quarantined, conflict_count, last_conflict_at, metadata
+  ) values (
+    p_user_id, v_event_key, v_fingerprint, v_tx_sig, p_slot, p_event_at,
+    v_target, v_mint, v_side, v_amount_raw, v_total_supply_raw, p_decimals,
+    p_market_cap_usd, p_valuation_slot, p_market_data_reliable, p_is_pump_fun,
+    p_classification_reliable, v_supply_mismatch,
+    case when v_supply_mismatch then 1 else 0 end,
+    case when v_supply_mismatch then now() else null end,
+    case when v_supply_mismatch then
+      p_metadata || jsonb_build_object(
+        'supplyEvidenceConflict', true,
+        'supplyEvidenceConflictObservedAt', now()
+      )
+    else p_metadata end
+  )
+  returning id into v_event_id;
+
+  v_state := public.get_supply_accumulation_state(p_user_id, v_mint, p_event_at);
+  return jsonb_build_object(
+    'applied', not v_supply_mismatch, 'duplicate', false, 'payloadMismatch', false,
+    'reason', case
+      when v_supply_mismatch then 'supply_or_decimals_mismatch'
+      when p_classification_reliable and p_is_pump_fun then 'recorded'
+      else 'unreliable_evidence_recorded'
+    end,
+    'eventId', v_event_id::text,
+    'state', v_state
+  );
+end;
+$$;
+
 create or replace function public.get_supply_accumulation_scale_plan(
   p_user_id uuid,
   p_token_mint text,
@@ -10608,7 +10847,7 @@ begin
     order by btrim(wallet)
   );
   v_config_fingerprint := encode(
-    digest(
+    extensions.digest(
       convert_to(
         jsonb_build_object(
           'modeEnabled', v_config.supply_accumulation_mode_enabled,
@@ -11092,6 +11331,10 @@ revoke all on function public.get_supply_accumulation_state_without_floor_v1(
 ) from public, anon, authenticated;
 revoke all on function public.get_supply_accumulation_state(uuid, text, timestamptz)
   from public, anon, authenticated;
+revoke all on function public.record_supply_accumulation_event(
+  uuid, text, text, bigint, timestamptz, text, text, text, text, text,
+  integer, numeric, bigint, boolean, boolean, boolean, jsonb
+) from public, anon, authenticated;
 revoke all on function public.get_supply_accumulation_scale_plan(uuid, text, uuid, text, uuid)
   from public, anon, authenticated;
 
@@ -11100,6 +11343,10 @@ grant execute on function public.get_supply_accumulation_state_without_floor_v1(
 ) to service_role;
 grant execute on function public.get_supply_accumulation_state(uuid, text, timestamptz)
   to service_role;
+grant execute on function public.record_supply_accumulation_event(
+  uuid, text, text, bigint, timestamptz, text, text, text, text, text,
+  integer, numeric, bigint, boolean, boolean, boolean, jsonb
+) to service_role;
 grant execute on function public.get_supply_accumulation_scale_plan(uuid, text, uuid, text, uuid)
   to service_role;
 
@@ -11135,12 +11382,29 @@ begin
         'public.materialize_supply_accumulation_market_cap_range()'
       ),
       to_regprocedure(
+        'public.record_supply_accumulation_event(uuid,text,text,bigint,timestamp with time zone,text,text,text,text,text,integer,numeric,bigint,boolean,boolean,boolean,jsonb)'
+      ),
+      to_regprocedure(
         'public.get_supply_accumulation_scale_plan(uuid,text,uuid,text,uuid)'
       )
     ]) routine(oid)
     where position('15000' in pg_get_functiondef(routine.oid)) > 0
   ) then
     raise exception 'a legacy Supply Accumulation 15k routine remains installed';
+  end if;
+  if exists (
+    select 1
+    from unnest(array[
+      to_regprocedure(
+        'public.record_supply_accumulation_event(uuid,text,text,bigint,timestamp with time zone,text,text,text,text,text,integer,numeric,bigint,boolean,boolean,boolean,jsonb)'
+      ),
+      to_regprocedure(
+        'public.get_supply_accumulation_scale_plan(uuid,text,uuid,text,uuid)'
+      )
+    ]) routine(oid)
+    where position('extensions.digest(' in pg_get_functiondef(routine.oid)) = 0
+  ) then
+    raise exception 'a Supply Accumulation pgcrypto call is not schema-qualified';
   end if;
   if exists (
     select 1

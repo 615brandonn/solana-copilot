@@ -30,6 +30,10 @@ test("20k migration is transactional, rerunnable, and never changes live strateg
   assert.doesNotMatch(migration, /\btruncate\b/i);
   assert.doesNotMatch(migration, /\bdrop\s+(table|column|schema)\b/i);
   assert.doesNotMatch(migration, /update\s+public\.bot_config/i);
+  assert.doesNotMatch(
+    migration,
+    /(?:insert\s+into|update|delete\s+from)\s+public\.(?:rpc_wallet_cursors|custody_rpc_wallet_cursors)\b/i,
+  );
   assert.doesNotMatch(migration, /supply_accumulation_mode_enabled\s*=\s*true/i);
   assert.doesNotMatch(migration, /\benabled\s*=\s*true/i);
   assert.match(migration, /alter column supply_accumulation_max_market_cap_usd set default 20000/i);
@@ -45,18 +49,22 @@ test("20k migration is transactional, rerunnable, and never changes live strateg
   assert.doesNotMatch(migration, /alter table public\.(positions|trades|sell_signal_claims)/i);
 });
 
-test("all four deployed database routines move to the same strict 20k contract", () => {
+test("all five deployed database routines move to the same strict 20k and pgcrypto contract", () => {
   for (const signature of [
     "get_supply_accumulation_state_without_floor_v1\\(",
     "get_supply_accumulation_state\\(",
     "materialize_supply_accumulation_market_cap_range\\(\\)",
+    "record_supply_accumulation_event\\(",
     "get_supply_accumulation_scale_plan\\(",
   ]) {
     assert.match(migration, new RegExp(`create or replace function public\\.${signature}`, "i"));
   }
-  assert.equal(migration.match(/security definer/gi)?.length, 4);
-  assert.equal(migration.match(/set search_path = pg_catalog, public, pg_temp/gi)?.length, 4);
-  assert.equal(migration.match(/coalesce\(auth\.role\(\), ''\) <> 'service_role'/gi)?.length, 3);
+  assert.equal(
+    migration.match(/security definer\s+set search_path = pg_catalog, public, pg_temp/gi)?.length,
+    5,
+  );
+  assert.equal(migration.match(/set search_path = pg_catalog, public, pg_temp/gi)?.length, 5);
+  assert.equal(migration.match(/coalesce\(auth\.role\(\), ''\) <> 'service_role'/gi)?.length, 4);
   assert.doesNotMatch(migration, /(?:default|:=|<=|>)\s*15000/i);
   assert.match(migration, /supply_accumulation_max_market_cap_usd <= 20000/i);
   assert.match(migration, /max_market_cap_usd <= 20000/i);
@@ -67,6 +75,14 @@ test("all four deployed database routines move to the same strict 20k contract",
   );
   assert.match(migration, /not v_event\.is_pump_fun/i);
   assert.match(migration, /v_pump_fun_verified boolean := false/i);
+  assert.match(migration, /to_regprocedure\('extensions\.digest\(text,text\)'\) is null/i);
+  assert.match(migration, /to_regprocedure\('extensions\.digest\(bytea,text\)'\) is null/i);
+  assert.equal(migration.match(/(?<!')extensions\.digest\(/gi)?.length, 2);
+  assert.doesNotMatch(migration, /(?<!extensions\.)\bdigest\(/i);
+  assert.match(
+    migration,
+    /position\('extensions\.digest\(' in pg_get_functiondef\(routine\.oid\)\) = 0/i,
+  );
 });
 
 test("routine replacements preserve the reviewed v1, v2, trigger, and scale-plan bodies", () => {
@@ -107,9 +123,21 @@ test("routine replacements preserve the reviewed v1, v2, trigger, and scale-plan
   const actualWrapper = between(
     migration,
     "create or replace function public.get_supply_accumulation_state(",
-    "create or replace function public.get_supply_accumulation_scale_plan(",
+    "-- Repair the durable event recorder as part of this additive migration.",
   );
   assert.equal(actualWrapper, expectedWrapper);
+
+  const expectedRecorder = between(
+    entryMigration,
+    "create or replace function public.record_supply_accumulation_event(",
+    "-- One database snapshot gates every Supply Accumulation entry",
+  );
+  const actualRecorder = between(
+    migration,
+    "create or replace function public.record_supply_accumulation_event(",
+    "create or replace function public.get_supply_accumulation_scale_plan(",
+  );
+  assert.equal(actualRecorder, expectedRecorder);
 
   const expectedPlan = between(
     scaleMigration,
@@ -128,6 +156,7 @@ test("routine permissions remain service-only and RLS is not weakened", () => {
   for (const fn of [
     "get_supply_accumulation_state_without_floor_v1",
     "get_supply_accumulation_state",
+    "record_supply_accumulation_event",
     "get_supply_accumulation_scale_plan",
   ]) {
     assert.match(
@@ -155,4 +184,19 @@ test("canonical schema embeds the 20k compatibility migration byte-for-byte", ()
   assert.ok(beginIndex >= 0, "canonical mirror begin marker is missing");
   assert.ok(endIndex > beginIndex, "canonical mirror end marker is missing");
   assert.equal(schema.slice(beginIndex + begin.length, endIndex).trim(), migration.trim());
+});
+
+test("every canonical Supply pgcrypto call is explicitly schema-qualified", () => {
+  for (const [name, source] of [
+    ["entry migration", entryMigration],
+    ["scale migration", scaleMigration],
+    ["20k compatibility migration", migration],
+    ["canonical schema", schema],
+  ] as const) {
+    assert.doesNotMatch(
+      source,
+      /(?<!extensions\.)\bdigest\(/i,
+      `${name} contains an ambient-search-path digest call`,
+    );
+  }
 });

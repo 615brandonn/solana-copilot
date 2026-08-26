@@ -198,6 +198,7 @@ test("service-only plan is fresh, exact, contiguous, and fail-closed", () => {
     migration,
     /create or replace function public\.get_supply_accumulation_scale_plan\(/i,
   );
+  assert.match(migration, /extensions\.digest\([\s\S]*'sha256'/i);
   assert.match(migration, /service_role is required for Supply Accumulation scale planning/i);
   assert.match(migration, /v_event\.event_at < now\(\) - interval '55 seconds'/i);
   assert.match(migration, /v_state\.as_of < now\(\) - interval '55 seconds'/i);
