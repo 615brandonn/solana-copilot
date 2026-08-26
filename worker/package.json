@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",
+    "@pump-fun/pump-sdk": "1.36.0",
     "@solana/spl-token": "^0.4.15",
     "@solana/web3.js": "^1.95.4",
     "@supabase/supabase-js": "^2.45.4",

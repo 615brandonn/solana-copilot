@@ -9,7 +9,7 @@ import { env } from "./env.js";
 import { db, type BotConfigRow } from "./db.js";
 import { GeyserFeed, type FeedEvent, type SwapEvent, type TransferEvent } from "./geyser.js";
 import { FollowerMonitor, type ChainedTransferBatchState } from "./monitor.js";
-import { executeSwap, type ExecuteResult } from "./executor.js";
+import { executeSwap, type ExecuteInput, type ExecuteResult } from "./executor.js";
 import {
   exactRawAmount,
   rawAmountToUiNumber,
@@ -2517,6 +2517,8 @@ async function main() {
     markFollowerSellerExit = false,
     strategyEvent?: FeedEvent,
     mirroredSoldFraction?: number,
+    onPrepared?: ExecuteInput["onPrepared"],
+    beforeSubmit?: ExecuteInput["beforeSubmit"],
   ): Promise<ExecuteResult | null> {
     if (exitsInFlight.has(positionId)) return null;
     exitsInFlight.add(positionId);
@@ -2578,6 +2580,8 @@ async function main() {
             throw new Error("executor returned an exit amount above the verified live balance");
           }
         },
+        onPrepared,
+        beforeSubmit,
       });
       landedResult = result;
       if (executedSellRaw === undefined || liveBalanceRaw === undefined || executedSellRaw <= 0n) {
@@ -2873,6 +2877,37 @@ async function main() {
         { status: "submitted", submission_started_at: new Date().toISOString() },
         true,
       );
+      let preparedBotTxSig: string | null = null;
+      const persistPreparedSell = async ({ txSig }: { txSig: string }) => {
+        const { data: prepared, error: preparedError } = await db
+          .from("sell_signal_claims")
+          .update({
+            bot_tx_sig: txSig,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", claim.id)
+          .eq("status", "submitted")
+          .is("bot_tx_sig", null)
+          .select("id")
+          .maybeSingle();
+        if (preparedError || !prepared) {
+          throw new Error(
+            `sell claim lost prepared-attempt ownership: ${safeDiagnostic(preparedError ?? "claim changed")}`,
+          );
+        }
+        preparedBotTxSig = txSig;
+      };
+      const authorizePreparedSell = async () => {
+        if (!preparedBotTxSig) return false;
+        const { data: prepared, error: preparedError } = await db
+          .from("sell_signal_claims")
+          .select("id")
+          .eq("id", claim.id)
+          .eq("status", "submitted")
+          .eq("bot_tx_sig", preparedBotTxSig)
+          .maybeSingle();
+        return !preparedError && Boolean(prepared);
+      };
       try {
         log.warn({ positionId, mint, sellPct: normalizedPct, reason }, "claimed exit triggered");
         const result = await executeExitSell(
@@ -2886,6 +2921,8 @@ async function main() {
           Boolean(options.markFollowerSellerExit),
           event,
           options.mirroredSoldFraction,
+          persistPreparedSell,
+          authorizePreparedSell,
         );
         if (!result) {
           await updateClaim({ status: "failed_pre_submit", error_code: "no-executable-amount" });
@@ -3834,16 +3871,20 @@ async function main() {
         outputDecimals: event.decimals,
         pumpFunDirectOnly: true,
         onPrepared: async ({ txSig, lastValidBlockHeight }) => {
+          if (!Number.isSafeInteger(lastValidBlockHeight) || Number(lastValidBlockHeight) <= 0) {
+            throw new Error("Supply scale Pump transaction is missing its exact expiry height");
+          }
+          const exactLastValidBlockHeight = Number(lastValidBlockHeight);
           const submissionStartedAt = new Date().toISOString();
           preparedCandidate = {
             botTxSig: txSig,
-            lastValidBlockHeight: String(lastValidBlockHeight),
+            lastValidBlockHeight: String(exactLastValidBlockHeight),
             submissionStartedAt,
           };
           const submitted = await supplyAccumulationScaleStore.beginSubmission(
             claim.id,
             txSig,
-            String(lastValidBlockHeight),
+            String(exactLastValidBlockHeight),
             submissionStartedAt,
           );
           preparedAttempt = preparedSupplyScaleAttempt(submitted);
@@ -6233,11 +6274,19 @@ async function main() {
           pumpFunDirectOnly: supplyEntry,
           onPrepared: supplyEntry
             ? async ({ txSig, lastValidBlockHeight }) => {
+                if (
+                  !Number.isSafeInteger(lastValidBlockHeight) ||
+                  Number(lastValidBlockHeight) <= 0
+                ) {
+                  throw new Error(
+                    "Supply entry Pump transaction is missing its exact expiry height",
+                  );
+                }
                 await persistPreparedSupplyEntryClaim(
                   entryClaim.id,
                   entrySubmissionStartedAt,
                   txSig,
-                  lastValidBlockHeight,
+                  Number(lastValidBlockHeight),
                 );
               }
             : undefined,

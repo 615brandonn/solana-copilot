@@ -12,9 +12,13 @@ Yellowstone gRPC and to Jito, which serverless edges don't support.
 ```bash
 cd worker
 cp .env.example .env    # fill in every value
-bun install             # or `npm install`
+bun install --frozen-lockfile
 bun run dev             # or `npm run dev`
 ```
+
+Production installs must use the committed Bun lockfile. The direct Pump.fun
+executor pins its reviewed SDK exactly; an unlocked `npm install` could resolve
+different transitive instruction builders.
 
 ## Required env vars
 

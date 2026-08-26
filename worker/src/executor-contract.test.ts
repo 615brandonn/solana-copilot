@@ -6,12 +6,20 @@ const executorSource = readFileSync(new URL("../src/executor.ts", import.meta.ur
 
 test("Pump.fun fallback keeps transaction submission behind the caller-owned final gate", () => {
   const pumpStart = executorSource.indexOf("async function executePumpFunSwap");
-  const pumpEnd = executorSource.indexOf("async function notifyPumpTransactionPrepared", pumpStart);
+  const pumpEnd = executorSource.indexOf("async function notifyTransactionPrepared", pumpStart);
   assert.ok(pumpStart >= 0 && pumpEnd > pumpStart, "Pump.fun executor was not found");
 
   const pumpSource = executorSource.slice(pumpStart, pumpEnd);
-  assert.match(pumpSource, /getBuyInstructionsBySolAmount/);
-  assert.match(pumpSource, /getSellInstructionsByTokenAmount/);
+  assert.match(pumpSource, /await buildPumpFunDirectSwap\(\{/);
+  assert.match(pumpSource, /side: isBuy \? "buy" : "sell"/);
+  assert.match(pumpSource, /amountRaw: exactRawAmount\(/);
+  assert.match(pumpSource, /const pumpInstructions = direct\.instructions/);
+  assert.match(pumpSource, /const receipt = confirmedTokenReceiptFromTx\(/);
+  assert.match(pumpSource, /receipt\.decimals !== direct\.decimals/);
+  assert.match(pumpSource, /landed buy lacks an exact matching transaction token receipt/);
+  assert.match(pumpSource, /outRawAmount = receipt\.amountRaw/);
+  assert.match(pumpSource, /outDecimals = receipt\.decimals/);
+  assert.doesNotMatch(pumpSource, /getAccount\(/);
   assert.match(
     pumpSource,
     /sendRawViaRpc\([\s\S]*?"pump\.fun",[\s\S]*?knownSig,[\s\S]*?input\.beforeSubmit,[\s\S]*?false,[\s\S]*?"pump\.fun",[\s\S]*?serialized,[\s\S]*?\)/,
@@ -27,30 +35,48 @@ test("curve-proven supply entries can bypass slower aggregators without changing
   assert.match(executorSource, /pumpFunDirectOnly\?: boolean/);
 });
 
+test("Pump.fun post-submit RPC reads are bounded and never guess from a later wallet snapshot", () => {
+  const pumpStart = executorSource.indexOf("async function executePumpFunSwap");
+  const pumpEnd = executorSource.indexOf("async function notifyTransactionPrepared", pumpStart);
+  const pumpSource = executorSource.slice(pumpStart, pumpEnd);
+  assert.match(pumpSource, /await executorRpcWithTimeout\([\s\S]*?getLatestBlockhash/);
+  assert.match(pumpSource, /await loadConfirmedPumpTransaction\(knownSig\)/);
+
+  const landingStart = executorSource.indexOf("async function waitForLanding");
+  const landingEnd = executorSource.indexOf("async function sendViaJito", landingStart);
+  const landingSource = executorSource.slice(landingStart, landingEnd);
+  assert.match(landingSource, /await executorRpcWithTimeout\([\s\S]*?getSignatureStatuses/);
+  assert.match(executorSource, /await submitKnownSignatureWithTimeout\(\{/);
+});
+
 test("owned Pump.fun transactions expose their signed identity before any final gate or send", () => {
   const pumpStart = executorSource.indexOf("async function executePumpFunSwap");
-  const pumpEnd = executorSource.indexOf("async function notifyPumpTransactionPrepared", pumpStart);
+  const pumpEnd = executorSource.indexOf("async function notifyTransactionPrepared", pumpStart);
   assert.ok(pumpStart >= 0 && pumpEnd > pumpStart, "Pump.fun executor was not found");
 
   const pumpSource = executorSource.slice(pumpStart, pumpEnd);
   assert.match(pumpSource, /const \{ blockhash, lastValidBlockHeight \}/);
   const signAt = pumpSource.indexOf("tx.sign([signer])");
   const signatureAt = pumpSource.indexOf("const knownSig = signedTransactionSignature(tx)");
-  const serializationAt = pumpSource.indexOf("const serialized = tx.serialize()", signatureAt);
-  const preparedAt = pumpSource.indexOf("await notifyPumpTransactionPrepared(input");
+  const serializationAt = pumpSource.indexOf("createPreparedTransactionNotifier(", signatureAt);
+  const preparedAt = pumpSource.indexOf("await ensurePrepared()", serializationAt);
   const sendAt = pumpSource.indexOf("await sendRawViaRpc(");
   assert.ok(signAt >= 0 && signAt < signatureAt);
   assert.ok(signatureAt < serializationAt && serializationAt < preparedAt);
   assert.ok(preparedAt < sendAt);
-  assert.match(pumpSource, /txSig: knownSig,\s*lastValidBlockHeight,/);
+  assert.match(
+    pumpSource,
+    /createPreparedTransactionNotifier\([\s\S]*?knownSig,[\s\S]*?lastValidBlockHeight/,
+  );
 
-  assert.match(executorSource, /onPrepared\?: \(prepared: \{/);
-  assert.match(executorSource, /txSig: string;\s*lastValidBlockHeight: number\s*}/);
+  assert.match(executorSource, /onPrepared\?: \(prepared: PreparedTransaction\)/);
+  assert.match(executorSource, /recentBlockhash: string/);
+  assert.match(executorSource, /lastValidBlockHeight\?: number/);
 });
 
 test("a failed Pump.fun preparation callback cancels every submission route", () => {
-  const notifyStart = executorSource.indexOf("async function notifyPumpTransactionPrepared");
-  const notifyEnd = executorSource.indexOf("function tokenBalanceUi", notifyStart);
+  const notifyStart = executorSource.indexOf("async function notifyTransactionPrepared");
+  const notifyEnd = executorSource.indexOf("function signedTransactionSignature", notifyStart);
   assert.ok(
     notifyStart >= 0 && notifyEnd > notifyStart,
     "preparation callback helper was not found",
@@ -59,6 +85,24 @@ test("a failed Pump.fun preparation callback cancels every submission route", ()
   const notifySource = executorSource.slice(notifyStart, notifyEnd);
   assert.match(notifySource, /await input\.onPrepared\(prepared\)/);
   assert.match(notifySource, /throw new SubmissionCancelledBeforeSendError/);
+});
+
+test("all locally signed routes durably publish one exact attempt before their first send", () => {
+  const sharedStart = executorSource.indexOf("async function submitSignedSwapTx");
+  const sharedEnd = executorSource.indexOf("export async function executeSwap", sharedStart);
+  const sharedSource = executorSource.slice(sharedStart, sharedEnd);
+  assert.match(sharedSource, /createPreparedTransactionNotifier\(/);
+  assert.match(sharedSource, /sendViaJito\([\s\S]*?ensurePrepared/);
+  assert.match(sharedSource, /sendRawViaRpc\([\s\S]*?ensurePrepared/);
+
+  const managedStart = executorSource.indexOf("async function executeJupiterManagedV2");
+  const managedEnd = executorSource.indexOf("async function executePumpFunSwap", managedStart);
+  const managedSource = executorSource.slice(managedStart, managedEnd);
+  const preparedAt = managedSource.indexOf("await ensurePrepared()");
+  const authorizedAt = managedSource.indexOf("await assertSubmissionAuthorized", preparedAt);
+  const executeAt = managedSource.indexOf("await fetch(`${JUPITER_V2_BASE}/execute`", authorizedAt);
+  assert.ok(preparedAt >= 0 && preparedAt < authorizedAt && authorizedAt < executeAt);
+  assert.match(executorSource, /recentBlockhash: tx\.message\.recentBlockhash/);
 });
 
 test("direct-first Pump.fun exits fall back only after a recoverable pre-submit failure", () => {
@@ -115,8 +159,9 @@ test("raw RPC submission authorizes after serialization and before the network c
 
   const sendSource = executorSource.slice(sendStart, sendEnd);
   const serializeAt = sendSource.indexOf("tx.serialize()");
+  const preparedAt = sendSource.indexOf("ensurePrepared?.()");
   const authorizeAt = sendSource.indexOf("assertSubmissionAuthorized(beforeSubmit)");
   const networkAt = sendSource.indexOf("conn.sendRawTransaction");
-  assert.ok(serializeAt >= 0 && serializeAt < authorizeAt);
+  assert.ok(serializeAt >= 0 && serializeAt < preparedAt && preparedAt < authorizeAt);
   assert.ok(authorizeAt < networkAt);
 });
