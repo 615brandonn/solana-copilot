@@ -1597,6 +1597,109 @@ test("historical recovery cannot consume the lane reserved for current wallets",
   await new Promise<void>((resolve) => setImmediate(resolve));
 });
 
+test("reserved recovery reaches backlog behind 10k live wallets and rotates fairly", async () => {
+  const liveWallets = Array.from({ length: 10_000 }, (_, index) => `live-wallet-${index}`);
+  const recoveryWallets = Array.from({ length: 3 }, (_, index) => `recovery-wallet-${index}`);
+  const started: string[] = [];
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet);
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 4,
+    recoveryConcurrency: 2,
+    maxWalletsPerPoll: 4,
+    deferInitialCursorHydration: true,
+  });
+  (poller as any).pollWallet = async (wallet: string) => {
+    started.push(wallet);
+  };
+  for (const wallet of [...liveWallets, ...recoveryWallets]) poller.watch(wallet);
+  (poller as any).cursorHydrationPending.clear();
+  for (const wallet of recoveryWallets) (poller as any).backlogWallets.add(wallet);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, [
+    recoveryWallets[0],
+    recoveryWallets[1],
+    liveWallets[0],
+    liveWallets[1],
+  ]);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(started.slice(4), [
+    recoveryWallets[2],
+    recoveryWallets[0],
+    liveWallets[2],
+    liveWallets[3],
+  ]);
+});
+
+test("a rejected recovery lane backs off and the next reserved wallet runs first", async () => {
+  const liveWallets = ["live-wallet-one", "live-wallet-two"];
+  const recoveryWallets = ["recovery-wallet-one", "recovery-wallet-two"];
+  const started: string[] = [];
+  let backlogMarks = 0;
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet);
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      backlogMarks += 1;
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 2,
+    recoveryConcurrency: 1,
+    maxWalletsPerPoll: 2,
+    deferInitialCursorHydration: true,
+  });
+  (poller as any).pollWallet = async (wallet: string) => {
+    started.push(wallet);
+    if (wallet === recoveryWallets[0]) throw new Error("recovery handler rejected");
+  };
+  for (const wallet of [...liveWallets, ...recoveryWallets]) poller.watch(wallet);
+  (poller as any).cursorHydrationPending.clear();
+  for (const wallet of recoveryWallets) (poller as any).backlogWallets.add(wallet);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, [recoveryWallets[0], liveWallets[0]]);
+  assert.equal(backlogMarks, 1);
+  assert.ok(((poller as any).walletRetryAt.get(recoveryWallets[0]) as number) > Date.now());
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(started.slice(2), [recoveryWallets[1], liveWallets[1]]);
+  assert.equal(started.filter((wallet) => wallet === recoveryWallets[0]).length, 1);
+  assert.equal(poller.health().failures, 1);
+});
+
 test("recovery lanes rotate instead of relaunching the first deep wallet", async () => {
   const recoveryWallets = Array.from({ length: 3 }, () => Keypair.generate().publicKey.toBase58());
   const started: string[] = [];
