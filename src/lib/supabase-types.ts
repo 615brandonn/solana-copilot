@@ -162,6 +162,42 @@ export type PositionRow = {
   follower_seller_exit_triggered: boolean;
 };
 
+export type EntrySignalClaimRow = {
+  id: string;
+  user_id: string;
+  source_tx_sig: string;
+  source_wallet: string;
+  token_mint: string;
+  planned_position_id: string;
+  entry_mode: "regular" | "coordinated";
+  entry_strategy: "supply_accumulation" | "regular" | "coordinated" | "conviction" | null;
+  source_slot: number | null;
+  token_decimals: number | null;
+  contributing_wallets: string[] | null;
+  planned_buy_usd: number | null;
+  last_valid_block_height: number | null;
+  fresh_tail_epoch_id: string | null;
+  fresh_tail_request_id: string | null;
+  fresh_tail_monitoring_armed_at: string | null;
+  received_amount_raw: string | null;
+  received_token_decimals: number | null;
+  amount_lamports: number;
+  status:
+    | "claimed"
+    | "submitted"
+    | "landed"
+    | "persisted"
+    | "failed_pre_submit"
+    | "uncertain";
+  bot_tx_sig: string | null;
+  error_code: string | null;
+  submission_started_at: string | null;
+  landed_at: string | null;
+  persisted_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type TradeRow = {
   id: string;
   user_id: string;
@@ -414,6 +450,308 @@ export type ConvictionTokenStateRow = {
   updated_at: string;
 };
 
+export type CustodyFreshTailEpochRow = {
+  id: string;
+  user_id: string;
+  status: "active" | "retired" | "invalidated";
+  activation_slot: number;
+  activation_blockhash: string;
+  activation_block_time: string;
+  root_wallets: string[];
+  root_fingerprint: string;
+  scope_revision: number;
+  lease_owner: string | null;
+  lease_token: string | null;
+  lease_generation: number;
+  lease_expires_at: string | null;
+  invalid_reason: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CustodyFreshTailMintRow = {
+  epoch_id: string;
+  user_id: string;
+  token_mint: string;
+  enrollment_event_key: string;
+  enrollment_tx_sig: string;
+  enrollment_slot: number;
+  enrollment_blockhash: string;
+  enrollment_block_time: string;
+  enrollment_target_wallet: string;
+  creation_tx_sig: string;
+  creation_slot: number;
+  creation_blockhash: string;
+  bonding_curve: string;
+  creator: string;
+  create_variant: "classic_v1" | "create_v2_token2022";
+  token_program: string;
+  mint_layout_fingerprint: string;
+  parser_abi_fingerprint: string;
+  total_supply_raw: string;
+  decimals: number;
+  attested_head_slot: number;
+  attested_head_blockhash: string;
+  status: "active" | "retired";
+  scope_revision: number;
+  poisoned: boolean;
+  poison_reason: string | null;
+  retire_reason: string | null;
+  retired_at: string | null;
+  attested_at: string;
+  updated_at: string;
+};
+
+export type CustodyFreshTailSupplyEventRow = {
+  id: string;
+  epoch_id: string;
+  user_id: string;
+  event_key: string;
+  payload_fingerprint: string;
+  tx_sig: string;
+  slot: number;
+  block_time: string;
+  target_wallet: string;
+  token_mint: string;
+  side: "buy" | "sell";
+  amount_raw: string;
+  total_supply_raw: string;
+  decimals: number;
+  market_cap_usd: number | null;
+  valuation_slot: number | null;
+  market_data_reliable: boolean;
+  pump_fun_verified: boolean;
+  classification_reliable: boolean;
+  parser_domain: string;
+  parser_abi_fingerprint: string;
+  finalized_head_slot: number;
+  finalized_head_blockhash: string;
+  quarantined: boolean;
+  conflict_count: number;
+  first_conflict_at: string | null;
+  recorded_at: string;
+};
+
+export type CustodyFreshTailRecipient = {
+  wallet: string;
+  amountRaw: string;
+  preRaw: string;
+  postRaw: string;
+  classification: string;
+  classificationReliable: boolean;
+  watchable: boolean;
+};
+
+export type CustodyFreshTailCustodyEventRow = {
+  id: string;
+  epoch_id: string;
+  user_id: string;
+  event_key: string;
+  payload_fingerprint: string;
+  tx_sig: string;
+  slot: number;
+  block_time: string;
+  source_wallet: string;
+  token_mint: string;
+  event_kind: "TARGET_BUY" | "TRANSFER" | "SELL" | "UNRESOLVED_OUTFLOW" | "TERMINAL_OUTFLOW";
+  amount_raw: string;
+  source_pre_raw: string;
+  source_post_raw: string;
+  decimals: number;
+  recipients: CustodyFreshTailRecipient[];
+  classification: string;
+  classification_reliable: boolean;
+  watchable: boolean;
+  parser_domain: string;
+  parser_abi_fingerprint: string;
+  finalized_head_slot: number;
+  finalized_head_blockhash: string;
+  classification_pending: boolean;
+  terminal_poison: boolean;
+  quarantined: boolean;
+  conflict_count: number;
+  first_conflict_at: string | null;
+  recorded_at: string;
+};
+
+export type CustodyFreshTailRequestRow = {
+  id: string;
+  epoch_id: string;
+  user_id: string;
+  token_mint: string;
+  status: "pending" | "settled" | "expired" | "invalidated";
+  window_started_at: string;
+  trigger_supply_event_id: string;
+  trigger_event_key: string;
+  trigger_tx_sig: string;
+  trigger_slot: number;
+  trigger_target_wallet: string;
+  trigger_block_time: string;
+  expires_at: string;
+  requested_head_slot: number;
+  requested_head_blockhash: string;
+  requested_head_block_time: string;
+  head_snapshot_parser_abi_fingerprint: string;
+  head_curve_state_fingerprint: string;
+  head_curve_observed_slot: number;
+  head_curve_complete: false;
+  head_virtual_token_reserves_raw: string;
+  head_virtual_sol_reserves_lamports: string;
+  head_real_token_reserves_raw: string;
+  head_real_sol_reserves_lamports: string;
+  head_curve_total_supply_raw: string;
+  head_mint_layout_fingerprint: string;
+  head_token_program: string;
+  head_mint_supply_raw: string;
+  head_mint_decimals: number;
+  scope_revision: number;
+  settled_revision: number | null;
+  settled_lease_generation: number | null;
+  settled_at: string | null;
+  invalid_reason: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CustodyFreshTailCursorRow = {
+  epoch_id: string;
+  user_id: string;
+  scope_mint: string;
+  wallet: string;
+  cursor_role: "root" | "descendant";
+  floor_slot: number;
+  initial_boundary_kind: "exclusive_slot" | "inclusive_slot";
+  current_boundary_kind: "exclusive_slot" | "inclusive_slot" | "exact_signature";
+  last_processed_signature: string | null;
+  last_processed_slot: number | null;
+  last_block_time: number | null;
+  first_available_block: number | null;
+  history_floor_proven: boolean;
+  covered_through_slot: number | null;
+  covered_through_blockhash: string | null;
+  coverage_revision: number;
+  backlog_detected: boolean;
+  last_error: string | null;
+  last_success_at: string | null;
+  last_lease_generation: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CustodyFreshTailExitIntentRow = {
+  id: string;
+  user_id: string;
+  epoch_id: string;
+  request_id: string;
+  token_mint: string;
+  entry_claim_id: string;
+  position_id: string;
+  source_domain: "supply" | "custody";
+  supply_event_id: string | null;
+  custody_event_id: string | null;
+  trigger_kind: "direct_target_sell" | "mirror_custody_sell" | "terminal_outflow";
+  status: "pending" | "claimed" | "retry" | "uncertain" | "resolved" | "dismissed";
+  disposition: string | null;
+  worker_id: string | null;
+  claim_token: string | null;
+  claim_generation: number;
+  claim_expires_at: string | null;
+  sell_claim_id: string | null;
+  bot_tx_sig: string | null;
+  error_code: string | null;
+  created_at: string;
+  updated_at: string;
+  resolved_at: string | null;
+};
+
+export type CustodyFreshTailRootRow = {
+  epoch_id: string; user_id: string; wallet: string; ordinal: number;
+  floor_slot: number; boundary_kind: "exclusive_slot"; created_at: string;
+};
+
+export type CustodyFreshTailFinalizedHeadRow = {
+  epoch_id: string; user_id: string; slot: number; blockhash: string;
+  block_time: string; first_lease_generation: number;
+  last_lease_generation: number; first_seen_at: string; last_seen_at: string;
+};
+
+export type CustodyFreshTailMintRejectionRow = {
+  epoch_id: string; user_id: string; token_mint: string; source_tx_sig: string;
+  source_slot: number; rejection_code: string; parser_abi_fingerprint: string;
+  proof_fingerprint: string; finalized_head_slot: number;
+  finalized_head_blockhash: string; quarantined: boolean; conflict_count: number;
+  first_conflict_at: string | null; created_at: string; updated_at: string;
+};
+
+export type CustodyFreshTailEdgeRow = {
+  epoch_id: string; user_id: string; token_mint: string; custody_event_id: string;
+  source_wallet: string; destination_wallet: string; discovery_slot: number;
+  amount_raw: string; classification: string; classification_reliable: boolean;
+  watchable: boolean; applied_revision: number | null; scope_applied_at: string | null;
+  recorded_at: string;
+};
+
+export type CustodyFreshTailWalletRow = {
+  epoch_id: string; user_id: string; token_mint: string; wallet: string;
+  parent_wallet: string; discovery_event_id: string; discovery_event_key: string;
+  discovery_slot: number; floor_slot: number; boundary_kind: "inclusive_slot";
+  watch_status: "active" | "released" | "unwatchable"; classification: string;
+  classification_reliable: boolean; added_revision: number;
+  created_at: string; updated_at: string;
+};
+
+export type CustodyFreshTailBackscanRangeRow = {
+  id: string; epoch_id: string; user_id: string; token_mint: string; wallet: string;
+  source_edge_event_id: string; floor_slot: number; boundary_kind: "inclusive_slot";
+  current_boundary_kind: "inclusive_slot" | "exact_signature";
+  last_processed_signature: string | null; last_processed_slot: number | null;
+  last_block_time: number | null; first_available_block: number | null;
+  history_floor_proven: boolean; covered_through_slot: number | null;
+  covered_through_blockhash: string | null; coverage_revision: number;
+  backlog_detected: boolean; last_error: string | null; last_success_at: string | null;
+  last_lease_generation: number; completed_at: string | null;
+  created_at: string; updated_at: string;
+};
+
+export type CustodyFreshTailCoverageAttestationRow = {
+  id: string; epoch_id: string; user_id: string; lane_kind: "main" | "backscan";
+  scope_mint: string | null; wallet: string | null; range_id: string | null;
+  covered_head_slot: number; covered_head_blockhash: string;
+  coverage_revision: number; lease_generation: number; attested_at: string;
+};
+
+export type CustodyFreshTailWorkerHeartbeatRow = {
+  user_id: string;
+  epoch_id: string;
+  worker_id: string;
+  lease_token: string;
+  lease_generation: number;
+  lease_expires_at: string;
+  enabled: boolean;
+  shadow: boolean;
+  latest_head_slot: number;
+  latest_head_blockhash: string;
+  latest_head_block_time: string;
+  root_required_count: 3;
+  root_covered_count: number;
+  root_backlog_count: number;
+  max_root_lag_slots: number;
+  active_mint_count: number;
+  poisoned_mint_count: number;
+  retired_mint_count: number;
+  pending_candidate_count: number;
+  oldest_pending_candidate_age_seconds: number | null;
+  descendant_required_count: number;
+  descendant_covered_count: number;
+  incomplete_backscan_count: number;
+  exit_pending_count: number;
+  exit_retry_count: number;
+  exit_uncertain_count: number;
+  last_success_at: string | null;
+  last_error: string | null;
+  updated_at: string;
+};
+
 export type ConvictionRankHistoryRow = {
   id: string;
   user_id: string;
@@ -543,6 +881,12 @@ export type Database = {
         Update: Partial<PositionRow>;
         Relationships: [];
       };
+      entry_signal_claims: {
+        Row: EntrySignalClaimRow;
+        Insert: Partial<EntrySignalClaimRow>;
+        Update: Partial<EntrySignalClaimRow>;
+        Relationships: [];
+      };
       trades: {
         Row: TradeRow;
         Insert: Omit<TradeRow, "id" | "created_at">;
@@ -601,6 +945,96 @@ export type Database = {
         Row: CustodyPendingEventRow;
         Insert: CustodyPendingEventRow;
         Update: Partial<CustodyPendingEventRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_epochs: {
+        Row: CustodyFreshTailEpochRow;
+        Insert: Partial<CustodyFreshTailEpochRow>;
+        Update: Partial<CustodyFreshTailEpochRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_roots: {
+        Row: CustodyFreshTailRootRow;
+        Insert: Partial<CustodyFreshTailRootRow>;
+        Update: Partial<CustodyFreshTailRootRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_finalized_heads: {
+        Row: CustodyFreshTailFinalizedHeadRow;
+        Insert: Partial<CustodyFreshTailFinalizedHeadRow>;
+        Update: Partial<CustodyFreshTailFinalizedHeadRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_mints: {
+        Row: CustodyFreshTailMintRow;
+        Insert: Partial<CustodyFreshTailMintRow>;
+        Update: Partial<CustodyFreshTailMintRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_mint_rejections: {
+        Row: CustodyFreshTailMintRejectionRow;
+        Insert: Partial<CustodyFreshTailMintRejectionRow>;
+        Update: Partial<CustodyFreshTailMintRejectionRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_supply_events: {
+        Row: CustodyFreshTailSupplyEventRow;
+        Insert: Partial<CustodyFreshTailSupplyEventRow>;
+        Update: Partial<CustodyFreshTailSupplyEventRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_custody_events: {
+        Row: CustodyFreshTailCustodyEventRow;
+        Insert: Partial<CustodyFreshTailCustodyEventRow>;
+        Update: Partial<CustodyFreshTailCustodyEventRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_edges: {
+        Row: CustodyFreshTailEdgeRow;
+        Insert: Partial<CustodyFreshTailEdgeRow>;
+        Update: Partial<CustodyFreshTailEdgeRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_wallets: {
+        Row: CustodyFreshTailWalletRow;
+        Insert: Partial<CustodyFreshTailWalletRow>;
+        Update: Partial<CustodyFreshTailWalletRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_requests: {
+        Row: CustodyFreshTailRequestRow;
+        Insert: Partial<CustodyFreshTailRequestRow>;
+        Update: Partial<CustodyFreshTailRequestRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_cursors: {
+        Row: CustodyFreshTailCursorRow;
+        Insert: Partial<CustodyFreshTailCursorRow>;
+        Update: Partial<CustodyFreshTailCursorRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_backscan_ranges: {
+        Row: CustodyFreshTailBackscanRangeRow;
+        Insert: Partial<CustodyFreshTailBackscanRangeRow>;
+        Update: Partial<CustodyFreshTailBackscanRangeRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_coverage_attestations: {
+        Row: CustodyFreshTailCoverageAttestationRow;
+        Insert: Partial<CustodyFreshTailCoverageAttestationRow>;
+        Update: Partial<CustodyFreshTailCoverageAttestationRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_exit_intents: {
+        Row: CustodyFreshTailExitIntentRow;
+        Insert: Partial<CustodyFreshTailExitIntentRow>;
+        Update: Partial<CustodyFreshTailExitIntentRow>;
+        Relationships: [];
+      };
+      custody_fresh_tail_worker_heartbeat: {
+        Row: CustodyFreshTailWorkerHeartbeatRow;
+        Insert: Partial<CustodyFreshTailWorkerHeartbeatRow>;
+        Update: Partial<CustodyFreshTailWorkerHeartbeatRow>;
         Relationships: [];
       };
       conviction_events: {

@@ -854,6 +854,106 @@ async function checkSupplyAccumulationSchema(
     return false;
   }
 
+  const freshSchema = await Promise.all([
+    db
+      .from("custody_fresh_tail_epochs")
+      .select(
+        "id,user_id,status,activation_slot,activation_blockhash,activation_block_time,root_wallets,root_fingerprint,scope_revision,lease_owner,lease_token,lease_generation,lease_expires_at,invalid_reason,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_roots")
+      .select("epoch_id,user_id,wallet,ordinal,floor_slot,boundary_kind,created_at")
+      .limit(1),
+    db
+      .from("custody_fresh_tail_finalized_heads")
+      .select(
+        "epoch_id,user_id,slot,blockhash,block_time,first_lease_generation,last_lease_generation,first_seen_at,last_seen_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_mint_rejections")
+      .select(
+        "epoch_id,user_id,token_mint,source_tx_sig,source_slot,rejection_code,parser_abi_fingerprint,proof_fingerprint,finalized_head_slot,finalized_head_blockhash,quarantined,conflict_count,first_conflict_at,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_mints")
+      .select(
+        "epoch_id,user_id,token_mint,enrollment_event_key,enrollment_tx_sig,enrollment_slot,enrollment_blockhash,enrollment_block_time,enrollment_target_wallet,creation_tx_sig,creation_slot,creation_blockhash,bonding_curve,creator,create_variant,token_program,mint_layout_fingerprint,parser_abi_fingerprint,total_supply_raw,decimals,attested_head_slot,attested_head_blockhash,status,scope_revision,poisoned,poison_reason,retire_reason,retired_at,attested_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_edges")
+      .select(
+        "epoch_id,user_id,token_mint,custody_event_id,source_wallet,destination_wallet,discovery_slot,amount_raw,classification,classification_reliable,watchable,applied_revision,scope_applied_at,recorded_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_wallets")
+      .select(
+        "epoch_id,user_id,token_mint,wallet,parent_wallet,discovery_event_id,discovery_event_key,discovery_slot,floor_slot,boundary_kind,watch_status,classification,classification_reliable,added_revision,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_supply_events")
+      .select(
+        "id,epoch_id,user_id,event_key,payload_fingerprint,tx_sig,slot,block_time,target_wallet,token_mint,side,amount_raw,total_supply_raw,decimals,market_cap_usd,valuation_slot,market_data_reliable,pump_fun_verified,classification_reliable,parser_domain,parser_abi_fingerprint,finalized_head_slot,finalized_head_blockhash,quarantined,conflict_count,first_conflict_at,recorded_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_coverage_attestations")
+      .select(
+        "id,epoch_id,user_id,lane_kind,scope_mint,wallet,range_id,covered_head_slot,covered_head_blockhash,coverage_revision,lease_generation,attested_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_custody_events")
+      .select(
+        "id,epoch_id,user_id,event_key,payload_fingerprint,tx_sig,slot,block_time,source_wallet,token_mint,event_kind,amount_raw,source_pre_raw,source_post_raw,decimals,recipients,classification,classification_reliable,watchable,parser_domain,parser_abi_fingerprint,finalized_head_slot,finalized_head_blockhash,classification_pending,terminal_poison,quarantined,conflict_count,first_conflict_at,recorded_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_requests")
+      .select(
+        "id,epoch_id,user_id,token_mint,status,window_started_at,trigger_supply_event_id,trigger_event_key,trigger_tx_sig,trigger_slot,trigger_target_wallet,trigger_block_time,expires_at,requested_head_slot,requested_head_blockhash,requested_head_block_time,head_snapshot_parser_abi_fingerprint,head_curve_state_fingerprint,head_curve_observed_slot,head_curve_complete,head_virtual_token_reserves_raw,head_virtual_sol_reserves_lamports,head_real_token_reserves_raw,head_real_sol_reserves_lamports,head_curve_total_supply_raw,head_mint_layout_fingerprint,head_token_program,head_mint_supply_raw,head_mint_decimals,scope_revision,settled_revision,settled_lease_generation,settled_at,invalid_reason,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_cursors")
+      .select(
+        "epoch_id,user_id,scope_mint,wallet,cursor_role,floor_slot,initial_boundary_kind,current_boundary_kind,last_processed_signature,last_processed_slot,first_available_block,history_floor_proven,covered_through_slot,covered_through_blockhash,coverage_revision,backlog_detected,last_error,last_success_at,last_lease_generation,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_backscan_ranges")
+      .select(
+        "id,epoch_id,user_id,token_mint,wallet,source_edge_event_id,floor_slot,boundary_kind,current_boundary_kind,last_processed_signature,last_processed_slot,first_available_block,history_floor_proven,covered_through_slot,covered_through_blockhash,coverage_revision,backlog_detected,last_error,last_success_at,last_lease_generation,completed_at,created_at,updated_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_exit_intents")
+      .select(
+        "id,user_id,epoch_id,request_id,token_mint,entry_claim_id,position_id,source_domain,supply_event_id,custody_event_id,trigger_kind,status,disposition,worker_id,claim_token,claim_generation,claim_expires_at,sell_claim_id,bot_tx_sig,error_code,created_at,updated_at,resolved_at",
+      )
+      .limit(1),
+    db
+      .from("custody_fresh_tail_worker_heartbeat")
+      .select(
+        "user_id,epoch_id,worker_id,lease_token,lease_generation,lease_expires_at,enabled,shadow,latest_head_slot,latest_head_blockhash,latest_head_block_time,root_required_count,root_covered_count,root_backlog_count,max_root_lag_slots,active_mint_count,poisoned_mint_count,retired_mint_count,pending_candidate_count,oldest_pending_candidate_age_seconds,descendant_required_count,descendant_covered_count,incomplete_backscan_count,exit_pending_count,exit_retry_count,exit_uncertain_count,last_success_at,last_error,updated_at",
+      )
+      .limit(1),
+  ]);
+  const freshSchemaError = freshSchema.find((result) => result.error)?.error;
+  if (freshSchemaError) {
+    fail(
+      "Supply fresh-tail schema",
+      `${safeDiagnostic(freshSchemaError.message)} — run supabase/supply-accumulation-fresh-tail-migration.sql`,
+    );
+    return false;
+  }
+
+
   try {
     const apiUrl = new URL("/rest/v1/", env.BOT_SUPABASE_URL);
     const headers: Record<string, string> = { apikey: env.BOT_SUPABASE_SERVICE_ROLE_KEY };
@@ -875,6 +975,31 @@ async function checkSupplyAccumulationSchema(
       "/rpc/get_supply_accumulation_scale_plan",
       "/rpc/claim_supply_accumulation_scale_buy",
       "/rpc/apply_supply_accumulation_scale_buy",
+      "/rpc/assert_custody_fresh_tail_lease",
+      "/rpc/activate_custody_fresh_tail_epoch",
+      "/rpc/acquire_custody_fresh_tail_lease",
+      "/rpc/record_custody_fresh_tail_heartbeat",
+      "/rpc/attest_custody_fresh_tail_finalized_head",
+      "/rpc/is_custody_fresh_tail_parser_reviewed",
+      "/rpc/get_custody_fresh_tail_active_epoch",
+      "/rpc/get_custody_fresh_tail_work",
+      "/rpc/reject_custody_fresh_tail_mint",
+      "/rpc/attest_custody_fresh_tail_mint_creation",
+      "/rpc/record_custody_fresh_tail_supply_event",
+      "/rpc/record_custody_fresh_tail_custody_event",
+      "/rpc/sync_custody_fresh_tail_scope",
+      "/rpc/retire_custody_fresh_tail_mint",
+      "/rpc/request_custody_fresh_tail_coverage",
+      "/rpc/record_custody_fresh_tail_cursor",
+      "/rpc/record_custody_fresh_tail_backscan_cursor",
+      "/rpc/settle_custody_fresh_tail_request",
+      "/rpc/bind_supply_entry_claim_fresh_tail",
+      "/rpc/record_supply_entry_claim_fresh_tail_receipt",
+      "/rpc/claim_custody_fresh_tail_exit_intents",
+      "/rpc/claim_custody_fresh_tail_uncertain_intents",
+      "/rpc/resolve_custody_fresh_tail_exit_intent",
+      "/rpc/check_supply_accumulation_fresh_custody_gate",
+      "/rpc/get_custody_fresh_tail_entry_candidates",
     ].filter((path) => !paths[path]);
     if (!response.ok || missingRpc.length > 0) {
       fail("Supply Accumulation RPCs", {
@@ -888,6 +1013,10 @@ async function checkSupplyAccumulationSchema(
     return false;
   }
 
+  pass(
+    "Supply fresh-tail schema",
+    "FINALIZED isolated cursor/custody proof, retrograde backscans, and durable exit outbox are installed",
+  );
   pass(
     "Supply Accumulation schema",
     cfg.supply_accumulation_mode_enabled
@@ -963,7 +1092,7 @@ async function checkSellCoverageSchema(cfg: BotConfigRow): Promise<boolean> {
     db
       .from("entry_signal_claims")
       .select(
-        "user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,entry_strategy,source_slot,token_decimals,contributing_wallets,planned_buy_usd,last_valid_block_height,amount_lamports,status,bot_tx_sig,error_code,submission_started_at,landed_at,persisted_at,created_at,updated_at",
+        "user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,entry_strategy,source_slot,token_decimals,contributing_wallets,planned_buy_usd,last_valid_block_height,fresh_tail_epoch_id,fresh_tail_request_id,fresh_tail_monitoring_armed_at,received_amount_raw,received_token_decimals,amount_lamports,status,bot_tx_sig,error_code,submission_started_at,landed_at,persisted_at,created_at,updated_at",
       )
       .limit(1),
     db
