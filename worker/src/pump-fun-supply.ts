@@ -1,10 +1,34 @@
-import { type Commitment, Connection, PublicKey } from "@solana/web3.js";
-import { MintLayout, TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { BondingCurveAccount } from "pumpdotfun-sdk";
+import { createHash } from "node:crypto";
+import { type Commitment, Connection, PublicKey, SystemProgram } from "@solana/web3.js";
+import {
+  ExtensionType,
+  getExtensionData,
+  getExtensionTypes,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  unpackMint,
+} from "@solana/spl-token";
+import { unpack as unpackTokenMetadata } from "@solana/spl-token-metadata";
 
 export const PUMP_FUN_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+export const PUMP_FUN_STANDARD_TOTAL_SUPPLY_RAW = 1_000_000_000_000_000n;
 const BONDING_CURVE_SEED = Buffer.from("bonding-curve");
 const BONDING_CURVE_DISCRIMINATOR = 6_966_180_631_402_821_399n;
+
+export const PUMP_FUN_SNAPSHOT_PARSER_SCHEMA = [
+  "pump_fun_snapshot_v1",
+  "program=6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "curve_discriminator=6966180631402821399le",
+  "curve_layouts=classic:49|115|151-zero-tail;create_v2_token2022:115|151-zero-tail",
+  "curve_fields=virtual_token_u64,virtual_sol_u64,real_token_u64,real_sol_u64,total_supply_u64,complete_bool,creator_pubkey,mayhem_bool,cashback_bool,quote_mint_system",
+  "mint_classic=Tokenkeg+len82+no_extensions",
+  "mint_v2=TokenzQ+MetadataPointer(self,immutable)+TokenMetadata(immutable,no-additional-metadata)",
+  "mint_common=initialized+null_mint_authority+null_freeze_authority+supply_equals_curve_total+decimals6",
+  "identity=sha256_exact_curve_bytes+sha256_exact_mint_bytes+observed_context_slot",
+].join(";");
+export const PUMP_FUN_SNAPSHOT_PARSER_ABI_FINGERPRINT = createHash("sha256")
+  .update(PUMP_FUN_SNAPSHOT_PARSER_SCHEMA)
+  .digest("hex");
 
 export type PumpFunSupplySnapshot = {
   mint: string;
@@ -14,7 +38,27 @@ export type PumpFunSupplySnapshot = {
   virtualTokenReservesRaw: bigint;
   virtualSolReservesLamports: bigint;
   realTokenReservesRaw: bigint;
+  realSolReservesLamports: bigint;
   complete: boolean;
+  createVariant?: "classic_v1" | "create_v2_token2022";
+  tokenProgram?: string;
+  creator?: string;
+  isMayhemMode?: boolean;
+  isCashbackEnabled?: boolean;
+  quoteMint?: string;
+  mintLayoutFingerprint?: string;
+  curveStateFingerprint?: string;
+};
+
+export type ReviewedPumpFunStateExpectation = {
+  createVariant?: "classic_v1" | "create_v2_token2022";
+  tokenProgram?: string;
+  creator?: string;
+  name?: string;
+  symbol?: string;
+  uri?: string;
+  isMayhemMode?: boolean;
+  isCashbackEnabled?: boolean;
 };
 
 export type PumpFunMarketCapCheck = {
@@ -53,6 +97,180 @@ export function pumpFunBondingCurveAddress(mint: PublicKey): PublicKey {
   )[0];
 }
 
+function readCurveU64(data: Buffer, offset: number): bigint | null {
+  try {
+    return data.readBigUInt64LE(offset);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decodes only reviewed Pump curve + mint layouts. Current 151-byte curves are
+ * accepted only while the 36-byte post-IDL tail remains all zero. Token-2022
+ * mints are limited to immutable self-pointing metadata; transfer fees, hooks,
+ * scaled UI amounts, non-transferable flags, and every other extension fail.
+ */
+export function decodeReviewedPumpFunSupplyAccounts(
+  mint: PublicKey,
+  curveAccount: { owner: PublicKey; data: Buffer | Uint8Array },
+  mintAccount: { owner: PublicKey; data: Buffer | Uint8Array },
+  observedSlot: number,
+  expected: ReviewedPumpFunStateExpectation = {},
+): PumpFunSupplySnapshot | null {
+  if (
+    !Number.isSafeInteger(observedSlot) ||
+    observedSlot <= 0 ||
+    !curveAccount.owner.equals(PUMP_FUN_PROGRAM_ID)
+  ) {
+    return null;
+  }
+  const tokenProgram = mintAccount.owner.toBase58();
+  const createVariant = mintAccount.owner.equals(TOKEN_PROGRAM_ID)
+    ? "classic_v1"
+    : mintAccount.owner.equals(TOKEN_2022_PROGRAM_ID)
+      ? "create_v2_token2022"
+      : null;
+  if (
+    !createVariant ||
+    (expected.createVariant && expected.createVariant !== createVariant) ||
+    (expected.tokenProgram && expected.tokenProgram !== tokenProgram)
+  ) {
+    return null;
+  }
+
+  const curveData = Buffer.from(curveAccount.data);
+  const permittedCurveLengths =
+    createVariant === "create_v2_token2022" ? [115, 151] : [49, 115, 151];
+  if (!permittedCurveLengths.includes(curveData.length)) return null;
+  if (curveData.length === 151 && curveData.subarray(115).some((byte) => byte !== 0)) {
+    return null;
+  }
+  const discriminator = readCurveU64(curveData, 0);
+  const virtualTokenReservesRaw = readCurveU64(curveData, 8);
+  const virtualSolReservesLamports = readCurveU64(curveData, 16);
+  const realTokenReservesRaw = readCurveU64(curveData, 24);
+  const realSolReservesLamports = readCurveU64(curveData, 32);
+  const totalSupplyRaw = readCurveU64(curveData, 40);
+  const completeByte = curveData[48];
+  if (
+    discriminator !== BONDING_CURVE_DISCRIMINATOR ||
+    virtualTokenReservesRaw === null ||
+    virtualTokenReservesRaw <= 0n ||
+    virtualSolReservesLamports === null ||
+    virtualSolReservesLamports <= 0n ||
+    realTokenReservesRaw === null ||
+    realSolReservesLamports === null ||
+    totalSupplyRaw === null ||
+    totalSupplyRaw <= 0n ||
+    (completeByte !== 0 && completeByte !== 1)
+  ) {
+    return null;
+  }
+  let creator: string | undefined;
+  let isMayhemMode: boolean | undefined;
+  let isCashbackEnabled: boolean | undefined;
+  let quoteMint: string | undefined;
+  if (curveData.length >= 115) {
+    try {
+      creator = new PublicKey(curveData.subarray(49, 81)).toBase58();
+      isMayhemMode = curveData[81] === 1;
+      isCashbackEnabled = curveData[82] === 1;
+      quoteMint = new PublicKey(curveData.subarray(83, 115)).toBase58();
+    } catch {
+      return null;
+    }
+    if (
+      (curveData[81] !== 0 && curveData[81] !== 1) ||
+      (curveData[82] !== 0 && curveData[82] !== 1) ||
+      quoteMint !== SystemProgram.programId.toBase58() ||
+      (expected.creator && expected.creator !== creator) ||
+      (expected.isMayhemMode !== undefined && expected.isMayhemMode !== isMayhemMode) ||
+      (expected.isCashbackEnabled !== undefined &&
+        expected.isCashbackEnabled !== isCashbackEnabled)
+    ) {
+      return null;
+    }
+  } else if (
+    createVariant !== "classic_v1" ||
+    expected.isMayhemMode === true ||
+    expected.isCashbackEnabled === true
+  ) {
+    return null;
+  }
+
+  const mintData = Buffer.from(mintAccount.data);
+  let decodedMint: ReturnType<typeof unpackMint>;
+  try {
+    decodedMint = unpackMint(mint, { ...mintAccount, data: mintData } as any, mintAccount.owner);
+  } catch {
+    return null;
+  }
+  if (
+    !decodedMint.isInitialized ||
+    decodedMint.mintAuthority !== null ||
+    decodedMint.freezeAuthority !== null ||
+    decodedMint.supply !== totalSupplyRaw ||
+    decodedMint.decimals !== 6
+  ) {
+    return null;
+  }
+  const extensionTypes = getExtensionTypes(decodedMint.tlvData).sort((left, right) => left - right);
+  if (createVariant === "classic_v1") {
+    if (mintData.length !== 82 || extensionTypes.length !== 0) return null;
+  } else {
+    if (
+      curveData.length < 115 ||
+      extensionTypes.length !== 2 ||
+      extensionTypes[0] !== ExtensionType.MetadataPointer ||
+      extensionTypes[1] !== ExtensionType.TokenMetadata
+    ) {
+      return null;
+    }
+    const pointerData = getExtensionData(ExtensionType.MetadataPointer, decodedMint.tlvData);
+    const metadataData = getExtensionData(ExtensionType.TokenMetadata, decodedMint.tlvData);
+    if (!pointerData || !metadataData) return null;
+    try {
+      const metadata = unpackTokenMetadata(metadataData);
+      if (
+        pointerData.length !== 64 ||
+        pointerData.subarray(0, 32).some((byte) => byte !== 0) ||
+        new PublicKey(pointerData.subarray(32, 64)).toBase58() !== mint.toBase58() ||
+        metadata.updateAuthority !== undefined ||
+        metadata.mint.toBase58() !== mint.toBase58() ||
+        metadata.additionalMetadata.length !== 0 ||
+        (expected.name !== undefined && metadata.name !== expected.name) ||
+        (expected.symbol !== undefined && metadata.symbol !== expected.symbol) ||
+        (expected.uri !== undefined && metadata.uri !== expected.uri)
+      ) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  return {
+    mint: mint.toBase58(),
+    observedSlot,
+    totalSupplyRaw,
+    decimals: decodedMint.decimals,
+    virtualTokenReservesRaw,
+    virtualSolReservesLamports,
+    realTokenReservesRaw,
+    realSolReservesLamports,
+    complete: completeByte === 1,
+    createVariant,
+    tokenProgram,
+    creator,
+    isMayhemMode,
+    isCashbackEnabled,
+    quoteMint,
+    mintLayoutFingerprint: createHash("sha256").update(mintData).digest("hex"),
+    curveStateFingerprint: createHash("sha256").update(curveData).digest("hex"),
+  };
+}
+
 export async function loadPumpFunSupplySnapshot(
   connection: Connection,
   tokenMint: string,
@@ -75,44 +293,13 @@ export async function loadPumpFunSupplySnapshot(
     options.rpcCallTimeoutMs ?? 2_000,
   );
   const [account, mintAccount] = response.value;
-  if (
-    !account ||
-    !account.owner.equals(PUMP_FUN_PROGRAM_ID) ||
-    !mintAccount ||
-    !mintAccount.owner.equals(TOKEN_PROGRAM_ID)
-  ) {
-    return null;
-  }
-
-  let curve: BondingCurveAccount;
-  let decodedMint: ReturnType<typeof MintLayout.decode>;
-  try {
-    curve = BondingCurveAccount.fromBuffer(account.data);
-    decodedMint = MintLayout.decode(mintAccount.data);
-  } catch {
-    return null;
-  }
-  if (
-    curve.discriminator !== BONDING_CURVE_DISCRIMINATOR ||
-    curve.tokenTotalSupply <= 0n ||
-    curve.virtualTokenReserves <= 0n ||
-    curve.virtualSolReserves <= 0n ||
-    decodedMint.supply !== curve.tokenTotalSupply ||
-    decodedMint.decimals < 0 ||
-    decodedMint.decimals > 18
-  ) {
-    return null;
-  }
-  return {
-    mint: tokenMint,
-    observedSlot: response.context.slot,
-    totalSupplyRaw: curve.tokenTotalSupply,
-    decimals: decodedMint.decimals,
-    virtualTokenReservesRaw: curve.virtualTokenReserves,
-    virtualSolReservesLamports: curve.virtualSolReserves,
-    realTokenReservesRaw: curve.realTokenReserves,
-    complete: curve.complete,
-  };
+  if (!account || !mintAccount) return null;
+  return decodeReviewedPumpFunSupplyAccounts(
+    mint,
+    { owner: account.owner, data: account.data },
+    { owner: mintAccount.owner, data: mintAccount.data },
+    response.context.slot,
+  );
 }
 
 function marketCapLamports(
