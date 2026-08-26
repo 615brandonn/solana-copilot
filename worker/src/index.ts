@@ -9,7 +9,12 @@ import { env } from "./env.js";
 import { db, type BotConfigRow } from "./db.js";
 import { GeyserFeed, type FeedEvent, type SwapEvent, type TransferEvent } from "./geyser.js";
 import { FollowerMonitor, type ChainedTransferBatchState } from "./monitor.js";
-import { executeSwap, type ExecuteInput, type ExecuteResult } from "./executor.js";
+import {
+  executeSwap,
+  type ExecuteInput,
+  type ExecuteResult,
+  type PreparedTransaction,
+} from "./executor.js";
 import {
   exactRawAmount,
   rawAmountToUiString,
@@ -17,7 +22,11 @@ import {
   remainingUiAfterExactExit,
   uiAmountToRawFloor,
 } from "./exit-sizing.js";
-import { confirmedTokenReceiptFromTx } from "./execution-accounting.js";
+import {
+  confirmedTokenDebitFromTx,
+  confirmedTokenReceiptFromTx,
+  type ConfirmedTokenDebit,
+} from "./execution-accounting.js";
 import { BoundedBackgroundQueue } from "./bounded-background-queue.js";
 import { checkPriceSanity, priceSanityConfigFrom, type PriceSanityState } from "./price-sanity.js";
 import { SubmissionUncertainError, isPostSubmissionError } from "./execution-safety.js";
@@ -112,6 +121,11 @@ import {
   sellClaimFailureDisposition,
   type SellTriggerKind,
 } from "./sell-claim-policy.js";
+import { decideSellClaimRecovery } from "./sell-claim-recovery-policy.js";
+import {
+  SellClaimRecoveryStore,
+  type SellRecoveryClaim,
+} from "./sell-claim-recovery-store.js";
 import { authoritativeCoordinatedTargetLinks } from "./target-link-backfill.js";
 import { targetTerminalOutflowExitPct } from "./target-outflow-policy.js";
 import { quoteTokenSpendUsd } from "./token-spend-quote.js";
@@ -181,6 +195,24 @@ type EntryClaimRow = {
   fresh_tail_monitoring_armed_at?: string | null;
   received_amount_raw?: string | null;
   received_token_decimals?: number | null;
+};
+
+type PreparedSellContext = PreparedTransaction & {
+  executedSellAmountRaw: string;
+  preparedWalletBalanceRaw: string;
+  tokenDecimals: number;
+};
+
+type LandedSellContext = {
+  result: ExecuteResult;
+  executedSellAmountRaw: string;
+  preparedWalletBalanceRaw: string;
+  tokenDecimals: number;
+};
+
+type PersistedExit = {
+  closed: boolean;
+  amountRemaining: number;
 };
 
 async function classifyFollowerRecipient(address: string): Promise<RecipientClassification> {
@@ -487,6 +519,7 @@ async function main() {
   // position that was closed while the buy was being built.
   const tradeExecutionQueue = new KeyedExecutionQueue();
   const exitExecutionQueue = new KeyedExecutionQueue();
+  const sellClaimRecoveryStore = new SellClaimRecoveryStore(db, cfg.user_id);
   // Supply evidence is serialized per mint but never on the Geyser drain.
   // A later sell for the same mint therefore queues behind the preceding buy,
   // while unrelated mints and the live feed continue independently.
@@ -655,6 +688,236 @@ async function main() {
       }
     }
     throw new Error(`${label} failed after ${attempts} attempts: ${lastError}`);
+  }
+
+  async function finalizedSellDebit(
+    txSig: string,
+    tokenMint: string,
+    tokenDecimals: number,
+    timeoutMs: number,
+  ): Promise<ConfirmedTokenDebit | null> {
+    if (!fundingReadiness.walletPubkey) return null;
+    const deadline = Date.now() + Math.max(1, timeoutMs);
+    while (Date.now() < deadline) {
+      const statuses = await solanaRpcWithTimeout(
+        rpc.getSignatureStatuses([txSig], { searchTransactionHistory: true }),
+        Math.min(15_000, Math.max(1, deadline - Date.now())),
+      );
+      const status = statuses.value[0];
+      const finalized =
+        status?.confirmationStatus === "finalized" ||
+        (status?.confirmationStatus == null && status?.confirmations === null);
+      if (status?.err && finalized) return null;
+      if (status && !status.err && finalized) {
+        const transaction = await solanaRpcWithTimeout(
+          rpc.getTransaction(txSig, {
+            commitment: "finalized",
+            maxSupportedTransactionVersion: 0,
+          }),
+          Math.min(15_000, Math.max(1, deadline - Date.now())),
+        );
+        if (transaction) {
+          const debit = confirmedTokenDebitFromTx(
+            transaction,
+            fundingReadiness.walletPubkey,
+            tokenMint,
+          );
+          return debit?.decimals === tokenDecimals ? debit : null;
+        }
+      }
+      const pauseMs = Math.min(500, Math.max(0, deadline - Date.now()));
+      if (pauseMs > 0) await delay(pauseMs);
+    }
+    return null;
+  }
+
+  let reconcilingSellClaims = false;
+
+  async function reconcileUnresolvedSellClaims(): Promise<number> {
+    if (reconcilingSellClaims) return 0;
+    reconcilingSellClaims = true;
+    try {
+      const claims = await sellClaimRecoveryStore.loadUnresolved();
+      let resolved = 0;
+      for (const claim of claims) {
+        try {
+          const unsignedSince = Date.parse(
+            claim.submissionStartedAt ?? claim.createdAt ?? claim.updatedAt,
+          );
+          const staleUnsigned =
+            Number.isFinite(unsignedSince) && Date.now() - unsignedSince >= 120_000;
+          let chainEvidence:
+            | "not_checked"
+            | "missing"
+            | "pending_success"
+            | "pending_failure"
+            | "finalized_success"
+            | "finalized_failure" = "not_checked";
+          let preparedBlockhashExpired = false;
+          let historyNullAfterExpiryRecheck = false;
+          let exactReceiptMatchesPrepared = false;
+          let receipt: ConfirmedTokenDebit | null = null;
+          let position:
+            | {
+                id: string;
+                token_mint: string;
+                decimals: number | null;
+                entry_price_usd: number | null;
+              }
+            | null = null;
+
+          const isPreparedV1 =
+            claim.recoveryVersion === 1 &&
+            Boolean(claim.botTxSig) &&
+            Boolean(claim.recentBlockhash) &&
+            Boolean(claim.executedSellAmountRaw) &&
+            Boolean(claim.preparedWalletBalanceRaw) &&
+            Boolean(claim.positionAmountBeforeRaw) &&
+            claim.tokenDecimals !== null;
+          if (claim.botTxSig && isPreparedV1) {
+            const statuses = await solanaRpcWithTimeout(
+              rpc.getSignatureStatuses([claim.botTxSig], { searchTransactionHistory: true }),
+              15_000,
+            );
+            let status = statuses.value[0];
+            if (!status) {
+              chainEvidence = "missing";
+              if (claim.lastValidBlockHeight) {
+                const finalizedHeight = await solanaRpcWithTimeout(
+                  rpc.getBlockHeight("finalized"),
+                  15_000,
+                );
+                preparedBlockhashExpired =
+                  BigInt(finalizedHeight) > BigInt(claim.lastValidBlockHeight);
+              }
+              if (preparedBlockhashExpired) {
+                const recheck = await solanaRpcWithTimeout(
+                  rpc.getSignatureStatuses([claim.botTxSig], {
+                    searchTransactionHistory: true,
+                  }),
+                  15_000,
+                );
+                status = recheck.value[0];
+                historyNullAfterExpiryRecheck = !status;
+              }
+            }
+            if (status) {
+              const finalized =
+                status.confirmationStatus === "finalized" ||
+                (status.confirmationStatus == null && status.confirmations === null);
+              chainEvidence = status.err
+                ? finalized
+                  ? "finalized_failure"
+                  : "pending_failure"
+                : finalized
+                  ? "finalized_success"
+                  : "pending_success";
+              if (chainEvidence === "finalized_success") {
+                const positionResult = await db
+                  .from("positions")
+                  .select("id,token_mint,decimals,entry_price_usd")
+                  .eq("id", claim.positionId)
+                  .eq("user_id", cfg.user_id)
+                  .maybeSingle();
+                if (positionResult.error || !positionResult.data) {
+                  throw new Error(
+                    `sell recovery position lookup failed: ${safeDiagnostic(positionResult.error ?? "missing position")}`,
+                  );
+                }
+                position = positionResult.data;
+                receipt = await finalizedSellDebit(
+                  claim.botTxSig,
+                  position.token_mint,
+                  Number(position.decimals),
+                  15_000,
+                );
+                exactReceiptMatchesPrepared =
+                  receipt !== null &&
+                  receipt.decimals === claim.tokenDecimals &&
+                  receipt.amountRaw === claim.executedSellAmountRaw;
+              }
+            }
+          }
+
+          const decision = decideSellClaimRecovery({
+            status: claim.status,
+            botTxSig: claim.botTxSig,
+            recoveryVersion: isPreparedV1 ? claim.recoveryVersion : null,
+            staleUnsigned,
+            chainEvidence,
+            preparedBlockhashExpired,
+            historyNullAfterExpiryRecheck,
+            exactReceiptMatchesPrepared,
+          });
+          if (decision.action === "release_for_retry") {
+            if (await sellClaimRecoveryStore.markFailure(claim, decision.reason)) resolved += 1;
+            continue;
+          }
+          if (
+            decision.action === "quarantine" &&
+            chainEvidence === "pending_failure" &&
+            claim.status === "submitted" &&
+            claim.botTxSig
+          ) {
+            await sellClaimRecoveryStore.markUncertain(
+              claim.id,
+              claim.botTxSig,
+              decision.reason,
+            );
+            continue;
+          }
+          if (
+            decision.action !== "apply_exact_receipt" ||
+            !receipt ||
+            !position ||
+            !claim.botTxSig
+          ) {
+            continue;
+          }
+          await tradeExecutionQueue.run(position.token_mint, () =>
+            exitExecutionQueue.run(claim.positionId, async () => {
+              const result = await sellClaimRecoveryStore.apply(
+                claim.id,
+                claim.botTxSig!,
+                receipt!,
+                null,
+                null,
+                null,
+              );
+              const amountRemaining = Number(result.amountRemaining);
+              if (convictionRuntime.snapshot(position!.token_mint)) {
+                await convictionRuntime.setPositionUsd(
+                  position!.token_mint,
+                  convictionExposureIncludingShadow(
+                    position!.token_mint,
+                    amountRemaining * Math.max(0, Number(position!.entry_price_usd ?? 0)),
+                  ),
+                );
+              }
+              if (result.closed) await releaseMonitoredPosition(claim.positionId);
+            }),
+          );
+          resolved += 1;
+        } catch (err) {
+          log.warn(
+            { err: safeDiagnostic(err), claimId: claim.id, positionId: claim.positionId },
+            "sell claim reconciliation deferred — position remains quarantined",
+          );
+        }
+      }
+      if (claims.length > 0) {
+        log.warn(
+          {
+            unresolvedSellClaimCount: claims.length - resolved,
+            resolvedSellClaimCount: resolved,
+          },
+          "durable sell claims reconciled",
+        );
+      }
+      return resolved;
+    } finally {
+      reconcilingSellClaims = false;
+    }
   }
 
   async function updateEntryClaim(
@@ -2634,13 +2897,10 @@ async function main() {
     sellRaw: bigint,
     decimals: number,
     reason: string,
-    markTpTaken = false,
-    markCoordinatedExit = false,
-    markFollowerSellerExit = false,
     strategyEvent?: FeedEvent,
-    mirroredSoldFraction?: number,
-    onPrepared?: ExecuteInput["onPrepared"],
+    onPrepared?: (prepared: PreparedSellContext) => void | Promise<void>,
     beforeSubmit?: ExecuteInput["beforeSubmit"],
+    onLanded?: (landed: LandedSellContext) => Promise<PersistedExit>,
   ): Promise<ExecuteResult | null> {
     if (exitsInFlight.has(positionId)) return null;
     exitsInFlight.add(positionId);
@@ -2702,14 +2962,23 @@ async function main() {
             throw new Error("executor returned an exit amount above the verified live balance");
           }
         },
-        onPrepared,
+        onPrepared: async (prepared) => {
+          if (executedSellRaw === undefined || liveBalanceRaw === undefined) {
+            throw new Error("sell preparation is missing exact capped input evidence");
+          }
+          await onPrepared?.({
+            ...prepared,
+            executedSellAmountRaw: executedSellRaw.toString(),
+            preparedWalletBalanceRaw: liveBalanceRaw.toString(),
+            tokenDecimals: decimals,
+          });
+        },
         beforeSubmit,
       });
       landedResult = result;
       if (executedSellRaw === undefined || liveBalanceRaw === undefined || executedSellRaw <= 0n) {
         throw new Error("executor did not return a valid capped exit amount");
       }
-      const executedSellUi = rawAmountToUiNumber(executedSellRaw, decimals);
       if (strategyEvent) {
         recordStrategyDecision(strategyEvent, "mirrored", "event-triggered exit landed", {
           position_id: positionId,
@@ -2719,95 +2988,57 @@ async function main() {
           metadata: { persistencePending: true },
         });
       }
-      const cur = await retryDb<{
-        amount_remaining: number;
-        entry_price_usd: number | null;
-      } | null>("load position after exit", () =>
-        db
-          .from("positions")
-          .select("amount_remaining,entry_price_usd")
-          .eq("id", positionId)
-          .maybeSingle(),
-      );
-      if (!cur) throw new Error(`position ${positionId} disappeared after exit transaction landed`);
-      const newRemaining = remainingUiAfterExactExit(
-        cur.amount_remaining,
-        executedSellRaw,
-        liveBalanceRaw,
-        decimals,
-      ).remainingUi;
-      const closed = isFlatPosition(newRemaining);
-      const update: {
-        amount_remaining: number;
-        closed_at: string | null;
-        tp_taken?: boolean;
-        coordinated_exit_triggered?: boolean;
-        follower_seller_exit_triggered?: boolean;
-        mirrored_sold_fraction?: number;
-      } = {
-        amount_remaining: newRemaining,
-        closed_at: closed ? new Date().toISOString() : null,
-      };
-      if (markTpTaken) update.tp_taken = true;
-      if (markCoordinatedExit) update.coordinated_exit_triggered = true;
-      if (markFollowerSellerExit) update.follower_seller_exit_triggered = true;
-      if (mirroredSoldFraction !== undefined) {
-        update.mirrored_sold_fraction = Math.min(1, Math.max(0, Number(mirroredSoldFraction) || 0));
-      }
-      await retryDb("save position after exit", () =>
-        db.from("positions").update(update).eq("id", positionId),
-      );
-      if (convictionRuntime.snapshot(mint)) {
-        await convictionRuntime.setPositionUsd(
-          mint,
-          convictionExposureIncludingShadow(
+      if (!onLanded) throw new Error("exit is missing its atomic landed-accounting callback");
+      const persisted = await onLanded({
+        result,
+        executedSellAmountRaw: executedSellRaw.toString(),
+        preparedWalletBalanceRaw: liveBalanceRaw.toString(),
+        tokenDecimals: decimals,
+      });
+      const { data: positionAfterApply, error: positionAfterApplyError } = await db
+        .from("positions")
+        .select("entry_price_usd")
+        .eq("id", positionId)
+        .eq("user_id", cfg.user_id)
+        .maybeSingle();
+      if (positionAfterApplyError) {
+        log.warn(
+          { err: safeDiagnostic(positionAfterApplyError), positionId },
+          "landed exit accounting persisted but conviction exposure refresh was deferred",
+        );
+      } else if (positionAfterApply && convictionRuntime.snapshot(mint)) {
+        await convictionRuntime
+          .setPositionUsd(
             mint,
-            newRemaining * Math.max(0, Number(cur.entry_price_usd ?? 0)),
+            convictionExposureIncludingShadow(
+              mint,
+              persisted.amountRemaining *
+                Math.max(0, Number(positionAfterApply.entry_price_usd ?? 0)),
+            ),
+          )
+          .catch((err) =>
+            log.warn(
+              { err: safeDiagnostic(err), positionId },
+              "landed exit accounting persisted but conviction runtime refresh was deferred",
+            ),
+          );
+      }
+      log.info({ sig: result.txSig, reason, closed: persisted.closed }, "exit sell landed");
+      if (persisted.closed) {
+        await releaseMonitoredPosition(positionId).catch((err) =>
+          log.warn(
+            { err: safeDiagnostic(err), positionId },
+            "closed exit persisted; monitor release will reconcile later",
           ),
         );
       }
-      // Analytics: capture exit price, proceeds, and PnL so the trade log is
-      // measurable. Best-effort and non-blocking to execution — the swap has
-      // already landed above; a price-feed miss simply records nulls (prior
-      // behaviour) and never throws.
-      let exitPriceUsd: number | null = null;
-      try {
-        const p = await priceUsd(mint);
-        exitPriceUsd = typeof p === "number" && Number.isFinite(p) && p > 0 ? p : null;
-      } catch {
-        exitPriceUsd = null;
-      }
-      const entryPriceUsd = Number(cur.entry_price_usd ?? 0);
-      const exitAmountUsd = exitPriceUsd !== null ? executedSellUi * exitPriceUsd : null;
-      const exitPnlPct =
-        exitPriceUsd !== null && entryPriceUsd > 0
-          ? ((exitPriceUsd - entryPriceUsd) / entryPriceUsd) * 100
-          : null;
-      await retryDb("save exit trade", () =>
-        db.from("trades").insert({
-          user_id: cfg.user_id,
-          position_id: positionId,
-          side: "sell",
-          token_mint: mint,
-          amount_tokens: executedSellUi,
-          amount_usd: exitAmountUsd,
-          price_usd: exitPriceUsd,
-          pnl_pct: exitPnlPct,
-          tx_sig: result.txSig,
-          reason,
-          latency_ms: result.latencyMs,
-          route: result.route,
-        }),
-      );
-      log.info({ sig: result.txSig, reason, closed }, "exit sell landed");
-      if (closed) await releaseMonitoredPosition(positionId);
       if (strategyEvent) {
         recordStrategyDecision(strategyEvent, "mirrored", "event-triggered exit landed and saved", {
           position_id: positionId,
           bot_tx_sig: result.txSig,
           reaction_ms: strategyReactionMs(strategyEvent, Date.now(), result.latencyMs),
           execution_ms: result.latencyMs,
-          metadata: { persistencePending: false, closed },
+          metadata: { persistencePending: false, closed: persisted.closed },
         });
       }
       return result;
@@ -2870,6 +3101,14 @@ async function main() {
           status: "claimed",
           requested_sell_pct: normalizedPct,
           requested_sell_amount: requestedSellAmount,
+          exit_reason: reason,
+          mark_tp_taken: Boolean(options.markTpTaken),
+          mark_coordinated_exit: Boolean(options.markCoordinatedExit),
+          mark_follower_seller_exit: Boolean(options.markFollowerSellerExit),
+          mirrored_sold_fraction:
+            options.mirroredSoldFraction === undefined
+              ? null
+              : Math.min(1, Math.max(0, Number(options.mirroredSoldFraction) || 0)),
         })
         .select("id")
         .maybeSingle();
@@ -2917,8 +3156,29 @@ async function main() {
             error_code: `retrying failed_pre_submit; prior error: ${priorFailure}`,
             bot_tx_sig: null,
             landed_at: null,
+            recovery_version: null,
+            token_decimals: null,
+            executed_sell_amount_raw: null,
+            prepared_wallet_balance_raw: null,
+            position_amount_before_raw: null,
+            recent_blockhash: null,
+            last_valid_block_height: null,
+            receipt_pre_amount_raw: null,
+            receipt_post_amount_raw: null,
+            trade_id: null,
+            execution_route: null,
+            execution_latency_ms: null,
+            persisted_at: null,
             requested_sell_pct: normalizedPct,
             requested_sell_amount: requestedSellAmount,
+            exit_reason: reason,
+            mark_tp_taken: Boolean(options.markTpTaken),
+            mark_coordinated_exit: Boolean(options.markCoordinatedExit),
+            mark_follower_seller_exit: Boolean(options.markFollowerSellerExit),
+            mirrored_sold_fraction:
+              options.mirroredSoldFraction === undefined
+                ? null
+                : Math.min(1, Math.max(0, Number(options.mirroredSoldFraction) || 0)),
             submission_started_at: null,
             updated_at: new Date().toISOString(),
           })
@@ -2957,7 +3217,7 @@ async function main() {
 
       const { data: currentPosition, error: currentPositionError } = await db
         .from("positions")
-        .select("amount_remaining,decimals")
+        .select("amount_remaining,amount_remaining_raw,decimals")
         .eq("id", positionId)
         .is("closed_at", null)
         .maybeSingle();
@@ -2972,17 +3232,24 @@ async function main() {
         return null;
       }
 
-      const currentRemaining = Math.max(0, Number(currentPosition.amount_remaining) || 0);
-      const sellUi = Math.min(
-        currentRemaining,
-        requestedSellAmount !== null
-          ? requestedSellAmount
-          : currentRemaining * (normalizedPct / 100),
-      );
       const currentDecimals = Number(currentPosition.decimals ?? decimals);
+      const currentPositionRawText = String(currentPosition.amount_remaining_raw ?? "").trim();
       let sellRaw: bigint;
       try {
-        sellRaw = uiAmountToRawFloor(sellUi, currentDecimals);
+        if (!/^[1-9][0-9]*$/.test(currentPositionRawText)) {
+          throw new Error("position exact raw balance is unavailable");
+        }
+        const positionRaw = BigInt(currentPositionRawText);
+        if (requestedSellAmount !== null) {
+          sellRaw = uiAmountToRawFloor(requestedSellAmount, currentDecimals);
+        } else {
+          const scaledPct = Math.round(normalizedPct * 1_000_000);
+          if (!Number.isSafeInteger(scaledPct) || scaledPct <= 0 || scaledPct > 100_000_000) {
+            throw new Error("sell percentage cannot be represented exactly");
+          }
+          sellRaw = (positionRaw * BigInt(scaledPct)) / 100_000_000n;
+        }
+        if (sellRaw > positionRaw) sellRaw = positionRaw;
       } catch (err) {
         await updateClaim({
           status: "failed_pre_submit",
@@ -2990,45 +3257,65 @@ async function main() {
         });
         throw err;
       }
-      if (sellRaw <= 0n || sellUi <= 0) {
+      if (sellRaw <= 0n) {
         await updateClaim({ status: "failed_pre_submit", error_code: "no-executable-amount" });
         return null;
       }
 
-      await updateClaim(
-        { status: "submitted", submission_started_at: new Date().toISOString() },
-        true,
-      );
       let preparedBotTxSig: string | null = null;
-      const persistPreparedSell = async ({ txSig }: { txSig: string }) => {
-        const { data: prepared, error: preparedError } = await db
-          .from("sell_signal_claims")
-          .update({
-            bot_tx_sig: txSig,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", claim.id)
-          .eq("status", "submitted")
-          .is("bot_tx_sig", null)
-          .select("id")
-          .maybeSingle();
-        if (preparedError || !prepared) {
-          throw new Error(
-            `sell claim lost prepared-attempt ownership: ${safeDiagnostic(preparedError ?? "claim changed")}`,
-          );
-        }
-        preparedBotTxSig = txSig;
+      const persistPreparedSell = async (prepared: PreparedSellContext) => {
+        await sellClaimRecoveryStore.prepare(claim.id, {
+          txSig: prepared.txSig,
+          recentBlockhash: prepared.recentBlockhash,
+          lastValidBlockHeight: prepared.lastValidBlockHeight,
+          executedSellAmountRaw: prepared.executedSellAmountRaw,
+          preparedWalletBalanceRaw: prepared.preparedWalletBalanceRaw,
+          positionAmountBeforeRaw: currentPositionRawText,
+          tokenDecimals: prepared.tokenDecimals,
+        });
+        preparedBotTxSig = prepared.txSig;
       };
       const authorizePreparedSell = async () => {
         if (!preparedBotTxSig) return false;
-        const { data: prepared, error: preparedError } = await db
-          .from("sell_signal_claims")
-          .select("id")
-          .eq("id", claim.id)
-          .eq("status", "submitted")
-          .eq("bot_tx_sig", preparedBotTxSig)
-          .maybeSingle();
-        return !preparedError && Boolean(prepared);
+        return sellClaimRecoveryStore.authorize(claim.id, preparedBotTxSig);
+      };
+      const persistLandedSell = async (landed: LandedSellContext): Promise<PersistedExit> => {
+        const receipt = await finalizedSellDebit(
+          landed.result.txSig,
+          mint,
+          landed.tokenDecimals,
+          45_000,
+        );
+        if (!receipt || receipt.amountRaw !== landed.executedSellAmountRaw) {
+          throw new SubmissionUncertainError({
+            route: landed.result.route,
+            txSig: landed.result.txSig,
+            detail: "finalized sell transaction lacks the exact prepared token debit",
+          });
+        }
+        let exitPriceUsd: number | null = null;
+        try {
+          const observedPrice = await priceUsd(mint);
+          exitPriceUsd =
+            typeof observedPrice === "number" && Number.isFinite(observedPrice) && observedPrice > 0
+              ? observedPrice
+              : null;
+        } catch {
+          exitPriceUsd = null;
+        }
+        const applied = await sellClaimRecoveryStore.apply(
+          claim.id,
+          landed.result.txSig,
+          receipt,
+          landed.result.route,
+          landed.result.latencyMs,
+          exitPriceUsd,
+        );
+        const amountRemaining = Number(applied.amountRemaining);
+        if (!Number.isFinite(amountRemaining) || amountRemaining < 0 || applied.closed === null) {
+          throw new Error("atomic sell apply returned invalid position evidence");
+        }
+        return { closed: applied.closed, amountRemaining };
       };
       try {
         log.warn({ positionId, mint, sellPct: normalizedPct, reason }, "claimed exit triggered");
@@ -3038,32 +3325,37 @@ async function main() {
           sellRaw,
           currentDecimals,
           reason,
-          Boolean(options.markTpTaken),
-          Boolean(options.markCoordinatedExit),
-          Boolean(options.markFollowerSellerExit),
           event,
-          options.mirroredSoldFraction,
           persistPreparedSell,
           authorizePreparedSell,
+          persistLandedSell,
         );
         if (!result) {
-          await updateClaim({ status: "failed_pre_submit", error_code: "no-executable-amount" });
+          await sellClaimRecoveryStore.markPreSubmitFailure(
+            claim.id,
+            preparedBotTxSig,
+            "no-executable-amount",
+          );
           return null;
         }
-        await updateClaim({
-          status: "landed",
-          bot_tx_sig: result.txSig,
-          error_code: null,
-          landed_at: new Date().toISOString(),
-        });
         return result;
       } catch (err) {
-        const disposition = sellClaimFailureDisposition(err);
-        await updateClaim({
-          status: disposition.status,
-          bot_tx_sig: disposition.botTxSig,
-          error_code: safeDiagnostic(err),
-        });
+        if (isPostSubmissionError(err) && preparedBotTxSig) {
+          await sellClaimRecoveryStore
+            .markUncertain(claim.id, preparedBotTxSig, safeDiagnostic(err))
+            .catch((statusError) =>
+              log.warn(
+                { err: safeDiagnostic(statusError), claimId: claim.id },
+                "sell uncertainty status update deferred to reconciliation",
+              ),
+            );
+        } else {
+          await sellClaimRecoveryStore.markPreSubmitFailure(
+            claim.id,
+            preparedBotTxSig,
+            safeDiagnostic(err),
+          );
+        }
         throw err;
       }
     };

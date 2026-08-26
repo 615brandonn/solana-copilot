@@ -19,16 +19,24 @@ test("claimed exits preserve exact raw sizing and persist the executor-capped am
   assert.match(executeExit, /sellRaw: bigint/);
   assert.match(executeExit, /inputDecimals: decimals/);
   assert.match(executeExit, /onInputAmountCapped:/);
-  assert.match(executeExit, /remainingUiAfterExactExit\(/);
-  assert.match(executeExit, /amount_tokens: executedSellUi/);
+  assert.match(executeExit, /executedSellAmountRaw: executedSellRaw\.toString\(\)/);
+  assert.match(executeExit, /if \(!onLanded\)[\s\S]*const persisted = await onLanded\(/);
+  assert.doesNotMatch(executeExit, /\.from\("positions"\)[\s\S]*\.update\(/);
 
   const claimedExit = section(
     "async function executeClaimedPercentageExit",
     "const supplyBuyBackground",
   );
-  assert.match(claimedExit, /sellRaw = uiAmountToRawFloor\(sellUi, currentDecimals\)/);
+  assert.match(claimedExit, /currentPosition\.amount_remaining_raw/);
+  assert.match(claimedExit, /const positionRaw = BigInt\(currentPositionRawText\)/);
+  assert.match(
+    claimedExit,
+    /sellRaw = uiAmountToRawFloor\(requestedSellAmount, currentDecimals\)/,
+  );
+  assert.match(claimedExit, /sellRaw = \(positionRaw \* BigInt\(scaledPct\)\) \/ 100_000_000n/);
   assert.match(claimedExit, /sellRaw,[\s\S]*currentDecimals,[\s\S]*reason/);
-  assert.doesNotMatch(claimedExit, /Math\.floor\(sellUi \* Math\.pow/);
+  assert.match(claimedExit, /sellClaimRecoveryStore\.apply\(/);
+  assert.doesNotMatch(claimedExit, /Math\.floor\([^\n]*Math\.pow/);
 });
 
 test("only explicit pre-submit failures retry and stale landing identity is cleared", () => {
