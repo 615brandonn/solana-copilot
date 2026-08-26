@@ -23,6 +23,35 @@ const rpcResult = {
   journeyReleased: false,
 };
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function targetBuy(txSig: string, tokenMint: string): SwapEvent {
+  return {
+    kind: "swap",
+    wallet: "target",
+    side: "buy",
+    tokenMint,
+    amountTokens: 1,
+    decimals: 6,
+    solDelta: -1,
+    slot: 1,
+    txSig,
+    timestampMs: 1_000,
+    isPumpFun: false,
+    verifiedSwap: true,
+  };
+}
+
+async function flushTasks(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 test("custody RPC payloads preserve gross acquisition and exact raw evidence", async () => {
   const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
   const client = {
@@ -164,6 +193,64 @@ test("custody RPC payloads preserve gross acquisition and exact raw evidence", a
   assert.equal(metadata(3)?.preRaw, "100000000");
   assert.equal(metadata(3)?.postRaw, "75000000");
   assert.equal(metadata(3)?.reason, "negative_token_delta_not_attributed");
+});
+
+test("custody writes serialize per mint while different mints remain parallel", async () => {
+  const gates = new Map<string, ReturnType<typeof deferred>>();
+  const started: string[] = [];
+  let active = 0;
+  let maxActive = 0;
+  const client = {
+    async rpc(_name: string, args: Record<string, unknown>) {
+      const txSig = String(args.p_tx_sig);
+      const gate = deferred();
+      gates.set(txSig, gate);
+      started.push(txSig);
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await gate.promise;
+      active -= 1;
+      return { data: rpcResult, error: null };
+    },
+  };
+  const store = createSupabaseCustodyStore(client as never, "user-id");
+
+  const first = store.recordTargetBuy(targetBuy("same-1", "same-mint"));
+  const second = store.recordTargetBuy(targetBuy("same-2", "same-mint"));
+  const other = store.recordTargetBuy(targetBuy("other-1", "other-mint"));
+  await flushTasks();
+
+  assert.deepEqual(started, ["same-1", "other-1"]);
+  assert.equal(maxActive, 2);
+  gates.get("same-1")?.resolve();
+  gates.get("other-1")?.resolve();
+  await Promise.all([first, other]);
+  await flushTasks();
+
+  assert.deepEqual(started, ["same-1", "other-1", "same-2"]);
+  gates.get("same-2")?.resolve();
+  await second;
+});
+
+test("a failed custody write releases its mint queue for replay", async () => {
+  const started: string[] = [];
+  const client = {
+    async rpc(_name: string, args: Record<string, unknown>) {
+      const txSig = String(args.p_tx_sig);
+      started.push(txSig);
+      return txSig === "failed"
+        ? { data: null, error: { message: "database unavailable" } }
+        : { data: rpcResult, error: null };
+    },
+  };
+  const store = createSupabaseCustodyStore(client as never, "user-id");
+
+  const failed = store.recordTargetBuy(targetBuy("failed", "same-mint"));
+  const replay = store.recordTargetBuy(targetBuy("replay", "same-mint"));
+  await assert.rejects(failed, /record_custody_target_buy failed/);
+  await replay;
+
+  assert.deepEqual(started, ["failed", "replay"]);
 });
 
 test("custody persistence responses fail closed when malformed", () => {
