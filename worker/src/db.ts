@@ -10,36 +10,64 @@ function normalizeSupabaseUrl(url: string): string {
   return trimmed;
 }
 
-export const db = createClient(
-  normalizeSupabaseUrl(env.BOT_SUPABASE_URL),
-  env.BOT_SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: { persistSession: false, autoRefreshToken: false },
-    realtime: { transport: WebSocket as unknown as typeof globalThis.WebSocket },
-    global: {
-      fetch: (input, init) => {
-        const headers = new Headers(init?.headers);
-        headers.set("apikey", env.BOT_SUPABASE_SERVICE_ROLE_KEY);
-        const timeoutSignal = AbortSignal.timeout(5_000);
-        const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+export const DEFAULT_SUPABASE_REQUEST_TIMEOUT_MS = 5_000;
 
-        // New-format sb_secret_* keys are opaque, not JWTs. PostgREST accepts
-        // them as apikey, but not as an Authorization bearer token.
-        if (
-          env.BOT_SUPABASE_SERVICE_ROLE_KEY.startsWith("sb_") &&
-          headers.get("Authorization") === `Bearer ${env.BOT_SUPABASE_SERVICE_ROLE_KEY}`
-        ) {
-          headers.delete("Authorization");
-        }
+type SupabaseFetch = typeof fetch;
+type TimeoutSignalFactory = (timeoutMs: number) => AbortSignal;
 
-        return fetch(
-          input as Parameters<typeof fetch>[0],
-          { ...init, headers, signal } as Parameters<typeof fetch>[1],
-        ) as unknown as Promise<Response>;
+/**
+ * Builds an isolated Supabase client with a bounded request deadline.
+ *
+ * The trading worker deliberately keeps the five-second default below. The
+ * observation-only Custody process creates its own client with a longer
+ * deadline so historical evidence writers can wait for their per-mint
+ * database lock without changing entry, exit, or execution latency.
+ */
+export function createBotDb(
+  requestTimeoutMs = DEFAULT_SUPABASE_REQUEST_TIMEOUT_MS,
+  baseFetch: SupabaseFetch = fetch,
+  timeoutSignalFactory: TimeoutSignalFactory = (timeoutMs) => AbortSignal.timeout(timeoutMs),
+) {
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1) {
+    throw new Error("Supabase request timeout must be a positive safe integer");
+  }
+
+  return createClient(
+    normalizeSupabaseUrl(env.BOT_SUPABASE_URL),
+    env.BOT_SUPABASE_SERVICE_ROLE_KEY,
+    {
+      auth: { persistSession: false, autoRefreshToken: false },
+      realtime: { transport: WebSocket as unknown as typeof globalThis.WebSocket },
+      global: {
+        fetch: (input, init) => {
+          const headers = new Headers(init?.headers);
+          headers.set("apikey", env.BOT_SUPABASE_SERVICE_ROLE_KEY);
+          const timeoutSignal = timeoutSignalFactory(requestTimeoutMs);
+          const signal = init?.signal
+            ? AbortSignal.any([init.signal, timeoutSignal])
+            : timeoutSignal;
+
+          // New-format sb_secret_* keys are opaque, not JWTs. PostgREST accepts
+          // them as apikey, but not as an Authorization bearer token.
+          if (
+            env.BOT_SUPABASE_SERVICE_ROLE_KEY.startsWith("sb_") &&
+            headers.get("Authorization") === `Bearer ${env.BOT_SUPABASE_SERVICE_ROLE_KEY}`
+          ) {
+            headers.delete("Authorization");
+          }
+
+          return baseFetch(
+            input as Parameters<typeof fetch>[0],
+            { ...init, headers, signal } as Parameters<typeof fetch>[1],
+          ) as unknown as Promise<Response>;
+        },
       },
     },
-  },
-);
+  );
+}
+
+/** Shared client used by the trading worker and existing utilities. */
+export const db = createBotDb();
 
 export type BotConfigRow = {
   id: string;
