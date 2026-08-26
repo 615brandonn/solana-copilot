@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { safeDiagnostic } from "./diagnostics.js";
+import { KeyedExecutionQueue } from "./event-deduper.js";
 import type { SwapEvent, TransferEvent } from "./geyser.js";
 import type { UnresolvedOutflowEvent } from "./poller.js";
 import type {
@@ -158,13 +159,23 @@ function isRawString(value: unknown): value is string {
 }
 
 export function createSupabaseCustodyStore(client: SupabaseClient, userId: string): CustodyStore {
+  // Every custody event RPC takes PostgreSQL's advisory transaction lock for
+  // the same user+mint. Queue those calls here so concurrent wallet recovery
+  // lanes wait in-process instead of occupying PostgREST/database requests
+  // while they wait for the identical lock. The map only retains active keys;
+  // upstream handlers await each write, bounding waiters by poller concurrency.
+  const writeQueue = new KeyedExecutionQueue();
+
   const call = async (
     name: string,
     args: Record<string, unknown>,
   ): Promise<CustodyRecordResult> => {
-    const { data, error } = (await client.rpc(name, args)) as RpcResult;
-    if (error) throw new Error(`${name} failed: ${safeDiagnostic(error)}`);
-    return parseCustodyRecordResult(data);
+    const mint = typeof args.p_token_mint === "string" ? args.p_token_mint.trim() : "";
+    return writeQueue.run(`${userId}\u0000${mint}`, async () => {
+      const { data, error } = (await client.rpc(name, args)) as RpcResult;
+      if (error) throw new Error(`${name} failed: ${safeDiagnostic(error)}`);
+      return parseCustodyRecordResult(data);
+    });
   };
 
   return {
