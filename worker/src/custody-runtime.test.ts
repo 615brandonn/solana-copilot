@@ -83,6 +83,7 @@ function fakeStore() {
     transferRecipients: 0,
     scopeChecks: 0,
   };
+  let lastUnresolved: UnresolvedOutflowEvent | null = null;
   let activeAttribution = true;
   const store: CustodyStore = {
     async recordTargetBuy() {
@@ -98,8 +99,9 @@ function fakeStore() {
       calls.sells += 1;
       return result;
     },
-    async recordUnresolvedOutflow() {
+    async recordUnresolvedOutflow(event) {
       calls.unresolved += 1;
+      lastUnresolved = event;
       return result;
     },
     async hasActiveAttribution() {
@@ -123,6 +125,9 @@ function fakeStore() {
   return {
     store,
     calls,
+    lastUnresolved() {
+      return lastUnresolved;
+    },
     setActiveAttribution(value: boolean) {
       activeAttribution = value;
     },
@@ -300,7 +305,172 @@ test("a durable target buy opens its wallet+mint scope before same-transaction f
   });
   assert.equal(calls.buys, 1);
   assert.equal(calls.transfers, 1);
+  assert.equal(calls.unresolved, 0);
   assert.equal(calls.scopeChecks, 0);
+});
+
+test("non-target same-transaction acquisitions persist conserving unresolved outflows", async () => {
+  const cases = [
+    {
+      name: "fully forwarded acquisition",
+      event: {
+        amountTokens: 100,
+        senderPreAmount: 100,
+        senderPostAmount: 0,
+        chainSenderPreAmount: 0,
+        chainSenderPostAmount: 0,
+      },
+      expected: { preAmount: 100, postAmount: 0, amountTokens: 100 },
+    },
+    {
+      name: "existing balance plus partial forward",
+      event: {
+        amountTokens: 40,
+        senderPreAmount: 60,
+        senderPostAmount: 20,
+        chainSenderPreAmount: 100,
+        chainSenderPostAmount: 120,
+      },
+      expected: { preAmount: 160, postAmount: 120, amountTokens: 40 },
+    },
+  ] as const;
+
+  for (const item of cases) {
+    const { store, calls, lastUnresolved } = fakeStore();
+    let classifierLookups = 0;
+    const runtime = new CustodyRuntime(store, {
+      getAccountInfo: async () => {
+        classifierLookups += 1;
+        return null;
+      },
+    } as never);
+    runtime.reconcileActiveWatches([
+      { journeyId: `journey-${item.name}`, wallet: "custody", tokenMint: "mint", anchorSlot: 1 },
+    ]);
+
+    await runtime.observe(
+      transfer({
+        ...item.event,
+        from: "custody",
+        sameTransactionAcquisition: true,
+        source: "rpc",
+        delivery: "catchup",
+      }),
+      { enabled: true, targetWallets: new Set(["target"]) },
+    );
+
+    assert.equal(calls.unresolved, 1, item.name);
+    assert.equal(calls.transfers, 0, item.name);
+    assert.equal(classifierLookups, 0, item.name);
+    assert.deepEqual(
+      lastUnresolved(),
+      {
+        kind: "unresolved_outflow",
+        wallet: "custody",
+        tokenMint: "mint",
+        amountTokens: item.expected.amountTokens,
+        amountRaw: undefined,
+        preAmount: item.expected.preAmount,
+        postAmount: item.expected.postAmount,
+        preRaw: undefined,
+        postRaw: undefined,
+        decimals: 6,
+        slot: 2,
+        txSig: "transfer-tx",
+        timestampMs: 2_000,
+        blockTimeMs: undefined,
+        observedAtMs: undefined,
+        delivery: "catchup",
+        source: "rpc",
+        reason: "negative_token_delta_not_attributed",
+      },
+      item.name,
+    );
+  }
+});
+
+test("non-target same-transaction routing preserves exact raw evidence beyond JS integers", async () => {
+  const { store, calls, lastUnresolved } = fakeStore();
+  const runtime = new CustodyRuntime(store, { getAccountInfo: async () => null } as never);
+  runtime.reconcileActiveWatches([
+    { journeyId: "journey", wallet: "custody", tokenMint: "mint", anchorSlot: 1 },
+  ]);
+
+  await runtime.observe(
+    transfer({
+      from: "custody",
+      amountTokens: 40,
+      senderPreAmount: 60,
+      senderPostAmount: 20,
+      senderPreRaw: "60000000",
+      senderPostRaw: "20000000",
+      sameTransactionAcquisition: true,
+      chainSenderPreAmount: 9_007_199_254_740.992,
+      chainSenderPostAmount: 9_007_199_254_760.992,
+      chainSenderPreRaw: "9007199254740992000",
+      chainSenderPostRaw: "9007199254760992000",
+      source: "rpc",
+    }),
+    { enabled: true, targetWallets: new Set(["target"]) },
+  );
+
+  assert.equal(calls.unresolved, 1);
+  assert.equal(calls.transfers, 0);
+  assert.deepEqual(
+    lastUnresolved() && {
+      preRaw: lastUnresolved()!.preRaw,
+      postRaw: lastUnresolved()!.postRaw,
+      amountRaw: lastUnresolved()!.amountRaw,
+      amountTokens: lastUnresolved()!.amountTokens,
+    },
+    {
+      preRaw: "9007199254800992000",
+      postRaw: "9007199254760992000",
+      amountRaw: "40000000",
+      amountTokens: 40,
+    },
+  );
+});
+
+test("malformed non-target same-transaction evidence remains retryable", async () => {
+  const cases: Array<Partial<TransferEvent>> = [
+    {
+      senderPreAmount: undefined,
+      chainSenderPreAmount: undefined,
+      chainSenderPostAmount: undefined,
+    },
+    {
+      senderPreAmount: 10,
+      chainSenderPreAmount: 5,
+      chainSenderPostAmount: 15,
+    },
+    {
+      senderPreRaw: "10",
+      chainSenderPreRaw: "5",
+      chainSenderPostRaw: "15",
+    },
+  ];
+
+  for (const [index, evidence] of cases.entries()) {
+    const { store, calls } = fakeStore();
+    const runtime = new CustodyRuntime(store, { getAccountInfo: async () => null } as never);
+    runtime.reconcileActiveWatches([
+      { journeyId: `journey-${index}`, wallet: "custody", tokenMint: "mint", anchorSlot: 1 },
+    ]);
+    await assert.rejects(
+      runtime.observe(
+        transfer({
+          ...evidence,
+          from: "custody",
+          sameTransactionAcquisition: true,
+        }),
+        { enabled: true, targetWallets: new Set(["target"]) },
+      ),
+      /non-target same-transaction acquisition/,
+    );
+    assert.equal(calls.unresolved, 0);
+    assert.equal(calls.transfers, 0);
+  }
 });
 
 test("loaded wallet+mint scope preserves downstream-before-upstream pending replay", async () => {

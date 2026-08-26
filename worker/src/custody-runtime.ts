@@ -80,6 +80,105 @@ function isValidOnCurveWallet(wallet: string): boolean {
   }
 }
 
+const RAW_TOKEN_AMOUNT = /^[0-9]+$/;
+
+function exactRawAmount(value: unknown): bigint | null {
+  if (typeof value !== "string" || !RAW_TOKEN_AMOUNT.test(value)) return null;
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
+function finiteNonNegative(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+/**
+ * A downstream custody wallet can independently buy a token and atomically
+ * forward some of that fungible balance. Only configured targets may use the
+ * verified same-transaction acquisition path: for every other wallet it is
+ * impossible to prove whether the forwarded units came from the new purchase
+ * or from the target-attributed cohort already held by that wallet.
+ *
+ * Preserve that ambiguity as a durable unresolved outflow instead of sending
+ * an invalid same-transaction transfer to the database and wedging the wallet
+ * cursor. Exact raw balances are authoritative when the decoder supplied the
+ * complete gross-acquisition and chain-boundary triplet.
+ */
+function ambiguousSameTransactionOutflow(event: TransferEvent): UnresolvedOutflowEvent {
+  const decimals = Number(event.decimals);
+  if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 255) {
+    throw new Error("non-target same-transaction acquisition has invalid token decimals");
+  }
+
+  const grossRaw = exactRawAmount(event.senderPreRaw);
+  const chainPreRaw = exactRawAmount(event.chainSenderPreRaw);
+  const chainPostRaw = exactRawAmount(event.chainSenderPostRaw);
+  const rawEvidenceComplete = grossRaw !== null && chainPreRaw !== null && chainPostRaw !== null;
+
+  let preAmount: number;
+  let postAmount: number;
+  let amountTokens: number;
+  let preRaw: string | undefined;
+  let postRaw: string | undefined;
+  let amountRaw: string | undefined;
+
+  if (rawEvidenceComplete) {
+    const combinedPreRaw = chainPreRaw + grossRaw;
+    const outflowRaw = combinedPreRaw - chainPostRaw;
+    if (combinedPreRaw <= 0n || chainPostRaw < 0n || outflowRaw <= 0n) {
+      throw new Error("non-target same-transaction acquisition does not conserve raw balances");
+    }
+    const scale = 10 ** decimals;
+    preAmount = Number(combinedPreRaw) / scale;
+    postAmount = Number(chainPostRaw) / scale;
+    amountTokens = Number(outflowRaw) / scale;
+    if (![preAmount, postAmount, amountTokens].every(Number.isFinite)) {
+      throw new Error("non-target same-transaction acquisition raw balances exceed safe range");
+    }
+    preRaw = combinedPreRaw.toString();
+    postRaw = chainPostRaw.toString();
+    amountRaw = outflowRaw.toString();
+  } else {
+    const grossAmount = finiteNonNegative(event.senderPreAmount);
+    const chainPreAmount = finiteNonNegative(event.chainSenderPreAmount);
+    const chainPostAmount = finiteNonNegative(event.chainSenderPostAmount);
+    if (grossAmount === null || chainPreAmount === null || chainPostAmount === null) {
+      throw new Error("non-target same-transaction acquisition lacks complete balance evidence");
+    }
+    preAmount = chainPreAmount + grossAmount;
+    postAmount = chainPostAmount;
+    amountTokens = preAmount - postAmount;
+    if (!Number.isFinite(preAmount) || !Number.isFinite(amountTokens) || amountTokens <= 0) {
+      throw new Error("non-target same-transaction acquisition does not conserve balances");
+    }
+  }
+
+  return {
+    kind: "unresolved_outflow",
+    wallet: event.from,
+    tokenMint: event.tokenMint,
+    amountTokens,
+    amountRaw,
+    preAmount,
+    postAmount,
+    preRaw,
+    postRaw,
+    decimals,
+    slot: event.slot,
+    txSig: event.txSig,
+    timestampMs: event.timestampMs,
+    blockTimeMs: event.blockTimeMs,
+    observedAtMs: event.observedAtMs,
+    delivery: event.delivery,
+    source: event.source === "rpc" ? "rpc" : "unknown",
+    reason: "negative_token_delta_not_attributed",
+  };
+}
+
 export type CustodyResultHandler = (
   result: CustodyRecordResult,
   event: FeedEvent | UnresolvedOutflowEvent,
@@ -217,6 +316,12 @@ export class CustodyRuntime {
   ): Promise<CustodyRecordResult | null> {
     if (!(await this.shouldPersistPotentialCustodyEvent(event.from, event.tokenMint, targets))) {
       return null;
+    }
+    if (event.sameTransactionAcquisition === true && !targets.has(event.from)) {
+      // A non-target acquisition cannot extend the target cohort. Persist the
+      // maximum observable outflow as unresolved evidence so this mint stays
+      // fail-closed without retrying an SQL-invalid transfer forever.
+      return this.store.recordUnresolvedOutflow(ambiguousSameTransactionOutflow(event));
     }
     const recipients = await mapWithConcurrency(
       custodyTransferRecipients(event),

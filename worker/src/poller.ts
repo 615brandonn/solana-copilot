@@ -68,7 +68,7 @@ export type RpcBackfillPollerOptions = {
   maxWalletsPerPoll?: number;
   /** Defer pre-start one-row cursor reads so startup can bulk hydrate them. */
   deferInitialCursorHydration?: boolean;
-  /** Maximum lanes that historical recovery may occupy. Defaults to all lanes. */
+  /** Maximum lanes reserved-first for historical recovery. Defaults to all lanes. */
   recoveryConcurrency?: number;
   /** Signature-history pages discovered per wallet turn. Defaults to the full safe cap. */
   signaturePagesPerTurn?: number;
@@ -97,6 +97,7 @@ export class RpcBackfillPoller {
   private cursorCache = new Map<string, RpcWalletCursor>();
   private cursorSuccessPersistedAt = new Map<string, number>();
   private pollOffset = 0;
+  private recoveryPollOffset = 0;
   private walletsInFlight = new Set<string>();
   private walletFailureCounts = new Map<string, number>();
   private walletRetryAt = new Map<string, number>();
@@ -276,6 +277,15 @@ export class RpcBackfillPoller {
     else this.backlogWallets.delete(wallet);
   }
 
+  private isRecoveryWallet(wallet: string): boolean {
+    return (
+      this.backlogWallets.has(wallet) ||
+      this.cursorHydrationPending.has(wallet) ||
+      this.signatureDiscoveryPages.has(wallet) ||
+      this.recoveryQueues.has(wallet)
+    );
+  }
+
   private async poll() {
     this.lastPollAt = Date.now();
     const allEntries = Array.from(this.watched.entries());
@@ -286,7 +296,6 @@ export class RpcBackfillPoller {
     const configuredLimit = Math.trunc(Number(this.options.maxWalletsPerPoll ?? available));
     const launchLimit = Math.max(1, Math.min(available, configuredLimit || 1));
     const now = Date.now();
-    const start = this.pollOffset % allEntries.length;
     const configuredRecoveryConcurrency = Math.trunc(
       Number(this.options.recoveryConcurrency ?? concurrency),
     );
@@ -297,35 +306,66 @@ export class RpcBackfillPoller {
     let recoveryInFlight = Array.from(this.walletLaneInFlight.values()).filter(
       (lane) => lane === "recovery",
     ).length;
-    let scanned = 0;
     let launched = 0;
-    let nextPollOffset = start;
-    while (scanned < allEntries.length && launched < launchLimit) {
-      const entryIndex = (start + scanned) % allEntries.length;
+
+    const launch = (entryIndex: number, lane: "live" | "recovery") => {
       const entry = allEntries[entryIndex];
-      scanned += 1;
-      if (!entry) continue;
+      if (!entry) return;
       const [wallet, options] = entry;
-      if (this.walletsInFlight.has(wallet)) continue;
-      if ((this.walletRetryAt.get(wallet) ?? 0) > now) continue;
-      const isRecovery =
-        this.backlogWallets.has(wallet) ||
-        this.cursorHydrationPending.has(wallet) ||
-        this.signatureDiscoveryPages.has(wallet) ||
-        this.recoveryQueues.has(wallet);
-      if (isRecovery && recoveryInFlight >= recoveryConcurrency) continue;
       launched += 1;
       this.walletsInFlight.add(wallet);
-      const lane = isRecovery ? "recovery" : "live";
-      if (isRecovery) recoveryInFlight += 1;
+      if (lane === "recovery") recoveryInFlight += 1;
       this.walletLaneInFlight.set(wallet, lane);
-      nextPollOffset = (entryIndex + 1) % allEntries.length;
       void this.runWalletPoll(wallet, options);
+    };
+
+    // Recovery is selected independently of the live-wallet rotation. A large
+    // current watch set can therefore never hide a backlogged wallet beyond a
+    // small maxWalletsPerPoll slice. The separate offset keeps deep recovery
+    // wallets fair without disturbing the live round-robin.
+    const recoverySlots = Math.max(0, recoveryConcurrency - recoveryInFlight);
+    const recoveryLaunchLimit = Math.min(recoverySlots, launchLimit);
+    const recoveryStart = this.recoveryPollOffset % allEntries.length;
+    let recoveryScanned = 0;
+    let recoveryLaunched = 0;
+    let nextRecoveryOffset = recoveryStart;
+    while (recoveryScanned < allEntries.length && recoveryLaunched < recoveryLaunchLimit) {
+      const entryIndex = (recoveryStart + recoveryScanned) % allEntries.length;
+      recoveryScanned += 1;
+      const entry = allEntries[entryIndex];
+      if (!entry) continue;
+      const [wallet] = entry;
+      if (!this.isRecoveryWallet(wallet)) continue;
+      if (this.walletsInFlight.has(wallet)) continue;
+      if ((this.walletRetryAt.get(wallet) ?? 0) > now) continue;
+      launch(entryIndex, "recovery");
+      recoveryLaunched += 1;
+      nextRecoveryOffset = (entryIndex + 1) % allEntries.length;
     }
-    // A saturated recovery cap may force a full scan. Advancing by the scan
-    // length would wrap to the same wallet and let the first few deep wallets
-    // monopolize every recovery turn. Rotate only past the last launched lane.
-    if (launched > 0) this.pollOffset = nextPollOffset;
+    if (recoveryLaunched > 0) this.recoveryPollOffset = nextRecoveryOffset;
+
+    // Fill every remaining launch slot from the independent live rotation.
+    // Recovery wallets above the configured cap stay in the recovery lane;
+    // they are never mislabeled as live merely because their reserved slots
+    // are occupied or temporarily backing off.
+    const liveStart = this.pollOffset % allEntries.length;
+    let liveScanned = 0;
+    let liveLaunched = 0;
+    let nextLiveOffset = liveStart;
+    while (liveScanned < allEntries.length && launched < launchLimit) {
+      const entryIndex = (liveStart + liveScanned) % allEntries.length;
+      liveScanned += 1;
+      const entry = allEntries[entryIndex];
+      if (!entry) continue;
+      const [wallet] = entry;
+      if (this.isRecoveryWallet(wallet)) continue;
+      if (this.walletsInFlight.has(wallet)) continue;
+      if ((this.walletRetryAt.get(wallet) ?? 0) > now) continue;
+      launch(entryIndex, "live");
+      liveLaunched += 1;
+      nextLiveOffset = (entryIndex + 1) % allEntries.length;
+    }
+    if (liveLaunched > 0) this.pollOffset = nextLiveOffset;
   }
 
   private async runWalletPoll(wallet: string, options: RpcWatchOptions): Promise<void> {
