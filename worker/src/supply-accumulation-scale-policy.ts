@@ -4,7 +4,7 @@ export const SUPPLY_SCALE_ACTION_DEADLINE_MS = 55_000;
 export const SUPPLY_SCALE_MIN_THRESHOLD_BPS = 1_000;
 export const SUPPLY_SCALE_MAX_THRESHOLD_BPS = 2_000;
 
-const MAX_SUPPLY_SCALE_MARKET_CAP_USD = 15_000;
+const MAX_SUPPLY_SCALE_MARKET_CAP_USD = 20_000;
 const FUTURE_EVENT_TOLERANCE_MS = 5_000;
 const SCALE_STAGES = [2, 3, 4] as const;
 
@@ -219,7 +219,7 @@ export function validateSupplyScalePolicyConfig(
     maxMarketCapUsd <= 0 ||
     maxMarketCapUsd > MAX_SUPPLY_SCALE_MARKET_CAP_USD
   ) {
-    reasons.push("maximum market cap must be positive and no greater than $15,000");
+    reasons.push("maximum market cap must be positive and no greater than $20,000");
   }
   if (
     Number.isFinite(minMarketCapUsd) &&

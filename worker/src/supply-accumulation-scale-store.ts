@@ -432,7 +432,7 @@ export function parseSupplyScalePlan(value: unknown): SupplyScalePlan {
     (plan.marketCapUsd !== null && plan.marketCapUsd < 0) ||
     (plan.minMarketCapUsd !== null && plan.minMarketCapUsd < 0) ||
     (plan.maxMarketCapUsd !== null &&
-      (plan.maxMarketCapUsd <= 0 || plan.maxMarketCapUsd > 15_000)) ||
+      (plan.maxMarketCapUsd <= 0 || plan.maxMarketCapUsd > 20_000)) ||
     (plan.minMarketCapUsd !== null &&
       plan.maxMarketCapUsd !== null &&
       plan.minMarketCapUsd >= plan.maxMarketCapUsd)

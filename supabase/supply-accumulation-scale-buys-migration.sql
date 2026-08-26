@@ -904,7 +904,7 @@ begin
     order by btrim(wallet)
   );
   v_config_fingerprint := encode(
-    digest(
+    extensions.digest(
       convert_to(
         jsonb_build_object(
           'modeEnabled', v_config.supply_accumulation_mode_enabled,

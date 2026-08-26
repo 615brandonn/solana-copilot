@@ -170,7 +170,7 @@ export function projectedPumpFunMarketCaps(
   return {
     currentMarketCapUsd,
     projectedPostBuyMarketCapUsd,
-    // "Under $15k" is intentionally strict. Exactly $15,000 does not pass.
+    // "Under the configured ceiling" is strict. Equality does not pass.
     belowCap:
       currentMarketCapUsd < maxMarketCapUsd && projectedPostBuyMarketCapUsd < maxMarketCapUsd,
   };

@@ -20,7 +20,7 @@ const config: SupplyScalePolicyConfig = {
     { stage: 4, enabled: true, thresholdPct: 18, buyUsd: 10 },
   ],
   minMarketCapUsd: 2_000,
-  maxMarketCapUsd: 15_000,
+  maxMarketCapUsd: 20_000,
   maxExposureUsd: 50,
 };
 
@@ -98,8 +98,8 @@ test("configuration requires an exact contiguous 2/3/4 chain with strictly incre
     !gap.ok && gap.reasons.includes("enabled scale stages must be contiguous from stage 2"),
   );
 
-  assert.equal(validateSupplyScalePolicyConfig({ ...config, maxMarketCapUsd: 15_001 }).ok, false);
-  assert.equal(validateSupplyScalePolicyConfig({ ...config, minMarketCapUsd: 15_000 }).ok, false);
+  assert.equal(validateSupplyScalePolicyConfig({ ...config, maxMarketCapUsd: 20_001 }).ok, false);
+  assert.equal(validateSupplyScalePolicyConfig({ ...config, minMarketCapUsd: 20_000 }).ok, false);
 });
 
 test("raw threshold boundaries use exact BigInt cross multiplication", () => {
@@ -225,18 +225,18 @@ test("market-cap floor is inclusive while current and projected ceilings are str
     "market_cap_below_minimum",
   );
   assert.equal(
-    reason({ ...safe, currentMarketCapUsd: 15_000, projectedMarketCapUsd: 15_000 }),
+    reason({ ...safe, currentMarketCapUsd: 20_000, projectedMarketCapUsd: 20_000 }),
     "market_cap_at_or_above_maximum",
   );
   assert.equal(
-    reason({ ...safe, currentMarketCapUsd: 14_900, projectedMarketCapUsd: 15_000 }),
+    reason({ ...safe, currentMarketCapUsd: 19_900, projectedMarketCapUsd: 20_000 }),
     "projected_market_cap_at_or_above_maximum",
   );
   assert.equal(
     evaluateSupplyScaleAction({
       ...safe,
-      currentMarketCapUsd: 14_900,
-      projectedMarketCapUsd: 14_999.99,
+      currentMarketCapUsd: 19_900,
+      projectedMarketCapUsd: 19_999.99,
     }).action,
     "claim",
   );

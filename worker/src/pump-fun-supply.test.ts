@@ -40,7 +40,7 @@ test("invalid thresholds and floating-point fallbacks fail closed", () => {
 });
 
 test("market-cap guard checks both current and conservatively projected post-buy values", () => {
-  const small = projectedPumpFunMarketCaps(snapshot, 100, 20_000_000n, 15_000);
+  const small = projectedPumpFunMarketCaps(snapshot, 100, 20_000_000n, 20_000);
   assert.ok(small);
   assert.equal(small.belowCap, true);
   assert.ok(small.projectedPostBuyMarketCapUsd >= small.currentMarketCapUsd);
@@ -62,9 +62,9 @@ test("cap projection uses the transaction's full slippage allowance and strictes
     virtualSolReservesLamports: snapshot.virtualSolReservesLamports + 1_000_000_000n,
     virtualTokenReservesRaw: snapshot.virtualTokenReservesRaw - 1_000_000_000n,
   };
-  const strict = strictestPumpFunMarketCaps([snapshot, newer], 100, 108n, 15_000);
+  const strict = strictestPumpFunMarketCaps([snapshot, newer], 100, 108n, 20_000);
   assert.ok(strict);
-  const newerOnly = projectedPumpFunMarketCaps(newer, 100, 108n, 15_000);
+  const newerOnly = projectedPumpFunMarketCaps(newer, 100, 108n, 20_000);
   assert.ok(newerOnly);
   assert.equal(strict.currentMarketCapUsd, newerOnly.currentMarketCapUsd);
   assert.equal(strict.projectedPostBuyMarketCapUsd, newerOnly.projectedPostBuyMarketCapUsd);
@@ -73,15 +73,25 @@ test("cap projection uses the transaction's full slippage allowance and strictes
       [snapshot, { ...newer, totalSupplyRaw: snapshot.totalSupplyRaw + 1n }],
       100,
       108n,
-      15_000,
+      20_000,
     ),
     null,
   );
 });
 
 test("completed curves and missing price evidence fail closed", () => {
-  assert.equal(projectedPumpFunMarketCaps({ ...snapshot, complete: true }, 100, 1n, 15_000), null);
-  assert.equal(projectedPumpFunMarketCaps(snapshot, 0, 1n, 15_000), null);
+  assert.equal(projectedPumpFunMarketCaps({ ...snapshot, complete: true }, 100, 1n, 20_000), null);
+  assert.equal(
+    strictestPumpFunMarketCaps(
+      [snapshot, { ...snapshot, observedSlot: 2, complete: true }],
+      100,
+      1n,
+      20_000,
+    ),
+    null,
+    "either completed chain view must block an entry",
+  );
+  assert.equal(projectedPumpFunMarketCaps(snapshot, 0, 1n, 20_000), null);
 });
 
 test("Pump reserve ratio provides a token-price fallback before aggregators index it", () => {

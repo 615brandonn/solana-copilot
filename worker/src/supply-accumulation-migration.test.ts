@@ -85,9 +85,10 @@ test("duplicate payload conflicts quarantine evidence and exact replays may enri
     migration,
     /request_fingerprint text not null check \(char_length\(request_fingerprint\) = 64\)/i,
   );
-  assert.match(migration, /encode\(digest\([\s\S]*'sha256'\), 'hex'\)/i);
+  assert.match(migration, /encode\(extensions\.digest\([\s\S]*'sha256'\), 'hex'\)/i);
   const fingerprint =
-    migration.match(/v_fingerprint := encode\(digest\(([\s\S]*?)\), 'hex'\);/i)?.[1] ?? "";
+    migration.match(/v_fingerprint := encode\(extensions\.digest\(([\s\S]*?)\), 'hex'\);/i)?.[1] ??
+    "";
   assert.doesNotMatch(fingerprint, /market_cap|valuation_slot|metadata/i);
   assert.match(migration, /request_fingerprint <> v_fingerprint[\s\S]*quarantined = true/i);
   assert.match(migration, /conflict_count = conflict_count \+ 1/i);

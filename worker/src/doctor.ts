@@ -750,7 +750,7 @@ async function checkSupplyAccumulationSchema(
     minMarketCapUsd < 0 ||
     !Number.isFinite(maxMarketCapUsd) ||
     maxMarketCapUsd <= 0 ||
-    maxMarketCapUsd > 15_000 ||
+    maxMarketCapUsd > 20_000 ||
     minMarketCapUsd >= maxMarketCapUsd ||
     !Number.isInteger(windowSeconds) ||
     windowSeconds < 30 ||

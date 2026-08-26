@@ -22,7 +22,7 @@ test("Supply Accumulation defaults are deployment-safe and exact", () => {
   assert.equal(config.supplyAccumulationThresholdPct, 10);
   assert.equal(config.supplyAccumulationBuyUsd, 20);
   assert.equal(config.supplyAccumulationMinMarketCapUsd, 2_000);
-  assert.equal(config.supplyAccumulationMaxMarketCapUsd, 15_000);
+  assert.equal(config.supplyAccumulationMaxMarketCapUsd, 20_000);
   assert.equal(config.supplyAccumulationWindowSeconds, 600);
   assert.equal(config.supplyAccumulationScale2Enabled, false);
   assert.equal(config.supplyAccumulationScale2ThresholdPct, 12);
@@ -43,14 +43,18 @@ test("Supply Accumulation accepts only the bounded live strategy contract", () =
     supplyAccumulationModeEnabled: true,
   };
   assert.equal(BotConfigSchema.parse(base).supplyAccumulationModeEnabled, true);
+  assert.equal(
+    BotConfigSchema.safeParse({ ...base, supplyAccumulationMaxMarketCapUsd: 20_000 }).success,
+    true,
+  );
 
   for (const patch of [
     { supplyAccumulationThresholdPct: 9.99 },
     { supplyAccumulationThresholdPct: 20.01 },
     { supplyAccumulationBuyUsd: 0 },
-    { supplyAccumulationMinMarketCapUsd: 15_000 },
+    { supplyAccumulationMinMarketCapUsd: 20_000 },
     { supplyAccumulationMinMarketCapUsd: 3_000, supplyAccumulationMaxMarketCapUsd: 2_999 },
-    { supplyAccumulationMaxMarketCapUsd: 15_001 },
+    { supplyAccumulationMaxMarketCapUsd: 20_000.01 },
     { supplyAccumulationWindowSeconds: 29 },
     { supplyAccumulationWindowSeconds: 3_601 },
   ]) {

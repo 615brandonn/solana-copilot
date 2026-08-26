@@ -712,7 +712,7 @@ begin
   end if;
 
   perform pg_advisory_xact_lock(hashtext(p_user_id::text), hashtext(v_mint));
-  v_fingerprint := encode(digest(jsonb_build_object(
+  v_fingerprint := encode(extensions.digest(jsonb_build_object(
     'txSig', v_tx_sig,
     'slot', p_slot,
     'targetWallet', v_target,

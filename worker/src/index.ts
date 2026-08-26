@@ -348,7 +348,7 @@ function supplyAccumulationConfigFingerprint(config: BotConfigRow): string {
     thresholdPct: Number(config.supply_accumulation_threshold_pct ?? 10),
     buyUsd: Number(config.supply_accumulation_buy_usd ?? 20),
     minMarketCapUsd: Number(config.supply_accumulation_min_market_cap_usd ?? 2_000),
-    maxMarketCapUsd: Number(config.supply_accumulation_max_market_cap_usd ?? 15_000),
+    maxMarketCapUsd: Number(config.supply_accumulation_max_market_cap_usd ?? 20_000),
     windowSeconds: Number(config.supply_accumulation_window_seconds ?? 600),
     scales: [2, 3, 4].map((tier) => ({
       tier,
@@ -3491,7 +3491,7 @@ async function main() {
       ) {
         return null;
       }
-      const configuredCap = Math.min(15_000, state.maxMarketCapUsd);
+      const configuredCap = Math.min(20_000, state.maxMarketCapUsd);
       const configuredFloor = Math.max(0, state.minMarketCapUsd);
       const maxSpendLamports = maximumSpendWithSlippageLamports(BigInt(amountLamports), 800);
       if (maxSpendLamports === null) return null;
@@ -3611,7 +3611,7 @@ async function main() {
         return null;
       }
       const configuredFloor = Math.max(0, plan.minMarketCapUsd);
-      const configuredCap = Math.min(15_000, plan.maxMarketCapUsd);
+      const configuredCap = Math.min(20_000, plan.maxMarketCapUsd);
       const maxSpendLamports = maximumSpendWithSlippageLamports(BigInt(amountLamports), 800);
       if (maxSpendLamports === null) return null;
       const currentViewCaps = [curves.confirmedCurve, curves.processedCurve].map((curve) =>
@@ -6095,7 +6095,7 @@ async function main() {
           recordStrategyDecision(
             event,
             "skipped",
-            "supply threshold, confirmed source, or sub-$15k curve gate changed before claim",
+            "supply threshold, confirmed source, or sub-$20k curve gate changed before claim",
             metaPatch,
           );
           return null;
