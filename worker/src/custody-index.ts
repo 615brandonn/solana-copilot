@@ -4,7 +4,7 @@
 import pino from "pino";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { env } from "./env.js";
-import { db } from "./db.js";
+import { createBotDb } from "./db.js";
 import { safeDiagnostic } from "./diagnostics.js";
 import type { FeedEvent } from "./geyser.js";
 import { RpcBackfillPoller, type UnresolvedOutflowEvent } from "./poller.js";
@@ -15,6 +15,9 @@ import { CustodyWatchRegistry } from "./custody-watch-registry.js";
 import { refreshCustodyWalletLearning } from "./custody-learning.js";
 
 const log = pino({ level: env.LOG_LEVEL });
+// Custody is observation-only and can safely wait longer for its serialized
+// per-mint evidence writers. The trading worker retains db.ts's 5s default.
+const db = createBotDb(30_000);
 // Custody accounting deliberately follows a confirmed canonical timeline.
 // The trading worker keeps its independent processed/Geyser path for speed.
 const rpc = new Connection(env.RPC_URL, { commitment: "confirmed" });
@@ -134,7 +137,7 @@ async function main(): Promise<void> {
     pollConcurrency: 16,
     maxWalletsPerPoll: 16,
     deferInitialCursorHydration: true,
-    recoveryConcurrency: 4,
+    recoveryConcurrency: 2,
     signaturePagesPerTurn: 2,
     recoveryChunkSize: 250,
   });
