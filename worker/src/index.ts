@@ -12,6 +12,7 @@ import { FollowerMonitor, type ChainedTransferBatchState } from "./monitor.js";
 import { executeSwap, type ExecuteInput, type ExecuteResult } from "./executor.js";
 import {
   exactRawAmount,
+  rawAmountToUiString,
   rawAmountToUiNumber,
   remainingUiAfterExactExit,
   uiAmountToRawFloor,
@@ -67,7 +68,14 @@ import {
   reachesSupplyThreshold,
   solanaRpcWithTimeout,
   strictestPumpFunMarketCaps,
+  type PumpFunSupplySnapshot,
 } from "./pump-fun-supply.js";
+import {
+  FreshTailClaimBindingRejectedError,
+  createFreshTailEntryStore,
+  freshTailCandidateIsUsable,
+  type FreshTailEntryCandidate,
+} from "./fresh-tail-entry-store.js";
 import {
   SupplyAccumulationStore,
   supplyEventKey,
@@ -141,6 +149,8 @@ type CopyBuyOptions = {
   targetBuyUsd: number | undefined;
   coordinatedWallets?: string[];
   supplyState?: SupplyAccumulationState;
+  /** Frozen finalized custody certificate; initial Supply entries only. */
+  freshTailCandidate?: FreshTailEntryCandidate;
 };
 
 function copyBuyEntryStrategy(options: CopyBuyOptions): AutomaticEntryStrategy {
@@ -166,6 +176,11 @@ type EntryClaimRow = {
   planned_buy_usd?: number | string | null;
   submission_started_at?: string | null;
   created_at?: string | null;
+  fresh_tail_epoch_id?: string | null;
+  fresh_tail_request_id?: string | null;
+  fresh_tail_monitoring_armed_at?: string | null;
+  received_amount_raw?: string | null;
+  received_token_decimals?: number | null;
 };
 
 async function classifyFollowerRecipient(address: string): Promise<RecipientClassification> {
@@ -445,6 +460,7 @@ async function main() {
   const coordinatedBuys = new CoordinatedBuyTracker();
   const supplyAccumulationStore = new SupplyAccumulationStore(db, cfg.user_id);
   const supplyAccumulationScaleStore = new SupplyAccumulationScaleStore(db, cfg.user_id);
+  const freshTailEntryStore = createFreshTailEntryStore(db, cfg.user_id);
 
   // Cumulative USDC the target has committed to each mint over a rolling window
   // (his real conviction). Used by the USDC-conviction gate/sizing when enabled.
@@ -727,7 +743,7 @@ async function main() {
     const sourceTxSig = event.txSig || `slot-${event.slot}`;
     const plannedPositionId = randomUUID();
     const fields =
-      "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig,entry_strategy,source_slot,token_decimals,contributing_wallets,last_valid_block_height,planned_buy_usd,submission_started_at,created_at";
+      "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig,entry_strategy,source_slot,token_decimals,contributing_wallets,last_valid_block_height,planned_buy_usd,submission_started_at,created_at,fresh_tail_epoch_id,fresh_tail_request_id,fresh_tail_monitoring_armed_at,received_amount_raw,received_token_decimals";
     const { data: inserted, error: insertError } = await db
       .from("entry_signal_claims")
       .insert({
@@ -770,7 +786,11 @@ async function main() {
       throw new Error(`entry signal claim recovery failed: ${safeDiagnostic(existingError)}`);
     }
     const existingClaim = existing as EntryClaimRow | null;
-    if (!existingClaim || !canReclaimEntryClaim(existingClaim.status)) {
+    if (
+      !existingClaim ||
+      existingClaim.fresh_tail_request_id ||
+      !canReclaimEntryClaim(existingClaim.status)
+    ) {
       log.warn(
         { mint: event.tokenMint, hasMatchingEventClaim: Boolean(existingClaim) },
         "entry blocked by an existing durable claim",
@@ -786,6 +806,9 @@ async function main() {
         planned_buy_usd: plannedBuyUsd,
         error_code: null,
         bot_tx_sig: null,
+        last_valid_block_height: null,
+        received_amount_raw: null,
+        received_token_decimals: null,
         submission_started_at: null,
         landed_at: null,
         persisted_at: null,
@@ -808,9 +831,23 @@ async function main() {
 
   async function recoverPreparedSupplyEntryClaim(
     claim: EntryClaimRow,
-    existingPositionId?: string,
+    existingPosition?: {
+      id: string;
+      amount_remaining_raw?: string | null;
+    },
   ): Promise<"persisted" | "retryable" | null> {
     if (claim.entry_strategy !== "supply_accumulation" || !claim.bot_tx_sig) return null;
+    const freshTailBindingParts = [
+      claim.fresh_tail_epoch_id,
+      claim.fresh_tail_request_id,
+      claim.fresh_tail_monitoring_armed_at,
+    ];
+    const freshTailBound = freshTailBindingParts.every(
+      (value) => typeof value === "string" && value.length > 0,
+    );
+    if (!freshTailBound && freshTailBindingParts.some((value) => value !== null && value !== undefined)) {
+      return null;
+    }
     const statuses = await solanaRpcWithTimeout(
       rpc.getSignatureStatuses([claim.bot_tx_sig], {
         searchTransactionHistory: true,
@@ -866,15 +903,52 @@ async function main() {
       // landed claim quarantined until its execution-time USD basis exists.
       return null;
     }
-    const entryPriceUsd = nominalBuyUsd / receipt.amountUi;
+    let receivedAmountForLedger: number | string = receipt.amountUi;
+    let receivedUiForMath = receipt.amountUi;
+    if (freshTailBound) {
+      let exactReceivedRaw = claim.received_amount_raw ?? null;
+      let exactReceivedDecimals = claim.received_token_decimals ?? null;
+      if (exactReceivedRaw !== null || exactReceivedDecimals !== null) {
+        if (
+          exactReceivedRaw !== receipt.amountRaw ||
+          exactReceivedDecimals !== receipt.decimals
+        ) {
+          return null;
+        }
+      } else {
+        const recoveredReceipt = await freshTailEntryStore.recordBoundReceipt(
+          {
+            epochId: claim.fresh_tail_epoch_id!,
+            requestId: claim.fresh_tail_request_id!,
+            tokenDecimals,
+          },
+          claim.id,
+          claim.planned_position_id,
+          claim.bot_tx_sig,
+          receipt.amountRaw,
+          receipt.decimals,
+        );
+        exactReceivedRaw = recoveredReceipt.receivedAmountRaw;
+        exactReceivedDecimals = recoveredReceipt.receivedTokenDecimals;
+      }
+      receivedAmountForLedger = rawAmountToUiString(
+        exactReceivedRaw,
+        exactReceivedDecimals,
+      );
+      receivedUiForMath = Number(receivedAmountForLedger);
+    }
+    if (!Number.isFinite(receivedUiForMath) || receivedUiForMath <= 0) return null;
+    const entryPriceUsd = nominalBuyUsd / receivedUiForMath;
     if (!Number.isFinite(entryPriceUsd) || entryPriceUsd <= 0) return null;
     const contributingWallets = Array.from(
       new Set([claim.source_wallet, ...(claim.contributing_wallets ?? [])]),
     );
     const observedAt = claim.created_at ?? new Date().toISOString();
-    const position = existingPositionId
-      ? { id: existingPositionId }
-      : await retryDb<{ id: string } | null>("recover prepared supply position", () =>
+    const position = existingPosition
+      ? existingPosition
+      : await retryDb<{ id: string; amount_remaining_raw?: string | null } | null>(
+          "recover prepared supply position",
+          () =>
           db
             .from("positions")
             .upsert(
@@ -884,8 +958,11 @@ async function main() {
                 token_mint: claim.token_mint,
                 entry_price_usd: entryPriceUsd,
                 bot_cost_basis_usd: nominalBuyUsd,
-                amount_tokens: receipt.amountUi,
-                amount_remaining: receipt.amountUi,
+                amount_tokens: receivedAmountForLedger,
+                amount_remaining: receivedAmountForLedger,
+                ...(freshTailBound
+                  ? { amount_remaining_raw: claim.received_amount_raw ?? receipt.amountRaw }
+                  : {}),
                 decimals: tokenDecimals,
                 mirrored_sold_fraction: 0,
                 tp_taken: false,
@@ -900,10 +977,16 @@ async function main() {
               },
               { onConflict: "id" },
             )
-            .select("id")
+            .select("id,amount_remaining_raw")
             .maybeSingle(),
         );
     if (!position) return null;
+    if (
+      freshTailBound &&
+      position.amount_remaining_raw !== (claim.received_amount_raw ?? receipt.amountRaw)
+    ) {
+      return null;
+    }
     supplyEntryPositionCache.set(position.id, true);
 
     for (const wallet of contributingWallets) {
@@ -931,7 +1014,7 @@ async function main() {
         position_id: position.id,
         side: "buy",
         token_mint: claim.token_mint,
-        amount_tokens: receipt.amountUi,
+        amount_tokens: receivedAmountForLedger,
         amount_usd: nominalBuyUsd,
         price_usd: entryPriceUsd,
         tx_sig: claim.bot_tx_sig,
@@ -958,7 +1041,7 @@ async function main() {
     await updateEntryClaim(claim.id, {
       status: "persisted",
       error_code: null,
-      landed_at: new Date().toISOString(),
+      ...(freshTailBound ? {} : { landed_at: new Date().toISOString() }),
       persisted_at: new Date().toISOString(),
     });
     schedulePendingEntrySellDrain(claim.token_mint);
@@ -973,7 +1056,7 @@ async function main() {
         db
           .from("entry_signal_claims")
           .select(
-            "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig,entry_strategy,source_slot,token_decimals,contributing_wallets,last_valid_block_height,planned_buy_usd,submission_started_at,created_at",
+            "id,user_id,source_tx_sig,source_wallet,token_mint,planned_position_id,entry_mode,amount_lamports,status,bot_tx_sig,entry_strategy,source_slot,token_decimals,contributing_wallets,last_valid_block_height,planned_buy_usd,submission_started_at,created_at,fresh_tail_epoch_id,fresh_tail_request_id,fresh_tail_monitoring_armed_at,received_amount_raw,received_token_decimals",
           )
           .eq("user_id", cfg.user_id)
           .in("status", ["claimed", "submitted", "landed", "uncertain"])
@@ -986,7 +1069,7 @@ async function main() {
           uncertainEntryMints.add(claim.token_mint);
           const { data: position, error: positionError } = await db
             .from("positions")
-            .select("id,token_mint,entry_tx_sig")
+            .select("id,token_mint,entry_tx_sig,amount_remaining_raw")
             .eq("user_id", cfg.user_id)
             .eq("id", claim.planned_position_id)
             .maybeSingle();
@@ -1051,7 +1134,18 @@ async function main() {
           // Run it before the generic exact-position shortcut so a crash between
           // any two of those writes cannot leave a partially armed position.
           if (preparedSupplyClaim && (!position || positionMatchesClaim)) {
-            const supplyRecovery = await recoverPreparedSupplyEntryClaim(claim, position?.id);
+            const supplyRecovery = await recoverPreparedSupplyEntryClaim(
+              claim,
+              position
+                ? {
+                    id: position.id,
+                    amount_remaining_raw:
+                      typeof position.amount_remaining_raw === "string"
+                        ? position.amount_remaining_raw
+                        : null,
+                  }
+                : undefined,
+            );
             if (supplyRecovery) {
               uncertainEntryMints.delete(claim.token_mint);
               resolved += 1;
@@ -1855,6 +1949,34 @@ async function main() {
     }
   };
   void startGeyserUntilConnected();
+
+  let freshTailEntryPollRunning = false;
+  const pollFreshTailEntries = async () => {
+    if (
+      freshTailEntryPollRunning ||
+      !cfg.enabled ||
+      entryConfigTransitioning ||
+      automaticEntryStrategy(cfg) !== "supply_accumulation" ||
+      cfg.supply_accumulation_mode_enabled !== true ||
+      cfg.custody_journey_enabled !== true
+    ) {
+      return;
+    }
+    freshTailEntryPollRunning = true;
+    try {
+      const candidates = await freshTailEntryStore.loadCandidates(25);
+      await Promise.all(candidates.map((candidate) => processFreshTailEntryCandidate(candidate)));
+    } catch (err) {
+      log.error(
+        { err: safeDiagnostic(err) },
+        "fresh-tail entry poll failed closed; no candidate was authorized",
+      );
+    } finally {
+      freshTailEntryPollRunning = false;
+    }
+  };
+  void pollFreshTailEntries();
+  setInterval(() => void pollFreshTailEntries(), 250);
 
   const runFollowerBalanceReconciliation = () => {
     followerBalanceReconciler
@@ -3326,6 +3448,107 @@ async function main() {
     }
   }
 
+  function freshTailCandidateEvent(candidate: FreshTailEntryCandidate): SwapEvent {
+    return {
+      kind: "swap",
+      wallet: candidate.targetWallet,
+      side: "buy",
+      tokenMint: candidate.tokenMint,
+      amountTokens: rawAmountToUiNumber(candidate.amountRaw, candidate.decimals),
+      amountRaw: candidate.amountRaw,
+      grossAmountTokens: rawAmountToUiNumber(candidate.amountRaw, candidate.decimals),
+      grossAmountRaw: candidate.amountRaw,
+      decimals: candidate.decimals,
+      solDelta: 0,
+      slot: candidate.slot,
+      txSig: candidate.txSig,
+      timestampMs: Date.parse(candidate.triggerBlockTime),
+      blockTimeMs: Date.parse(candidate.triggerBlockTime),
+      observedAtMs: Date.parse(candidate.proofObservedAt),
+      delivery: "catchup",
+      source: "rpc",
+      isPumpFun: true,
+      verifiedSwap: true,
+    };
+  }
+
+  function freshTailCandidateMatchesCurrentConfig(
+    candidate: FreshTailEntryCandidate,
+    event: SwapEvent,
+  ): boolean {
+    const configuredRoots = configuredTargetWallets(cfg).sort();
+    const candidateRoots = [...candidate.rootWallets].sort();
+    const triggerAt = Date.parse(candidate.triggerBlockTime);
+    const windowAt = Date.parse(candidate.windowStartedAt);
+    return (
+      cfg.supply_accumulation_mode_enabled === true &&
+      cfg.custody_journey_enabled === true &&
+      configuredRoots.length === 3 &&
+      configuredRoots.every((root, index) => root === candidateRoots[index]) &&
+      candidate.thresholdPct === Number(cfg.supply_accumulation_threshold_pct ?? 10) &&
+      candidate.minMarketCapUsd ===
+        Number(cfg.supply_accumulation_min_market_cap_usd ?? 2_000) &&
+      candidate.maxMarketCapUsd ===
+        Number(cfg.supply_accumulation_max_market_cap_usd ?? 20_000) &&
+      Number.isFinite(triggerAt) &&
+      Number.isFinite(windowAt) &&
+      triggerAt - windowAt ===
+        Number(cfg.supply_accumulation_window_seconds ?? 600) * 1_000 &&
+      event.wallet === candidate.targetWallet &&
+      event.tokenMint === candidate.tokenMint &&
+      event.txSig === candidate.txSig &&
+      event.slot === candidate.slot &&
+      event.decimals === candidate.decimals &&
+      event.amountRaw === candidate.amountRaw &&
+      event.blockTimeMs === triggerAt
+    );
+  }
+
+  function freshTailCurveMatchesCandidate(
+    curve: PumpFunSupplySnapshot,
+    candidate: FreshTailEntryCandidate,
+  ): boolean {
+    return (
+      curve.mint === candidate.tokenMint &&
+      curve.observedSlot >= candidate.requestedHeadSlot &&
+      curve.complete === false &&
+      curve.totalSupplyRaw.toString() === candidate.totalSupplyRaw &&
+      curve.decimals === candidate.decimals &&
+      curve.createVariant === candidate.createVariant &&
+      curve.tokenProgram === candidate.tokenProgram &&
+      curve.creator === candidate.creator &&
+      curve.mintLayoutFingerprint === candidate.mintLayoutFingerprint
+    );
+  }
+
+  async function loadFreshTailCurveViews(candidate: FreshTailEntryCandidate) {
+    const [confirmedCurve, processedCurve] = await Promise.all([
+      loadPumpFunSupplySnapshot(rpc, candidate.tokenMint, {
+        commitment: "confirmed",
+        minContextSlot: candidate.requestedHeadSlot,
+      }),
+      loadPumpFunSupplySnapshot(rpc, candidate.tokenMint, {
+        commitment: "processed",
+        minContextSlot: candidate.requestedHeadSlot,
+      }),
+    ]);
+    if (
+      !confirmedCurve ||
+      !processedCurve ||
+      !freshTailCurveMatchesCandidate(confirmedCurve, candidate) ||
+      !freshTailCurveMatchesCandidate(processedCurve, candidate) ||
+      confirmedCurve.totalSupplyRaw !== processedCurve.totalSupplyRaw ||
+      confirmedCurve.decimals !== processedCurve.decimals ||
+      confirmedCurve.createVariant !== processedCurve.createVariant ||
+      confirmedCurve.tokenProgram !== processedCurve.tokenProgram ||
+      confirmedCurve.creator !== processedCurve.creator ||
+      confirmedCurve.mintLayoutFingerprint !== processedCurve.mintLayoutFingerprint
+    ) {
+      return null;
+    }
+    return { confirmedCurve, processedCurve };
+  }
+
   async function loadSupplyCurveViews(event: SwapEvent) {
     const [confirmedCurve, processedCurve] = await Promise.all([
       loadPumpFunSupplySnapshot(rpc, event.tokenMint, {
@@ -3565,6 +3788,93 @@ async function main() {
         projectedPostBuyMarketCapUsd: caps.projectedPostBuyMarketCapUsd,
       };
     });
+  }
+
+  type FreshTailSubmissionValidation = {
+    candidate: FreshTailEntryCandidate;
+    currentMarketCapUsd: number;
+    projectedPostBuyMarketCapUsd: number;
+  };
+
+  async function validateFreshTailEntrySubmission(
+    event: SwapEvent,
+    candidate: FreshTailEntryCandidate,
+    amountLamports: number,
+    claimId: string | null,
+  ): Promise<FreshTailSubmissionValidation | null> {
+    if (
+      !cfg.enabled ||
+      entryConfigTransitioning ||
+      automaticEntryStrategy(cfg) !== "supply_accumulation" ||
+      currentEntryMonitoringGate().blocked ||
+      !Number.isSafeInteger(amountLamports) ||
+      amountLamports <= 0 ||
+      !freshTailCandidateIsUsable(candidate) ||
+      !isFreshAutomaticAction(event, SUPPLY_SCALE_ACTION_DEADLINE_MS) ||
+      !freshTailCandidateMatchesCurrentConfig(candidate, event)
+    ) {
+      return null;
+    }
+
+    // The database gate proves the exact finalized head/custody fixed point.
+    // With claimId set, it additionally requires the bound claim to be in the
+    // submitted state with this worker's locally signed signature persisted.
+    const rechecked = await freshTailEntryStore.recheck(candidate, claimId);
+    if (
+      !rechecked ||
+      !freshTailCandidateIsUsable(rechecked) ||
+      !freshTailCandidateMatchesCurrentConfig(rechecked, event)
+    ) {
+      return null;
+    }
+    const solPrice = await priceUsd(WSOL);
+    if (solPrice === undefined) return null;
+
+    // Submission sees both a confirmed state and the newest processed state;
+    // either completed or identity-changing curve closes the gate.
+    const curves = await loadFreshTailCurveViews(rechecked);
+    if (!curves) return null;
+    // Curve/price I/O consumed time in which the finalized observer may have
+    // persisted a sell, unresolved outflow, or parser conflict. Re-acquire the
+    // exact database certificate after those awaits. Everything below this
+    // point is synchronous, so beforeSubmit cannot authorize from a custody
+    // snapshot that predates its own market reads.
+    const finalCertificate = await freshTailEntryStore.recheck(rechecked, claimId);
+    if (!finalCertificate) return null;
+    const maxSpendLamports = maximumSpendWithSlippageLamports(BigInt(amountLamports), 800);
+    if (maxSpendLamports === null) return null;
+    const configuredFloor = Math.max(0, finalCertificate.minMarketCapUsd);
+    const configuredCap = Math.min(20_000, finalCertificate.maxMarketCapUsd);
+    const currentViewCaps = [curves.confirmedCurve, curves.processedCurve].map((curve) =>
+      pumpFunCurrentMarketCapUsd(curve, solPrice),
+    );
+    const caps = strictestPumpFunMarketCaps(
+      [curves.confirmedCurve, curves.processedCurve],
+      solPrice,
+      maxSpendLamports,
+      configuredCap,
+    );
+    if (
+      currentViewCaps.some(
+        (marketCap) => marketCap === undefined || marketCap < configuredFloor,
+      ) ||
+      !caps?.belowCap ||
+      caps.currentMarketCapUsd < configuredFloor ||
+      !freshTailCandidateIsUsable(finalCertificate) ||
+      !isFreshAutomaticAction(event, SUPPLY_SCALE_ACTION_DEADLINE_MS) ||
+      !freshTailCandidateMatchesCurrentConfig(finalCertificate, event) ||
+      !cfg.enabled ||
+      entryConfigTransitioning ||
+      automaticEntryStrategy(cfg) !== "supply_accumulation" ||
+      currentEntryMonitoringGate().blocked
+    ) {
+      return null;
+    }
+    return {
+      candidate: finalCertificate,
+      currentMarketCapUsd: caps.currentMarketCapUsd,
+      projectedPostBuyMarketCapUsd: caps.projectedPostBuyMarketCapUsd,
+    };
   }
 
   type SupplyScaleSubmissionValidation = {
@@ -4194,6 +4504,32 @@ async function main() {
         };
       }),
     );
+  }
+
+  async function processFreshTailEntryCandidate(
+    candidate: FreshTailEntryCandidate,
+  ): Promise<void> {
+    const event = freshTailCandidateEvent(candidate);
+    if (
+      !freshTailCandidateIsUsable(candidate) ||
+      !freshTailCandidateMatchesCurrentConfig(candidate, event) ||
+      !isFreshAutomaticAction(event, SUPPLY_SCALE_ACTION_DEADLINE_MS)
+    ) {
+      return;
+    }
+    await tradeExecutionQueue.run(candidate.tokenMint, async () => {
+      // This route is intentionally initial-entry-only. tryCopyBuyLocked's
+      // existing open-position and already-traded guards reject it rather than
+      // forwarding a fresh certificate into the scale engine.
+      await tryCopyBuyLocked(event, "fresh finalized custody accumulation threshold reached", {
+        entryStrategy: "supply_accumulation",
+        entryMode: "regular",
+        firstBuy: false,
+        targetBuyUsd: undefined,
+        coordinatedWallets: candidate.rootWallets,
+        freshTailCandidate: candidate,
+      });
+    });
   }
 
   function convictionEventIdentity(event: FeedEvent, suffix: string): string {
@@ -5966,9 +6302,13 @@ async function main() {
     }
 
     const supplyEntry = expectedStrategy === "supply_accumulation";
+    const freshTailEntry = supplyEntry && options.freshTailCandidate !== undefined;
     const meta: TokenMeta = supplyEntry
       ? {
-          marketCapUsd: options.supplyState?.latestMarketCapUsd ?? undefined,
+          marketCapUsd:
+            options.freshTailCandidate?.marketCapUsd ??
+            options.supplyState?.latestMarketCapUsd ??
+            undefined,
           isPumpFun: true,
           socials: {},
         }
@@ -6028,7 +6368,7 @@ async function main() {
     const decision = supplyEntry
       ? prior !== null
         ? ({ pass: false, reason: "already traded this token" } as const)
-        : options.supplyState?.entryReady === true
+        : freshTailEntry || options.supplyState?.entryReady === true
           ? ({ pass: true } as const)
           : ({ pass: false, reason: "supply accumulation state is not entry-ready" } as const)
       : options.entryMode === "coordinated"
@@ -6131,25 +6471,58 @@ async function main() {
       }
       const amountLamports = Math.floor((buyUsd / solPrice) * 1e9);
       if (supplyEntry) {
-        const validation = await validateSupplyAccumulationSubmission(event, amountLamports, true);
-        if (!validation) {
-          recordStrategyDecision(
+        if (options.freshTailCandidate) {
+          const validation = await validateFreshTailEntrySubmission(
             event,
-            "skipped",
-            "supply threshold, confirmed source, or sub-$20k curve gate changed before claim",
-            metaPatch,
+            options.freshTailCandidate,
+            amountLamports,
+            null,
           );
-          return null;
+          if (!validation) {
+            recordStrategyDecision(
+              event,
+              "skipped",
+              "fresh custody certificate or dual sub-$20k Pump curve gate changed before claim",
+              metaPatch,
+            );
+            return null;
+          }
+          options.freshTailCandidate = validation.candidate;
+          options.coordinatedWallets = validation.candidate.rootWallets;
+          metaPatch.market_cap_usd = validation.currentMarketCapUsd;
+          metaPatch.metadata = {
+            ...(metaPatch.metadata ?? {}),
+            freshTailEpochId: validation.candidate.epochId,
+            freshTailRequestId: validation.candidate.requestId,
+            netSupplyPct: validation.candidate.netSupplyPct,
+            thresholdPct: validation.candidate.thresholdPct,
+            projectedPostBuyMarketCapUsd: validation.projectedPostBuyMarketCapUsd,
+          };
+        } else {
+          const validation = await validateSupplyAccumulationSubmission(
+            event,
+            amountLamports,
+            true,
+          );
+          if (!validation) {
+            recordStrategyDecision(
+              event,
+              "skipped",
+              "supply threshold, confirmed source, or sub-$20k curve gate changed before claim",
+              metaPatch,
+            );
+            return null;
+          }
+          options.supplyState = validation.state;
+          options.coordinatedWallets = validation.state.rootWallets;
+          metaPatch.market_cap_usd = validation.currentMarketCapUsd;
+          metaPatch.metadata = {
+            ...(metaPatch.metadata ?? {}),
+            netSupplyPct: validation.state.netSupplyPct,
+            thresholdPct: validation.state.thresholdPct,
+            projectedPostBuyMarketCapUsd: validation.projectedPostBuyMarketCapUsd,
+          };
         }
-        options.supplyState = validation.state;
-        options.coordinatedWallets = validation.state.rootWallets;
-        metaPatch.market_cap_usd = validation.currentMarketCapUsd;
-        metaPatch.metadata = {
-          ...(metaPatch.metadata ?? {}),
-          netSupplyPct: validation.state.netSupplyPct,
-          thresholdPct: validation.state.thresholdPct,
-          projectedPostBuyMarketCapUsd: validation.projectedPostBuyMarketCapUsd,
-        };
       }
       if (!cfg.enabled) {
         log.info(
@@ -6206,6 +6579,34 @@ async function main() {
         return null;
       }
       uncertainEntryMints.add(event.tokenMint);
+      if (options.freshTailCandidate) {
+        try {
+          await freshTailEntryStore.bindClaim(
+            options.freshTailCandidate,
+            entryClaim.id,
+            entryClaim.planned_position_id,
+          );
+        } catch (err) {
+          if (err instanceof FreshTailClaimBindingRejectedError) {
+            await updateEntryClaim(entryClaim.id, {
+              status: "failed_pre_submit",
+              error_code: `fresh-tail-binding-${err.reason}`,
+            });
+            uncertainEntryMints.delete(event.tokenMint);
+            recordStrategyDecision(
+              event,
+              "skipped",
+              `fresh custody claim could not be armed: ${err.reason}`,
+              metaPatch,
+            );
+            return null;
+          }
+          // A lost RPC response may have committed the binding. Keep this mint
+          // quarantined and let startup reconciliation inspect the durable row;
+          // never downgrade an ambiguous bind to a retryable claim.
+          throw err;
+        }
+      }
       const entrySubmissionStartedAt = new Date().toISOString();
       await beginEntryClaimSubmission(entryClaim.id, entrySubmissionStartedAt);
 
@@ -6298,14 +6699,26 @@ async function main() {
               !currentEntryMonitoringGate().blocked;
             if (!genericGate) return false;
             if (!supplyEntry) return true;
-            const validation = await validateSupplyAccumulationSubmission(
-              event,
-              amountLamports,
-              false,
-            );
-            if (!validation) return false;
-            options.supplyState = validation.state;
-            options.coordinatedWallets = validation.state.rootWallets;
+            if (options.freshTailCandidate) {
+              const validation = await validateFreshTailEntrySubmission(
+                event,
+                options.freshTailCandidate,
+                amountLamports,
+                entryClaim.id,
+              );
+              if (!validation) return false;
+              options.freshTailCandidate = validation.candidate;
+              options.coordinatedWallets = validation.candidate.rootWallets;
+            } else {
+              const validation = await validateSupplyAccumulationSubmission(
+                event,
+                amountLamports,
+                false,
+              );
+              if (!validation) return false;
+              options.supplyState = validation.state;
+              options.coordinatedWallets = validation.state.rootWallets;
+            }
             return (
               cfg.enabled === true &&
               !entryConfigTransitioning &&
@@ -6353,12 +6766,44 @@ async function main() {
         );
         throw err;
       }
-      await updateEntryClaim(entryClaim.id, {
-        status: "landed",
-        bot_tx_sig: result.txSig,
-        error_code: null,
-        landed_at: new Date().toISOString(),
-      });
+      let receivedAmountForLedger: number | string = result.outUiAmount ?? 0;
+      let receivedUiForMath = Number(receivedAmountForLedger);
+      let receivedAmountRawForPosition: string | null = null;
+      if (options.freshTailCandidate) {
+        if (
+          typeof result.outRawAmount !== "string" ||
+          !/^[1-9][0-9]*$/.test(result.outRawAmount) ||
+          result.outDecimals !== event.decimals
+        ) {
+          // executeSwap already proved the signature landed. Missing exact
+          // receipt data is therefore recovery work, never a retryable buy.
+          throw new Error("fresh-tail landed buy is missing its exact Pump token receipt");
+        }
+        const exactReceipt = await freshTailEntryStore.recordReceipt(
+          options.freshTailCandidate,
+          entryClaim.id,
+          entryClaim.planned_position_id,
+          result.txSig,
+          result.outRawAmount,
+          result.outDecimals,
+        );
+        receivedAmountForLedger = rawAmountToUiString(
+          exactReceipt.receivedAmountRaw,
+          exactReceipt.receivedTokenDecimals,
+        );
+        receivedAmountRawForPosition = exactReceipt.receivedAmountRaw;
+        receivedUiForMath = Number(receivedAmountForLedger);
+      } else {
+        await updateEntryClaim(entryClaim.id, {
+          status: "landed",
+          bot_tx_sig: result.txSig,
+          error_code: null,
+          landed_at: new Date().toISOString(),
+        });
+      }
+      if (!Number.isFinite(receivedUiForMath) || receivedUiForMath <= 0) {
+        throw new Error("landed copy buy has no positive representable token receipt");
+      }
       recordStrategyDecision(event, "copied", "copy buy landed; saving position", {
         ...metaPatch,
         amount_usd: options.targetBuyUsd,
@@ -6368,19 +6813,22 @@ async function main() {
         metadata: {
           ...metaPatch.metadata,
           configuredBuyUsd: buyUsd,
-          receivedTokens: result.outUiAmount,
+          receivedTokens: receivedAmountForLedger,
           route: result.route,
           persistencePending: true,
         },
       });
 
-      const receivedUi = result.outUiAmount ?? 0;
       const entryPrice =
-        receivedUi > 0 ? buyUsd / receivedUi : ((await priceUsd(event.tokenMint)) ?? 0);
+        receivedUiForMath > 0
+          ? buyUsd / receivedUiForMath
+          : ((await priceUsd(event.tokenMint)) ?? 0);
       const targetBuyAt = new Date(event.timestampMs).toISOString();
 
       const positionId = entryClaim.planned_position_id;
-      const pos = await retryDb<{ id: string } | null>("save landed copy-buy position", () =>
+      const pos = await retryDb<{ id: string; amount_remaining_raw?: string | null } | null>(
+        "save landed copy-buy position",
+        () =>
         db
           .from("positions")
           .upsert(
@@ -6390,8 +6838,11 @@ async function main() {
               token_mint: event.tokenMint,
               entry_price_usd: entryPrice,
               ...(supplyEntry ? { bot_cost_basis_usd: buyUsd } : {}),
-              amount_tokens: receivedUi,
-              amount_remaining: receivedUi,
+              amount_tokens: receivedAmountForLedger,
+              amount_remaining: receivedAmountForLedger,
+              ...(receivedAmountRawForPosition
+                ? { amount_remaining_raw: receivedAmountRawForPosition }
+                : {}),
               decimals: event.decimals,
               mirrored_sold_fraction: 0,
               tp_taken: false,
@@ -6406,13 +6857,19 @@ async function main() {
             },
             { onConflict: "id" },
           )
-          .select("id")
+          .select("id,amount_remaining_raw")
           .maybeSingle(),
       );
       if (!pos) {
         throw new Error(
           `copy buy ${result.txSig} landed but position ${positionId} could not be read back`,
         );
+      }
+      if (
+        receivedAmountRawForPosition !== null &&
+        pos.amount_remaining_raw !== receivedAmountRawForPosition
+      ) {
+        throw new Error("fresh-tail position exact raw receipt did not persist atomically");
       }
       if (supplyEntry) supplyEntryPositionCache.set(pos.id, true);
       const linkedTargets = new Set([event.wallet, ...(options.coordinatedWallets ?? [])]);
@@ -6435,7 +6892,7 @@ async function main() {
         position_id: pos.id,
         side: "buy",
         token_mint: event.tokenMint,
-        amount_tokens: receivedUi,
+        amount_tokens: receivedAmountForLedger,
         amount_usd: buyUsd,
         tx_sig: result.txSig,
         reason,
@@ -6528,7 +6985,7 @@ async function main() {
         metadata: {
           ...metaPatch.metadata,
           configuredBuyUsd: buyUsd,
-          receivedTokens: receivedUi,
+          receivedTokens: receivedAmountForLedger,
           entryPriceUsd: entryPrice,
           route: result.route,
           persistencePending: false,
