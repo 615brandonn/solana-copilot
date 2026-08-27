@@ -249,13 +249,24 @@ test("fresh landing and recovery use the exact frozen receipt before numeric led
   assert.match(recovery, /amount_remaining: receivedAmountForLedger/);
 });
 
-test("legacy Supply initial, scale, and exit routes remain present", () => {
+test("legacy Supply remains observation/scale-only while fresh-tail owns every initial entry", () => {
   const supply = section(
     "async function processSupplyAccumulationTargetBuy",
     "async function classifyTransferRecipients",
   );
   assert.match(supply, /executeSupplyScaleInLocked/);
-  assert.match(supply, /await tryCopyBuyLocked/);
+  assert.doesNotMatch(supply, /tryCopyBuyLocked/);
+  assert.match(
+    supply,
+    /legacy Supply observation stored; finalized fresh-tail candidate poll owns initial entries/,
+  );
+  assert.match(supply, /initialEntryOwner: "finalized_fresh_tail_candidate_poll"/);
+  const freshCandidate = section(
+    "async function processFreshTailEntryCandidate",
+    "function convictionEventIdentity",
+  );
+  assert.match(freshCandidate, /await tryCopyBuyLocked/);
+  assert.match(freshCandidate, /freshTailCandidate: candidate/);
   const copy = section("async function tryCopyBuyLocked", 'process.on("unhandledRejection"');
   assert.match(copy, /validateSupplyAccumulationSubmission\(/);
   assert.match(copy, /processDurableSupplySells\(/);

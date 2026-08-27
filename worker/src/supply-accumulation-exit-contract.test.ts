@@ -11,7 +11,7 @@ function section(startMarker: string, endMarker: string): string {
   return workerSource.slice(start, end);
 }
 
-test("Supply Accumulation enters through the durable regular-position contract", () => {
+test("fresh-tail Supply enters through the durable regular-position contract", () => {
   const claimOwnership = section(
     "async function beginEntryClaimSubmission",
     "async function claimEntrySubmission",
@@ -28,9 +28,16 @@ test("Supply Accumulation enters through the durable regular-position contract",
     "async function processSupplyAccumulationTargetBuy",
     "async function classifyTransferRecipients",
   );
-  assert.match(supply, /entryStrategy: "supply_accumulation"/);
-  assert.match(supply, /entryMode: "regular"/);
-  assert.match(supply, /coordinatedWallets: state\.rootWallets/);
+  assert.doesNotMatch(supply, /tryCopyBuyLocked/);
+  assert.match(supply, /finalized fresh-tail candidate poll owns initial entries/);
+  const freshCandidate = section(
+    "async function processFreshTailEntryCandidate",
+    "function convictionEventIdentity",
+  );
+  assert.match(freshCandidate, /entryStrategy: "supply_accumulation"/);
+  assert.match(freshCandidate, /entryMode: "regular"/);
+  assert.match(freshCandidate, /coordinatedWallets: candidate\.rootWallets/);
+  assert.match(freshCandidate, /freshTailCandidate: candidate/);
 
   const copy = section("async function tryCopyBuy", 'process.on("unhandledRejection"');
   assert.match(

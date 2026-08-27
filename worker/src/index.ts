@@ -5254,14 +5254,25 @@ async function main() {
         await executeSupplyScaleInLocked(event, openPosition.id, supplyEventKey(event));
         return;
       }
-      await tryCopyBuyLocked(event, "market-maker supply accumulation threshold reached", {
-        entryStrategy: "supply_accumulation",
-        entryMode: "regular",
-        firstBuy: resolvedFirstBuy,
-        targetBuyUsd: undefined,
-        coordinatedWallets: state.rootWallets,
-        supplyState: state,
-      });
+      // Initial Supply entries are exclusively authorized by the isolated
+      // finalized fresh-tail candidate poll in this release. Keep the legacy
+      // ledger hot for learning and preserve its exact open-position scale
+      // path above, but never fall back to an initial buy if fresh-tail schema,
+      // coverage, or runtime health is unavailable.
+      recordStrategyDecision(
+        event,
+        "tracked",
+        "legacy Supply observation stored; finalized fresh-tail candidate poll owns initial entries",
+        {
+          market_cap_usd: state.latestMarketCapUsd ?? undefined,
+          metadata: {
+            ...metadata,
+            actionable: false,
+            firstBuy: resolvedFirstBuy,
+            initialEntryOwner: "finalized_fresh_tail_candidate_poll",
+          },
+        },
+      );
     });
   }
 
