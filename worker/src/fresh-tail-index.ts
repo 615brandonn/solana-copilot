@@ -221,7 +221,7 @@ async function main(): Promise<void> {
     try {
       const config = await loadConfig();
       const result = await observer.cycle(config);
-      log.info(
+      log.debug(
         {
           status: result.status,
           epochId: result.epochId,

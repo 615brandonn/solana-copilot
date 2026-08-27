@@ -19,6 +19,7 @@ test("fresh-tail process is observation-only and defaults to shadow mode", () =>
   assert.match(indexSource, /FRESH_TAIL_SHADOW:[\s\S]*value !== "false" && value !== "0"/);
   assert.match(indexSource, /randomUUID\(\)/);
   assert.match(indexSource, /no trading path was invoked/);
+  assert.match(indexSource, /log\.debug\([\s\S]*"fresh-tail cycle complete"/);
 });
 
 test("epoch activation is impossible while global Entries is enabled", () => {
