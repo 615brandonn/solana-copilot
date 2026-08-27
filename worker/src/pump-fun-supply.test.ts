@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   confirmedSourceIsFresh,
+  decodeReviewedPumpFunSupplyAccounts,
   exactSupplyShareBps,
   loadConfirmedSourceTransaction,
+  loadPumpFunSupplySnapshot,
   maximumSpendWithSlippageLamports,
   projectedPumpFunMarketCaps,
   pumpFunTokenPriceUsd,
@@ -11,7 +13,18 @@ import {
   strictestPumpFunMarketCaps,
   type PumpFunSupplySnapshot,
 } from "./pump-fun-supply.js";
-import type { Connection } from "@solana/web3.js";
+import { PublicKey, type Connection } from "@solana/web3.js";
+import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+
+const REAL_V2_MINT = new PublicKey("Fw5xoxp3JYrW1ELUCQ98t3MvRiMKSFk7WBEsMs8Gpump");
+const REAL_V2_MINT_DATA = Buffer.from(
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIDGpH6NAwAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARIAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAN3el2sNX+izp+oW0dQhauLHIpS22qs/E1Bl/e/21dyfEwCgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3d6Xaw1f6LOn6hbR1CFq4scilLbaqz8TUGX97/bV3J8VAAAAU1RBUlQgREVWVklORyBXSVRIIDMwBQAAAERFTlpBNgAAAGh0dHBzOi8vbWV0YWRhdGEuajd0cmFja2VyLmlvL21ldGFkYXRhL29kTHNDRUsyWUcuanNvbgAAAAA=",
+  "base64",
+);
+const REAL_V2_CURVE_115 = Buffer.from(
+  "F7f4N2DYrGBkRMAI684DAM796v0GAAAAZKytvFnQAgDOUccBAAAAAACAxqR+jQMAAGox52y3xlaaRuCdHzLlDxg2g94XyItFoIdgXyLdscXbAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  "base64",
+);
 
 const snapshot: PumpFunSupplySnapshot = {
   mint: "mint",
@@ -21,8 +34,73 @@ const snapshot: PumpFunSupplySnapshot = {
   virtualTokenReservesRaw: 1_073_000_000_000_000n,
   virtualSolReservesLamports: 30_000_000_000n,
   realTokenReservesRaw: 793_100_000_000_000n,
+  realSolReservesLamports: 0n,
   complete: false,
 };
+
+test("reviewed shared loader accepts active Token-2022 Pump state at confirmed/processed", async () => {
+  const commitments: string[] = [];
+  const connection = {
+    async getMultipleAccountsInfoAndContext(_keys: PublicKey[], config: any) {
+      commitments.push(config.commitment);
+      return {
+        context: { slot: 441_792_999 },
+        value: [
+          {
+            owner: new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+            data: REAL_V2_CURVE_115,
+          },
+          { owner: TOKEN_2022_PROGRAM_ID, data: REAL_V2_MINT_DATA },
+        ],
+      } as any;
+    },
+  } as unknown as Connection;
+  for (const commitment of ["confirmed", "processed"] as const) {
+    const loaded = await loadPumpFunSupplySnapshot(connection, REAL_V2_MINT.toBase58(), {
+      commitment,
+      minContextSlot: 441_792_999,
+    });
+    assert.ok(loaded);
+    assert.equal(loaded.complete, false);
+    assert.equal(loaded.createVariant, "create_v2_token2022");
+    assert.equal(loaded.tokenProgram, TOKEN_2022_PROGRAM_ID.toBase58());
+    assert.equal(loaded.totalSupplyRaw, 1_000_000_000_000_000n);
+    assert.equal(loaded.decimals, 6);
+    assert.match(loaded.curveStateFingerprint ?? "", /^[0-9a-f]{64}$/);
+  }
+  assert.deepEqual(commitments, ["confirmed", "processed"]);
+});
+
+test("reviewed shared loader accepts 115/zero-tail 151 curves and rejects unknown tail use", () => {
+  const account = (curveData: Buffer, mintData = REAL_V2_MINT_DATA) =>
+    decodeReviewedPumpFunSupplyAccounts(
+      REAL_V2_MINT,
+      {
+        owner: new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+        data: curveData,
+      },
+      { owner: TOKEN_2022_PROGRAM_ID, data: mintData },
+      441_792_999,
+    );
+  assert.ok(account(REAL_V2_CURVE_115));
+  assert.ok(account(Buffer.concat([REAL_V2_CURVE_115, Buffer.alloc(36)])));
+  const futureTail = Buffer.concat([REAL_V2_CURVE_115, Buffer.alloc(36)]);
+  futureTail[150] = 1;
+  assert.equal(account(futureTail), null);
+
+  const wrongSupply = Buffer.from(REAL_V2_MINT_DATA);
+  wrongSupply.writeBigUInt64LE(999n, 36);
+  assert.equal(account(REAL_V2_CURVE_115, wrongSupply), null);
+  const wrongDecimals = Buffer.from(REAL_V2_MINT_DATA);
+  wrongDecimals[44] = 9;
+  assert.equal(account(REAL_V2_CURVE_115, wrongDecimals), null);
+
+  const unsafeExtension = Buffer.from(REAL_V2_MINT_DATA);
+  const metadataPointerHeader = unsafeExtension.indexOf(Buffer.from([18, 0, 64, 0]));
+  assert.ok(metadataPointerHeader >= 0);
+  unsafeExtension[metadataPointerHeader] = 1;
+  assert.equal(account(REAL_V2_CURVE_115, unsafeExtension), null);
+});
 
 test("exact raw supply math blocks 3% and triggers at the configured 10% boundary", () => {
   assert.equal(exactSupplyShareBps(30n, 1_000n), 300n);

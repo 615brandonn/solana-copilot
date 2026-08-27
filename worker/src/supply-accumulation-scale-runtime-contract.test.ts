@@ -105,7 +105,7 @@ test("the $20,000 ceiling never substitutes for active pre-graduation curve proo
   }
 });
 
-test("an existing Supply position is routed to scaling while initial entry remains one-position", () => {
+test("an existing Supply position scales while the legacy no-position path is observation-only", () => {
   const processSupply = section(
     "async function processSupplyAccumulationTargetBuy",
     "async function classifyTransferRecipients",
@@ -113,7 +113,10 @@ test("an existing Supply position is routed to scaling while initial entry remai
   const positionLookup = processSupply.indexOf('.from("positions")');
   const provenanceCheck = processSupply.indexOf("isSupplyEntryPosition(", positionLookup);
   const scaleCall = processSupply.indexOf("executeSupplyScaleInLocked", provenanceCheck);
-  const initialCall = processSupply.indexOf("await tryCopyBuyLocked(");
+  const observationOnly = processSupply.indexOf(
+    "legacy Supply observation stored; finalized fresh-tail candidate poll owns initial entries",
+    scaleCall,
+  );
 
   assert.ok(positionLookup >= 0, "Supply routing must read the existing open position first");
   assert.match(
@@ -125,16 +128,19 @@ test("an existing Supply position is routed to scaling while initial entry remai
     "only a position created by Supply Accumulation may use its scale path",
   );
   assert.ok(scaleCall > provenanceCheck, "the existing Supply position must enter the scale path");
-  assert.ok(initialCall > scaleCall, "the initial one-position path must remain the fallback");
+  assert.ok(
+    observationOnly > scaleCall,
+    "the no-position branch must become observation-only after the scale branch",
+  );
   assert.match(
-    processSupply.slice(scaleCall, initialCall),
+    processSupply.slice(scaleCall, observationOnly),
     /return;/,
-    "an existing position must return before the initial-entry call",
+    "an existing position must return before the observation-only no-position branch",
   );
   assert.equal(
     occurrences(processSupply, "await tryCopyBuyLocked(").length,
-    1,
-    "Supply must retain exactly one initial-position entry call",
+    0,
+    "legacy Supply must never retain a fallback initial-position entry call",
   );
 });
 

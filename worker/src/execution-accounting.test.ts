@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   attributablePositiveBalanceDelta,
+  confirmedTokenDebitFromTx,
   confirmedTokenReceiptFromTx,
 } from "./execution-accounting.js";
 
@@ -57,6 +58,59 @@ test("confirmed receipt preserves raw deltas above Number's exact range", () => 
   );
   assert.equal(receipt?.amountRaw, "9007199254740993");
   assert.equal(receipt?.decimals, 0);
+});
+
+test("confirmed sell debit preserves exact pre, post, and delta raw balances", () => {
+  const debit = confirmedTokenDebitFromTx(
+    {
+      meta: {
+        preTokenBalances: [
+          balance("owner", "mint", "9007199254741000", 6),
+          balance("owner", "mint", "25", 6),
+        ],
+        postTokenBalances: [balance("owner", "mint", "17", 6)],
+      },
+    },
+    "owner",
+    "mint",
+  );
+  assert.deepEqual(debit, {
+    amountRaw: "9007199254741008",
+    amountUi: 9007199254.741009,
+    decimals: 6,
+    preAmountRaw: "9007199254741025",
+    postAmountRaw: "17",
+  });
+});
+
+test("confirmed sell debit handles a closed token account and rejects credits", () => {
+  assert.deepEqual(
+    confirmedTokenDebitFromTx(
+      { meta: { preTokenBalances: [balance("owner", "mint", "42", 0)] } },
+      "owner",
+      "mint",
+    ),
+    {
+      amountRaw: "42",
+      amountUi: 42,
+      decimals: 0,
+      preAmountRaw: "42",
+      postAmountRaw: "0",
+    },
+  );
+  assert.equal(
+    confirmedTokenDebitFromTx(
+      {
+        meta: {
+          preTokenBalances: [balance("owner", "mint", "41", 0)],
+          postTokenBalances: [balance("owner", "mint", "42", 0)],
+        },
+      },
+      "owner",
+      "mint",
+    ),
+    undefined,
+  );
 });
 
 test("confirmed receipt fails closed on non-positive, inconsistent, or malformed evidence", () => {

@@ -160,6 +160,27 @@ signature, and last valid block height before submission. Startup may
 automatically recover only the exact `supply_accumulation` claim; legacy or
 incomplete claims remain fail-closed for manual reconciliation.
 
+### Finalized fresh-tail rollout
+
+The additive `supabase/supply-accumulation-fresh-tail-migration.sql` creates a
+separate FINALIZED, epoch-fenced observer. It does not import the executor,
+funding key, positions, or claims. Apply it only with global Entries OFF, then
+run the observer in mandatory shadow mode first:
+
+```bash
+cd worker
+npm run build
+FRESH_TAIL_SHADOW=true pm2 start dist/fresh-tail-index.js --name helix-fresh-tail-v1
+```
+
+Do not set `FRESH_TAIL_SHADOW=false` or enable Entries until the fresh-tail
+heartbeat is current, every root/descendant cursor is covered, Doctor passes,
+and the matching main worker plus `sell-claim-recovery-migration.sql` are
+deployed. Prepared exits persist their exact signed attempt before send and
+apply their finalized raw token debit atomically. Legacy positions without an
+exact raw receipt remain deliberately fail-closed rather than guessing from a
+floating-point amount or aggregate wallet balance.
+
 ## Custody Journey observer
 
 Custody Journey is an optional, observation-only service. It starts a durable

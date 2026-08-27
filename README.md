@@ -142,6 +142,26 @@ migrations install the strategy and every scale tier OFF; enable Custody Journey
 and then enable this strategy explicitly in Settings only after validation.
 Enabling it turns off the Conviction and Coordinated toggles.
 
+The optional finalized fresh-tail service is a separate observation-only path
+for post-activation Pump launches. With Entries OFF, apply
+`supabase/supply-accumulation-fresh-tail-migration.sql`, build the worker, and
+start `dist/fresh-tail-index.js` with `FRESH_TAIL_SHADOW=true`. It uses one
+finalized activation boundary, fenced leases, exact-signature cursors,
+fixed-point descendant coverage, and durable candidate certificates. It never
+uses legacy catch-up cursors to manufacture a fresh decision. Live candidates
+remain blocked until the observer is explicitly non-shadow, healthy, fully
+covered, and the main worker rechecks the same bound certificate immediately
+before sending.
+
+Apply `supabase/sell-claim-recovery-migration.sql` with the matching worker
+before any live rollout. It adds exact raw position provenance for new verified
+receipts and atomically persists prepared sell identity, finalized token debit,
+trade, position, and claim. Existing positions without exact raw provenance are
+not backfilled and cannot be auto-sold through this recovery path.
+
+Use the ordered [finalized fresh-tail live rollout checklist](worker/FRESH_TAIL_LIVE_ROLLOUT.md)
+for shadow proof, activation, verification, and rollback.
+
 ### Optional Custody Journey observer
 
 Custody Journey runs as a separate observation-only VPS process. It starts on

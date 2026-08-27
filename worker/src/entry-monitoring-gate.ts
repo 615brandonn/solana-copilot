@@ -12,6 +12,29 @@ export type EntryMonitoringGate = {
   reasons: string[];
 };
 
+export type FreshTailEntryMonitoringSignals = Pick<
+  EntryMonitoringSignals,
+  "geyserConnected" | "rpcLastSuccessAt"
+>;
+
+/**
+ * The finalized fresh-tail certificate replaces only the legacy RPC catch-up
+ * and follower-balance prerequisites for that exact entry. Keep the shared
+ * live-monitor availability breaker: this narrower gate must not become a
+ * general bypass for ordinary, coordinated, legacy Supply, or scale entries.
+ */
+export function evaluateFreshTailEntryMonitoringGate(
+  signals: FreshTailEntryMonitoringSignals,
+  nowMs = Date.now(),
+): EntryMonitoringGate {
+  const reasons: string[] = [];
+  const rpcFresh = signals.rpcLastSuccessAt !== null && nowMs - signals.rpcLastSuccessAt <= 60_000;
+  if (!signals.geyserConnected && !rpcFresh) {
+    reasons.push("both Geyser and RPC monitoring are unavailable or stale");
+  }
+  return { blocked: reasons.length > 0, reasons };
+}
+
 export function evaluateEntryMonitoringGate(
   signals: EntryMonitoringSignals,
   nowMs = Date.now(),
