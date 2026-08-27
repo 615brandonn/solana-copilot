@@ -15,8 +15,18 @@ test("every claimed exit persists its exact signed attempt before the first netw
   const body = source.slice(start, end);
 
   const preparedAt = body.indexOf("const persistPreparedSell");
+  const expiryCheckAt = body.indexOf("Number.isSafeInteger(lastValidBlockHeight)", preparedAt);
+  const durablePrepareAt = body.indexOf("sellClaimRecoveryStore.prepare", preparedAt);
   const executeAt = body.indexOf("const result = await executeExitSell", preparedAt);
   assert.ok(preparedAt >= 0 && preparedAt < executeAt);
+  assert.ok(
+    expiryCheckAt > preparedAt && durablePrepareAt > expiryCheckAt,
+    "a sell without an exact positive block-height expiry must fail inside onPrepared before persistence and send",
+  );
+  assert.match(
+    body.slice(preparedAt, durablePrepareAt),
+    /!Number\.isSafeInteger\(lastValidBlockHeight\)[\s\S]*lastValidBlockHeight <= 0/,
+  );
   assert.match(
     body,
     /sellClaimRecoveryStore\.prepare\(claim\.id,[\s\S]*positionAmountBeforeRaw: currentPositionRawText/,

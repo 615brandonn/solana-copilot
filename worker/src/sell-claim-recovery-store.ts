@@ -35,7 +35,7 @@ export type SellRecoveryClaim = {
 export type PreparedSellAttempt = {
   txSig: string;
   recentBlockhash: string;
-  lastValidBlockHeight?: number;
+  lastValidBlockHeight: number;
   executedSellAmountRaw: string;
   preparedWalletBalanceRaw: string;
   positionAmountBeforeRaw: string;
@@ -210,10 +210,10 @@ export class SellClaimRecoveryStore {
     const walletRaw = exactRaw(attempt.preparedWalletBalanceRaw, "prepared wallet balance");
     const positionRaw = exactRaw(attempt.positionAmountBeforeRaw, "prepared position balance");
     const tokenDecimals = decimals(attempt.tokenDecimals, "prepared sell decimals");
-    const lastHeight =
-      attempt.lastValidBlockHeight === undefined
-        ? null
-        : Number(exactRaw(BigInt(attempt.lastValidBlockHeight), "prepared last valid height"));
+    const lastHeight = Number(attempt.lastValidBlockHeight);
+    if (!Number.isSafeInteger(lastHeight) || lastHeight <= 0) {
+      throw new Error("prepared last valid height must be a positive safe integer");
+    }
     if (BigInt(soldRaw) > BigInt(walletRaw))
       throw new Error("prepared sell exceeds wallet balance");
     if (BigInt(soldRaw) > BigInt(positionRaw)) {

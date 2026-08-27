@@ -3378,10 +3378,17 @@ async function main() {
 
       let preparedBotTxSig: string | null = null;
       const persistPreparedSell = async (prepared: PreparedSellContext) => {
+        const lastValidBlockHeight = Number(prepared.lastValidBlockHeight);
+        if (!Number.isSafeInteger(lastValidBlockHeight) || lastValidBlockHeight <= 0) {
+          // onPrepared runs before every executor network send. A signed sell
+          // without a durable expiry can never be proven absent from history,
+          // so reject it while it is still guaranteed to be local.
+          throw new Error("prepared sell is missing a positive last valid block height");
+        }
         await sellClaimRecoveryStore.prepare(claim.id, {
           txSig: prepared.txSig,
           recentBlockhash: prepared.recentBlockhash,
-          lastValidBlockHeight: prepared.lastValidBlockHeight,
+          lastValidBlockHeight,
           executedSellAmountRaw: prepared.executedSellAmountRaw,
           preparedWalletBalanceRaw: prepared.preparedWalletBalanceRaw,
           positionAmountBeforeRaw: currentPositionRawText,

@@ -177,7 +177,8 @@ alter table public.sell_signal_claims
       and btrim(bot_tx_sig) <> ''
       and recent_blockhash is not null
       and btrim(recent_blockhash) <> ''
-      and (last_valid_block_height is null or last_valid_block_height > 0)
+      and last_valid_block_height is not null
+      and last_valid_block_height > 0
       and (execution_latency_ms is null or execution_latency_ms >= 0)
       and (execution_route is null or execution_route in ('jito', 'rpc'))
       and (mirrored_sold_fraction is null or mirrored_sold_fraction between 0 and 1)
@@ -257,7 +258,8 @@ begin
      or p_position_amount_before_raw !~ '^[1-9][0-9]*$'
      or char_length(p_position_amount_before_raw) > 78
      or p_token_decimals is null or p_token_decimals < 0 or p_token_decimals > 18
-     or (p_last_valid_block_height is not null and p_last_valid_block_height <= 0) then
+     or p_last_valid_block_height is null
+     or p_last_valid_block_height <= 0 then
     return jsonb_build_object('prepared', false, 'reason', 'invalid_request');
   end if;
   v_sell_raw := p_executed_sell_amount_raw::numeric;

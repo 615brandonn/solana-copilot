@@ -151,6 +151,33 @@ test("prepare publishes signature, blockhash, expiry, and exact raw values in on
   ]);
 });
 
+test("prepare rejects a missing or inexact block-height expiry before its RPC", async () => {
+  for (const lastValidBlockHeight of [
+    undefined,
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
+    const client = new FakeClient();
+    const store = new SellClaimRecoveryStore(client as never, USER);
+    await assert.rejects(
+      store.prepare(CLAIM, {
+        txSig: SIG,
+        recentBlockhash: BLOCKHASH,
+        lastValidBlockHeight,
+        executedSellAmountRaw: SOLD,
+        preparedWalletBalanceRaw: PRE,
+        positionAmountBeforeRaw: PRE,
+        tokenDecimals: 6,
+      } as never),
+      /positive safe integer/,
+    );
+    assert.equal(client.rpcCalls.length, 0);
+  }
+});
+
 test("final authorization is bound to the exact submitted v1 signature", async () => {
   const client = new FakeClient();
   client.queryResponse = { data: { id: CLAIM }, error: null };

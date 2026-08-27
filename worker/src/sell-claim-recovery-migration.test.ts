@@ -43,6 +43,10 @@ test("migration records the immutable prepared signature, expiry, and exact raw 
   assert.match(sql, /sell_signal_claims_recovery_v1_check[\s\S]*recovery_version = 1/i);
   assert.match(
     sql,
+    /recovery_version = 1[\s\S]*last_valid_block_height is not null[\s\S]*last_valid_block_height > 0/i,
+  );
+  assert.match(
+    sql,
     /receipt_pre_amount_raw::numeric - receipt_post_amount_raw::numeric[\s\S]*executed_sell_amount_raw::numeric/i,
   );
   assert.match(
@@ -61,6 +65,10 @@ test("prepare RPC takes the position-action lock and publishes one complete atte
     "create or replace function public.apply_landed_sell_claim_v1",
   );
   assert.match(body, /auth\.role\(\)[\s\S]*service_role/i);
+  assert.match(
+    body,
+    /p_last_valid_block_height is null[\s\S]*p_last_valid_block_height <= 0[\s\S]*invalid_request/i,
+  );
   assert.match(body, /pg_advisory_xact_lock[\s\S]*helix-position-action:/i);
   assert.match(body, /from public\.sell_signal_claims[\s\S]*for update/i);
   assert.match(body, /from public\.positions[\s\S]*for update/i);
