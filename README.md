@@ -159,6 +159,9 @@ receipts and atomically persists prepared sell identity, finalized token debit,
 trade, position, and claim. Existing positions without exact raw provenance are
 not backfilled and cannot be auto-sold through this recovery path.
 
+Use the ordered [finalized fresh-tail live rollout checklist](worker/FRESH_TAIL_LIVE_ROLLOUT.md)
+for shadow proof, activation, verification, and rollback.
+
 ### Optional Custody Journey observer
 
 Custody Journey runs as a separate observation-only VPS process. It starts on
