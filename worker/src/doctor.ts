@@ -982,6 +982,7 @@ async function checkSupplyAccumulationSchema(
       "/rpc/is_custody_fresh_tail_parser_reviewed",
       "/rpc/get_custody_fresh_tail_active_epoch",
       "/rpc/get_custody_fresh_tail_work",
+      "/rpc/get_custody_fresh_tail_retirement_candidates",
       "/rpc/reject_custody_fresh_tail_mint",
       "/rpc/attest_custody_fresh_tail_mint_creation",
       "/rpc/record_custody_fresh_tail_supply_event",

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { freshTailTradeMarketCapUsd } from "./fresh-tail-observer.js";
+import {
+  freshTailTradeMarketCapUsd,
+  freshTailTransactionLookupKeys,
+} from "./fresh-tail-observer.js";
 
 const indexSource = readFileSync(new URL("../src/fresh-tail-index.ts", import.meta.url), "utf8");
 const observerSource = readFileSync(
@@ -34,10 +37,18 @@ test("epoch activation is impossible while global Entries is enabled", () => {
 
 test("older durable request heads drain before discovery advances to the latest head", () => {
   const cycle = observerSource.slice(observerSource.indexOf("async cycle(config"));
+  const headAttestation = cycle.indexOf("this.attestHead(sampled.head");
+  const overflowRetirement = cycle.indexOf("this.retireResourceOverflow");
   const firstDrain = cycle.indexOf("this.drainRequests");
   const latestCoverage = cycle.indexOf("this.coverHead(sampled.head");
   const secondDrain = cycle.indexOf("this.drainRequests", firstDrain + 1);
-  assert.ok(firstDrain >= 0 && latestCoverage > firstDrain && secondDrain > latestCoverage);
+  assert.ok(
+    headAttestation >= 0 &&
+      overflowRetirement > headAttestation &&
+      firstDrain > overflowRetirement &&
+      latestCoverage > firstDrain &&
+      secondDrain > latestCoverage,
+  );
   assert.match(observerSource, /\.sort\(requestSort\)/);
   assert.match(observerSource, /requestCannotRewind/);
 });
@@ -81,6 +92,32 @@ test("market-cap evidence rejects stale prices and uses the exact reserve ratio"
     ),
     null,
   );
+});
+
+test("root decoding indexes contracts by transaction mint/account evidence", () => {
+  const mint = "So11111111111111111111111111111111111111112";
+  const curve = "ComputeBudget111111111111111111111111111111";
+  const keys = freshTailTransactionLookupKeys({
+    transaction: {
+      message: { accountKeys: [{ pubkey: curve }] },
+      signatures: ["signature"],
+    },
+    meta: {
+      preTokenBalances: [{ mint }],
+      postTokenBalances: [],
+      loadedAddresses: { writable: [], readonly: [] },
+    },
+  } as never);
+  assert.deepEqual(new Set(keys), new Set([mint, curve]));
+  assert.equal(
+    freshTailTransactionLookupKeys({
+      transaction: { message: { accountKeys: ["not-a-key"] } },
+      meta: { preTokenBalances: [], postTokenBalances: [] },
+    } as never),
+    null,
+  );
+  assert.match(observerSource, /contractsByCurve/);
+  assert.match(observerSource, /lookupKeys === null[\s\S]*\.\.\.contracts\.values\(\)/);
 });
 
 test("historical tombstones and retired mints cannot pin a root cursor", () => {

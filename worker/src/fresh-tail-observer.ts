@@ -40,6 +40,7 @@ import type {
   FreshTailBackscanRange,
   FreshTailLease,
   FreshTailMutationResult,
+  FreshTailRetirementCandidate,
   FreshTailStore,
   FreshTailWork,
   FreshTailWorkCursor,
@@ -118,12 +119,6 @@ type PersistResult = {
   scopeRevision: number;
   requestCandidates: RequestCandidate[];
   poisoned: boolean;
-};
-
-export type FreshTailRetirementCandidate = {
-  tokenMint: string;
-  scopeRevision: number;
-  reason: "dormant_below_threshold" | "unsupported_after_enrollment";
 };
 
 /**
@@ -391,6 +386,58 @@ function cursorIsPastHead(cursor: FreshTailWorkCursor, headSlot: number): boolea
     (cursor.coveredThroughSlot !== null && cursor.coveredThroughSlot > headSlot) ||
     (cursor.lastSlot !== null && cursor.lastSlot > headSlot)
   );
+}
+
+/**
+ * Returns the only mint/account identities that can make an enrolled decoder
+ * produce evidence for this transaction. Malformed account metadata returns
+ * null so callers fall back to the exhaustive fail-closed path.
+ */
+export function freshTailTransactionLookupKeys(
+  transaction: ParsedTransactionWithMeta,
+): ReadonlySet<string> | null {
+  const normalize = (value: unknown): string | null => {
+    try {
+      return new PublicKey(
+        typeof value === "string"
+          ? value
+          : ((value as { toBase58?: () => string } | null)?.toBase58?.() ?? String(value ?? "")),
+      ).toBase58();
+    } catch {
+      return null;
+    }
+  };
+  const message = transaction.transaction.message as unknown as {
+    accountKeys?: unknown[];
+    staticAccountKeys?: unknown[];
+  };
+  const rawAccounts = message.accountKeys ?? message.staticAccountKeys;
+  if (!Array.isArray(rawAccounts) || rawAccounts.length === 0) return null;
+  const keys = new Set<string>();
+  for (const entry of rawAccounts) {
+    const key = normalize((entry as { pubkey?: unknown } | null)?.pubkey ?? entry);
+    if (!key) return null;
+    keys.add(key);
+  }
+  const loaded = (
+    transaction.meta as unknown as {
+      loadedAddresses?: { writable?: unknown[]; readonly?: unknown[] };
+    } | null
+  )?.loadedAddresses;
+  for (const entry of [...(loaded?.writable ?? []), ...(loaded?.readonly ?? [])]) {
+    const key = normalize(entry);
+    if (!key) return null;
+    keys.add(key);
+  }
+  for (const row of [
+    ...(transaction.meta?.preTokenBalances ?? []),
+    ...(transaction.meta?.postTokenBalances ?? []),
+  ]) {
+    const mint = normalize((row as { mint?: unknown }).mint);
+    if (!mint) return null;
+    keys.add(mint);
+  }
+  return keys;
 }
 
 export class FreshTailObserver {
@@ -848,6 +895,7 @@ export class FreshTailObserver {
     signature: ConfirmedSignatureInfo,
     root: string,
     contracts: Map<string, FreshTailMintContract>,
+    contractsByCurve: Map<string, FreshTailMintContract>,
     revisions: Map<string, number>,
     rejectedMints: Set<string>,
     poisonedMints: Set<string>,
@@ -890,13 +938,30 @@ export class FreshTailObserver {
       );
       if (contract) {
         contracts.set(contract.mint, contract);
+        contractsByCurve.set(contract.bondingCurve, contract);
         revisions.set(contract.mint, 0);
       } else {
         rejectedMints.add(candidate.tokenMint);
       }
     }
 
-    for (const [mint, contract] of [...contracts.entries()].sort(([a], [b]) =>
+    const lookupKeys = freshTailTransactionLookupKeys(transaction);
+    const relevantContracts =
+      lookupKeys === null
+        ? [...contracts.values()]
+        : [...lookupKeys].flatMap((key) => {
+            const byMint = contracts.get(key);
+            const byCurve = contractsByCurve.get(key);
+            return byMint && byCurve && byMint.mint !== byCurve.mint
+              ? [byMint, byCurve]
+              : [byMint ?? byCurve].filter(
+                  (contract): contract is FreshTailMintContract => contract !== undefined,
+                );
+          });
+    const uniqueContracts = new Map(
+      relevantContracts.map((contract) => [contract.mint, contract] as const),
+    );
+    for (const [mint, contract] of [...uniqueContracts.entries()].sort(([a], [b]) =>
       a.localeCompare(b),
     )) {
       if (poisonedMints.has(mint)) continue;
@@ -1131,6 +1196,9 @@ export class FreshTailObserver {
     );
 
     const contracts = this.activeContracts(work);
+    const contractsByCurve = new Map(
+      [...contracts.values()].map((contract) => [contract.bondingCurve, contract]),
+    );
     const revisions = this.scopeRevisions(work);
     const rejected = new Set(
       work.rejections.map((row) => String(row.tokenMint ?? "")).filter(Boolean),
@@ -1148,6 +1216,7 @@ export class FreshTailObserver {
           occurrence.signature,
           occurrence.root,
           contracts,
+          contractsByCurve,
           revisions,
           rejected,
           poisoned,
@@ -1465,6 +1534,24 @@ export class FreshTailObserver {
     this.assertLease();
     const work = await this.store.getWork(this.epoch!.epochId, this.lease!);
     const candidates = selectFreshTailRetirementCandidates(work, head.blockTimeMs);
+    return this.retireCandidates(candidates, deadlineMs);
+  }
+
+  private async retireResourceOverflow(deadlineMs: number): Promise<number> {
+    if (deadlineMs - Number(this.nowMs()) <= REQUEST_RESERVE_MS) return 0;
+    this.assertLease();
+    const candidates = await this.store.getRetirementCandidates(
+      this.epoch!.epochId,
+      this.lease!,
+      MAX_RETIREMENTS_PER_CYCLE,
+    );
+    return this.retireCandidates(candidates, deadlineMs);
+  }
+
+  private async retireCandidates(
+    candidates: readonly FreshTailRetirementCandidate[],
+    deadlineMs: number,
+  ): Promise<number> {
     let retired = 0;
     for (const candidate of candidates) {
       if (deadlineMs - Number(this.nowMs()) <= REQUEST_RESERVE_MS) break;
@@ -1488,6 +1575,7 @@ export class FreshTailObserver {
         result.reason === "fresh_exit_still_unresolved" ||
         result.reason === "fresh_request_still_live" ||
         result.reason === "mint_not_dormant" ||
+        result.reason === "retirement_reason_conflict" ||
         result.reason === "mint_not_found"
       ) {
         continue;
@@ -1676,6 +1764,9 @@ export class FreshTailObserver {
       }
       sampledHead = sampled.head;
       await this.attestHead(sampled.head);
+      // Capacity eviction has its own bounded RPC, so it remains available
+      // even when a full work snapshot is intentionally rejected at the cap.
+      await this.retireResourceOverflow(deadlineMs);
       const completedRequests = new Set<string>();
       let requestsSettled = await this.drainRequests(config, deadlineMs, completedRequests);
       await this.coverHead(sampled.head, config, deadlineMs);

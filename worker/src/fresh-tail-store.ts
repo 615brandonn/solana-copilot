@@ -81,6 +81,12 @@ export type FreshTailArmedBinding = {
   armedAt: string;
 };
 
+export type FreshTailRetirementCandidate = {
+  tokenMint: string;
+  scopeRevision: number;
+  reason: "dormant_below_threshold" | "resource_cap" | "unsupported_after_enrollment";
+};
+
 export type FreshTailWorkWallet = {
   tokenMint: string;
   wallet: string;
@@ -376,6 +382,41 @@ export function createSupabaseFreshTailStore(client: FreshTailDbClient, userId: 
         throw new Error("fresh-tail work epoch is malformed");
       }
       return result as FreshTailWork;
+    },
+
+    async getRetirementCandidates(
+      epochId: string,
+      lease: FreshTailLease,
+      limit: number,
+    ): Promise<FreshTailRetirementCandidate[]> {
+      const result = await invoke("get_custody_fresh_tail_retirement_candidates", {
+        ...fenced(epochId, lease),
+        p_limit: limit,
+      });
+      if (!result.ok) {
+        throw new Error(`fresh-tail retirement candidates unavailable: ${result.reason}`);
+      }
+      if (!Array.isArray(result.candidates)) {
+        throw new Error("fresh-tail retirement candidates are malformed");
+      }
+      return result.candidates.map((candidate) => {
+        const row = candidate as Record<string, unknown>;
+        const scopeRevision = Number(row.scopeRevision);
+        if (
+          typeof row.tokenMint !== "string" ||
+          row.tokenMint.length === 0 ||
+          !Number.isSafeInteger(scopeRevision) ||
+          scopeRevision < 0 ||
+          (row.reason !== "resource_cap" && row.reason !== "unsupported_after_enrollment")
+        ) {
+          throw new Error("fresh-tail retirement candidate row is malformed");
+        }
+        return {
+          tokenMint: row.tokenMint,
+          scopeRevision,
+          reason: row.reason,
+        };
+      });
     },
 
     async attestHead(

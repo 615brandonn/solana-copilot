@@ -39,6 +39,7 @@ const rpcs = [
   "record_custody_fresh_tail_heartbeat",
   "attest_custody_fresh_tail_finalized_head",
   "get_custody_fresh_tail_work",
+  "get_custody_fresh_tail_retirement_candidates",
   "reject_custody_fresh_tail_mint",
   "attest_custody_fresh_tail_mint_creation",
   "record_custody_fresh_tail_supply_event",
@@ -175,6 +176,25 @@ test("recovery work is lifecycle-filtered, indexed, and fails closed at fixed ca
     migration,
     /entry_signal_claims_fresh_tail_armed_idx[\s\S]*where fresh_tail_monitoring_armed_at is not null/i,
   );
+});
+
+test("resource-cap retirement discovery stays bounded and read-only outside getWork", () => {
+  const candidates = migration.slice(
+    migration.indexOf(
+      "create or replace function public.get_custody_fresh_tail_retirement_candidates(",
+    ),
+    migration.indexOf("create or replace function public.record_custody_fresh_tail_supply_event("),
+  );
+  assert.match(candidates, /assert_custody_fresh_tail_lease/i);
+  assert.match(candidates, /v_active_count - 256/i);
+  assert.match(candidates, /p_limit not between 1 and 100/i);
+  assert.match(candidates, /limit least\(p_limit::bigint, v_overflow_count\)/i);
+  assert.match(candidates, /'resource_cap'/i);
+  assert.match(candidates, /'unsupported_after_enrollment'/i);
+  assert.match(candidates, /fresh_tail_monitoring_armed_at is not null/i);
+  assert.match(candidates, /p\.closed_at is null/i);
+  assert.match(candidates, /i\.status not in \('resolved', 'dismissed'\)/i);
+  assert.doesNotMatch(candidates, /\b(?:insert|update|delete)\b/i);
 });
 
 test("mint enrollment is epoch-level, strict Pump creation proof with durable rejections", () => {

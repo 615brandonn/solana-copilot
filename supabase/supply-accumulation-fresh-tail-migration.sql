@@ -2029,6 +2029,116 @@ begin
 end;
 $$;
 
+create or replace function public.get_custody_fresh_tail_retirement_candidates(
+  p_user_id uuid,
+  p_epoch_id uuid,
+  p_limit integer,
+  p_lease_token uuid,
+  p_lease_generation bigint
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public, pg_temp
+as $$
+declare
+  v_epoch public.custody_fresh_tail_epochs%rowtype;
+  v_active_count bigint;
+  v_overflow_count bigint;
+  v_candidates jsonb := '[]'::jsonb;
+begin
+  v_epoch := public.assert_custody_fresh_tail_lease(
+    p_user_id, p_epoch_id, p_lease_token, p_lease_generation
+  );
+  if p_limit is null or p_limit not between 1 and 100 then
+    return jsonb_build_object('ok', false, 'reason', 'invalid_retirement_candidate_limit');
+  end if;
+
+  select count(*) into v_active_count
+  from public.custody_fresh_tail_mints m
+  where m.epoch_id = p_epoch_id and m.user_id = p_user_id
+    and m.status = 'active';
+  v_overflow_count := greatest(v_active_count - 256, 0);
+  if v_overflow_count = 0 then
+    return jsonb_build_object(
+      'ok', true, 'reason', 'within_resource_cap',
+      'activeMintCount', v_active_count, 'overflowCount', 0,
+      'candidates', v_candidates
+    );
+  end if;
+
+  -- This is a bounded capacity-eviction list, not retirement authority. The
+  -- retire RPC repeats every request/claim/position/intent check under the
+  -- mint advisory lock and scope-revision CAS before changing lifecycle state.
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'tokenMint', candidate.token_mint,
+    'scopeRevision', candidate.scope_revision,
+    'reason', candidate.retire_reason,
+    'lastSupplyEventBlockTime', candidate.last_supply_at
+  ) order by candidate.poisoned desc, candidate.last_supply_at, candidate.token_mint), '[]'::jsonb)
+  into v_candidates
+  from (
+    select m.token_mint, m.scope_revision, m.poisoned,
+      case when m.poisoned then 'unsupported_after_enrollment'
+        else 'resource_cap' end as retire_reason,
+      coalesce((
+        select max(e.block_time)
+        from public.custody_fresh_tail_supply_events e
+        where e.epoch_id = m.epoch_id and e.token_mint = m.token_mint
+      ), m.enrollment_block_time) as last_supply_at
+    from public.custody_fresh_tail_mints m
+    where m.epoch_id = p_epoch_id and m.user_id = p_user_id
+      and m.status = 'active'
+      and not exists (
+        select 1 from public.custody_fresh_tail_requests q
+        where q.epoch_id = m.epoch_id and q.token_mint = m.token_mint
+          and q.status in ('pending', 'settled')
+          and q.expires_at > clock_timestamp()
+      )
+      and not exists (
+        select 1 from public.entry_signal_claims c
+        where c.user_id = p_user_id and c.fresh_tail_epoch_id = m.epoch_id
+          and c.token_mint = m.token_mint
+          and c.fresh_tail_monitoring_armed_at is not null
+          and (
+            c.status in ('claimed', 'submitted', 'landed', 'uncertain')
+            or (
+              c.status = 'persisted'
+              and not exists (
+                select 1 from public.positions p
+                where p.id = c.planned_position_id and p.user_id = c.user_id
+                  and p.token_mint = c.token_mint and p.closed_at is not null
+              )
+            )
+          )
+      )
+      and not exists (
+        select 1
+        from public.positions p
+        join public.entry_signal_claims c on c.planned_position_id = p.id
+        where p.user_id = p_user_id and p.token_mint = m.token_mint
+          and p.closed_at is null and c.fresh_tail_epoch_id = m.epoch_id
+      )
+      and not exists (
+        select 1 from public.custody_fresh_tail_exit_intents i
+        where i.user_id = p_user_id and i.epoch_id = m.epoch_id
+          and i.token_mint = m.token_mint
+          and i.status not in ('resolved', 'dismissed')
+      )
+    order by m.poisoned desc, last_supply_at, m.token_mint
+    limit least(p_limit::bigint, v_overflow_count)
+  ) candidate;
+
+  return jsonb_build_object(
+    'ok', true, 'reason', case when jsonb_array_length(v_candidates) > 0
+      then 'resource_retirement_candidates' else 'resource_cap_blocked' end,
+    'activeMintCount', v_active_count,
+    'overflowCount', v_overflow_count,
+    'candidates', v_candidates
+  );
+end;
+$$;
+
 create or replace function public.record_custody_fresh_tail_supply_event(
   p_user_id uuid,
   p_epoch_id uuid,
@@ -5142,6 +5252,7 @@ begin
         'acquire_custody_fresh_tail_lease',
         'record_custody_fresh_tail_heartbeat',
         'get_custody_fresh_tail_work',
+        'get_custody_fresh_tail_retirement_candidates',
         'reject_custody_fresh_tail_mint',
         'attest_custody_fresh_tail_mint_creation',
         'record_custody_fresh_tail_supply_event',
@@ -5206,6 +5317,7 @@ begin
     'acquire_custody_fresh_tail_lease',
     'record_custody_fresh_tail_heartbeat',
     'get_custody_fresh_tail_work',
+    'get_custody_fresh_tail_retirement_candidates',
     'reject_custody_fresh_tail_mint',
     'attest_custody_fresh_tail_mint_creation',
     'record_custody_fresh_tail_supply_event',

@@ -118,6 +118,42 @@ test("first lease acquisition explicitly sends a null prior identity", async () 
   assert.equal(calls[0]?.parameters.p_expected_lease_generation, null);
 });
 
+test("resource retirement candidates use a bounded fenced RPC independent of getWork", async () => {
+  const calls: RpcCall[] = [];
+  const store = createSupabaseFreshTailStore(
+    client(calls, {
+      ok: true,
+      reason: "resource_retirement_candidates",
+      activeMintCount: 258,
+      overflowCount: 2,
+      candidates: [
+        {
+          tokenMint: "mint-a",
+          scopeRevision: 4,
+          reason: "resource_cap",
+          lastSupplyEventBlockTime: "2026-08-26T05:00:00.000Z",
+        },
+      ],
+    }),
+    "00000000-0000-4000-8000-000000000003",
+  );
+  assert.deepEqual(await store.getRetirementCandidates(lease.epochId, lease, 25), [
+    { tokenMint: "mint-a", scopeRevision: 4, reason: "resource_cap" },
+  ]);
+  assert.deepEqual(calls, [
+    {
+      name: "get_custody_fresh_tail_retirement_candidates",
+      parameters: {
+        p_user_id: "00000000-0000-4000-8000-000000000003",
+        p_epoch_id: lease.epochId,
+        p_lease_token: lease.leaseToken,
+        p_lease_generation: lease.leaseGeneration,
+        p_limit: 25,
+      },
+    },
+  ]);
+});
+
 test("heartbeat uses the fenced SQL RPC and exact canonical head identity", async () => {
   const calls: RpcCall[] = [];
   const store = createSupabaseFreshTailStore(
