@@ -55,7 +55,8 @@ import {
 import { loadPumpFunSupplySnapshot, type PumpFunSupplySnapshot } from "./pump-fun-supply.js";
 
 const DEFAULT_CYCLE_BUDGET_MS = 45_000;
-const DEFAULT_LEASE_SECONDS = 75;
+const DEFAULT_LEASE_SECONDS = 15;
+const DEFAULT_LEASE_KEEPALIVE_MS = 4_000;
 const DEFAULT_RPC_TIMEOUT_MS = 4_000;
 const REQUEST_RESERVE_MS = 4_000;
 const PRICE_MAX_AGE_MS = 5_000;
@@ -92,9 +93,14 @@ export type FreshTailObserverOptions = {
   nowMs?: () => number;
   cycleBudgetMs?: number;
   leaseSeconds?: number;
+  leaseKeepaliveMs?: number;
   rpcCallTimeoutMs?: number;
   pageSize?: number;
   maxPages?: number;
+  scheduler?: {
+    setInterval(callback: () => void, delayMs: number): unknown;
+    clearInterval(handle: unknown): void;
+  };
 };
 
 type RootScan = {
@@ -448,12 +454,15 @@ export class FreshTailObserver {
   private readonly nowMs: () => number;
   private readonly cycleBudgetMs: number;
   private readonly leaseSeconds: number;
+  private readonly leaseKeepaliveMs: number;
   private readonly rpcCallTimeoutMs: number;
   private readonly pageSize: number | undefined;
   private readonly maxPages: number | undefined;
+  private readonly scheduler: NonNullable<FreshTailObserverOptions["scheduler"]>;
   private epoch: FreshTailActiveEpoch | null = null;
   private lease: FreshTailLease | null = null;
   private latestAttestedHead: FreshTailFinalizedHead | null = null;
+  private leaseKeepaliveFailure: FreshTailObserverError | null = null;
 
   constructor(options: FreshTailObserverOptions) {
     if (!options.workerId.trim()) {
@@ -472,15 +481,33 @@ export class FreshTailObserver {
       options.leaseSeconds ?? DEFAULT_LEASE_SECONDS,
       "lease duration",
     );
+    this.leaseKeepaliveMs = positiveInteger(
+      options.leaseKeepaliveMs ?? DEFAULT_LEASE_KEEPALIVE_MS,
+      "lease keepalive interval",
+    );
+    if (this.leaseKeepaliveMs * 2 >= this.leaseSeconds * 1_000) {
+      throw new FreshTailObserverError(
+        "invalid_configuration",
+        false,
+        "fresh-tail lease keepalive must run at least twice per lease",
+      );
+    }
     this.rpcCallTimeoutMs = positiveInteger(
       options.rpcCallTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS,
       "RPC timeout",
     );
     this.pageSize = options.pageSize;
     this.maxPages = options.maxPages;
+    this.scheduler =
+      options.scheduler ??
+      ({
+        setInterval: (callback, delayMs) => setInterval(callback, delayMs),
+        clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
+      } satisfies NonNullable<FreshTailObserverOptions["scheduler"]>);
   }
 
   private assertLease(): void {
+    if (this.leaseKeepaliveFailure) throw this.leaseKeepaliveFailure;
     const lease = this.lease;
     const epoch = this.epoch;
     if (!lease || !epoch || lease.epochId !== epoch.epochId) {
@@ -491,6 +518,90 @@ export class FreshTailObserver {
       this.lease = null;
       throw new FreshTailObserverError("lease_lost", true, "fresh-tail lease expired locally");
     }
+  }
+
+  /**
+   * Keeps a long fixed-point cycle inside a short crash-recovery lease. Every
+   * renewal is a CAS over the exact secret token and generation. A timeout,
+   * rejection, or identity rotation clears local authority immediately; SQL's
+   * fencing repeats the same check for any mutation already in flight.
+   */
+  private startLeaseKeepalive(
+    epoch: FreshTailActiveEpoch,
+  ): () => Promise<FreshTailObserverError | null> {
+    let stopped = false;
+    let inFlight: Promise<void> | null = null;
+
+    const fail = (code: string, message: string): void => {
+      this.lease = null;
+      this.leaseKeepaliveFailure ??= new FreshTailObserverError(code, true, message);
+    };
+
+    const renew = (): void => {
+      if (stopped || inFlight || this.leaseKeepaliveFailure) return;
+      const expected = this.lease;
+      if (!expected || expected.epochId !== epoch.epochId) {
+        fail("lease_lost", "fresh-tail lease disappeared before its keepalive");
+        return;
+      }
+      const run = (async () => {
+        try {
+          const renewed = await this.store.acquireLease(
+            epoch.epochId,
+            this.workerId,
+            this.leaseSeconds,
+            expected,
+          );
+          if (!renewed) {
+            fail("lease_keepalive_fenced", "fresh-tail lease keepalive was rejected or fenced");
+            return;
+          }
+          if (
+            renewed.epochId !== expected.epochId ||
+            renewed.leaseToken !== expected.leaseToken ||
+            renewed.leaseGeneration !== expected.leaseGeneration
+          ) {
+            fail(
+              "lease_keepalive_identity_changed",
+              "fresh-tail lease identity rotated during an active observer cycle",
+            );
+            return;
+          }
+          if (
+            this.lease?.epochId !== expected.epochId ||
+            this.lease.leaseToken !== expected.leaseToken ||
+            this.lease.leaseGeneration !== expected.leaseGeneration
+          ) {
+            fail(
+              "lease_keepalive_concurrent_change",
+              "fresh-tail local lease changed while its keepalive was in flight",
+            );
+            return;
+          }
+          this.lease = renewed;
+          this.assertLease();
+        } catch (error) {
+          fail(
+            "lease_keepalive_failed",
+            `fresh-tail lease keepalive failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      })();
+      inFlight = run;
+      void run.finally(() => {
+        if (inFlight === run) inFlight = null;
+      });
+    };
+
+    const handle = this.scheduler.setInterval(renew, this.leaseKeepaliveMs);
+    return async () => {
+      stopped = true;
+      this.scheduler.clearInterval(handle);
+      await inFlight;
+      return this.leaseKeepaliveFailure;
+    };
   }
 
   private async ensureEpoch(
@@ -1718,6 +1829,7 @@ export class FreshTailObserver {
   }
 
   async cycle(config: FreshTailObserverConfig): Promise<FreshTailObserverCycleResult> {
+    this.leaseKeepaliveFailure = null;
     const startedAt = Number(this.nowMs());
     const deadlineMs = startedAt + this.cycleBudgetMs;
     if (!Number.isSafeInteger(startedAt) || startedAt <= 0) {
@@ -1751,7 +1863,9 @@ export class FreshTailObserver {
       };
     }
 
-    let sampledHead: FreshTailFinalizedHead | null = null;
+    const stopLeaseKeepalive = this.startLeaseKeepalive(epoch);
+    let cycleResult: FreshTailObserverCycleResult | null = null;
+    let cycleError: FreshTailObserverError | null = null;
     try {
       const sampled = await sampleFreshTailFinalizedHead(this.rpc, {
         minimumSlot: epoch.activationSlot,
@@ -1762,7 +1876,6 @@ export class FreshTailObserver {
       if (!sampled.ok) {
         throw new FreshTailObserverError(sampled.code, sampled.retryable, sampled.reason);
       }
-      sampledHead = sampled.head;
       await this.attestHead(sampled.head);
       // Capacity eviction has its own bounded RPC, so it remains available
       // even when a full work snapshot is intentionally rejected at the cap.
@@ -1774,7 +1887,7 @@ export class FreshTailObserver {
       await this.retireInactiveMints(sampled.head, deadlineMs);
       const successAt = new Date(Number(this.nowMs())).toISOString();
       await this.heartbeat(config, successAt, null);
-      return {
+      cycleResult = {
         status: "observed",
         epochId: epoch.epochId,
         leaseGeneration: this.lease!.leaseGeneration,
@@ -1782,16 +1895,32 @@ export class FreshTailObserver {
         requestsSettled,
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const authoritativeError = this.leaseKeepaliveFailure ?? error;
+      const message =
+        authoritativeError instanceof Error
+          ? authoritativeError.message
+          : String(authoritativeError);
       try {
         await this.heartbeat(config, null, message.slice(0, 1_000));
       } catch {
         // The original error (often lease loss) is the authoritative failure.
       }
-      if (error instanceof FreshTailObserverError) throw error;
-      throw new FreshTailObserverError("observer_cycle_failed", true, message);
+      cycleError =
+        authoritativeError instanceof FreshTailObserverError
+          ? authoritativeError
+          : new FreshTailObserverError("observer_cycle_failed", true, message);
     } finally {
-      void sampledHead;
+      const keepaliveFailure = await stopLeaseKeepalive();
+      cycleError ??= keepaliveFailure;
     }
+    if (cycleError) throw cycleError;
+    if (!cycleResult) {
+      throw new FreshTailObserverError(
+        "observer_cycle_failed",
+        false,
+        "fresh-tail observer cycle completed without a result",
+      );
+    }
+    return cycleResult;
   }
 }
