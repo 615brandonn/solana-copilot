@@ -53,6 +53,8 @@ export type FreshTailWorkMint = {
   enrollmentSlot: number;
   enrollmentBlockhash: string;
   enrollmentBlockTime: string;
+  /** Latest finalized root supply event used to age out an unclaimed launch. */
+  lastSupplyEventBlockTime: string;
   enrollmentTargetWallet: string;
   creationSlot: number;
   bondingCurve: string;
@@ -67,6 +69,16 @@ export type FreshTailWorkMint = {
   scopeRevision: number;
   poisoned: boolean;
   poisonReason: string | null;
+};
+
+export type FreshTailArmedBinding = {
+  entryClaimId: string;
+  positionId: string;
+  tokenMint: string;
+  sourceSlot: number;
+  epochId: string;
+  requestId: string;
+  armedAt: string;
 };
 
 export type FreshTailWorkWallet = {
@@ -159,7 +171,7 @@ export type FreshTailWork = {
   cursors: FreshTailWorkCursor[];
   backscanRanges: FreshTailBackscanRange[];
   requests: FreshTailWorkRequest[];
-  armedBindings: Array<Record<string, unknown>>;
+  armedBindings: FreshTailArmedBinding[];
   exitIntentHealth: Record<string, number>;
 };
 

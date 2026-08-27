@@ -1804,6 +1804,11 @@ begin
         'enrollmentSlot', m.enrollment_slot,
         'enrollmentBlockhash', m.enrollment_blockhash,
         'enrollmentBlockTime', m.enrollment_block_time,
+        'lastSupplyEventBlockTime', coalesce((
+          select max(e.block_time)
+          from public.custody_fresh_tail_supply_events e
+          where e.epoch_id = m.epoch_id and e.token_mint = m.token_mint
+        ), m.enrollment_block_time),
         'enrollmentTargetWallet', m.enrollment_target_wallet,
         'bondingCurve', m.bonding_curve, 'creator', m.creator,
         'createVariant', m.create_variant, 'tokenProgram', m.token_program,
@@ -2782,6 +2787,8 @@ declare
   v_mint public.custody_fresh_tail_mints%rowtype;
   v_token_mint text := btrim(coalesce(p_token_mint, ''));
   v_reason text := lower(btrim(coalesce(p_reason, '')));
+  v_window_seconds integer;
+  v_last_supply_at timestamptz;
 begin
   v_epoch := public.assert_custody_fresh_tail_lease(
     p_user_id, p_epoch_id, p_lease_token, p_lease_generation
@@ -2820,6 +2827,14 @@ begin
     );
   end if;
   if exists (
+    select 1 from public.custody_fresh_tail_requests q
+    where q.epoch_id = p_epoch_id and q.token_mint = v_token_mint
+      and q.status in ('pending', 'settled')
+      and q.expires_at > clock_timestamp()
+  ) then
+    return jsonb_build_object('ok', false, 'reason', 'fresh_request_still_live');
+  end if;
+  if exists (
     select 1 from public.entry_signal_claims c
     where c.user_id = p_user_id and c.fresh_tail_epoch_id = p_epoch_id
       and c.token_mint = v_token_mint
@@ -2832,6 +2847,34 @@ begin
       and p.closed_at is null and c.fresh_tail_epoch_id = p_epoch_id
   ) then
     return jsonb_build_object('ok', false, 'reason', 'fresh_position_still_armed');
+  end if;
+  if exists (
+    select 1 from public.custody_fresh_tail_exit_intents i
+    where i.user_id = p_user_id and i.epoch_id = p_epoch_id
+      and i.token_mint = v_token_mint
+      and i.status not in ('resolved', 'dismissed')
+  ) then
+    return jsonb_build_object('ok', false, 'reason', 'fresh_exit_still_unresolved');
+  end if;
+  if v_reason = 'dormant_below_threshold' then
+    select greatest(
+      30,
+      least(3600, coalesce(c.supply_accumulation_window_seconds, 600))
+    )::integer
+    into v_window_seconds
+    from public.bot_config c
+    where c.user_id = p_user_id;
+    if v_window_seconds is null then
+      return jsonb_build_object('ok', false, 'reason', 'fresh_config_missing');
+    end if;
+    select coalesce(max(e.block_time), v_mint.enrollment_block_time)
+    into v_last_supply_at
+    from public.custody_fresh_tail_supply_events e
+    where e.epoch_id = p_epoch_id and e.token_mint = v_token_mint;
+    if v_last_supply_at is null
+       or v_last_supply_at > clock_timestamp() - make_interval(secs => v_window_seconds) then
+      return jsonb_build_object('ok', false, 'reason', 'mint_not_dormant');
+    end if;
   end if;
 
   update public.custody_fresh_tail_requests set

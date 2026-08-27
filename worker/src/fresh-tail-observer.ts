@@ -59,6 +59,7 @@ const DEFAULT_RPC_TIMEOUT_MS = 4_000;
 const REQUEST_RESERVE_MS = 4_000;
 const PRICE_MAX_AGE_MS = 5_000;
 const MAX_FIXED_POINT_STEPS = 512;
+const MAX_RETIREMENTS_PER_CYCLE = 25;
 
 export type FreshTailObserverConfig = {
   observerEnabled: boolean;
@@ -117,6 +118,76 @@ type PersistResult = {
   requestCandidates: RequestCandidate[];
   poisoned: boolean;
 };
+
+export type FreshTailRetirementCandidate = {
+  tokenMint: string;
+  scopeRevision: number;
+  reason: "dormant_below_threshold" | "unsupported_after_enrollment";
+};
+
+/**
+ * Selects only launch watches that can no longer create a live entry. The
+ * database repeats the binding/position/intent checks under the mint advisory
+ * lock, so this snapshot is an optimization rather than the safety boundary.
+ */
+export function selectFreshTailRetirementCandidates(
+  work: Pick<FreshTailWork, "mints" | "requests" | "armedBindings">,
+  finalizedHeadBlockTimeMs: number,
+  windowSeconds: number,
+  limit = MAX_RETIREMENTS_PER_CYCLE,
+): FreshTailRetirementCandidate[] {
+  if (
+    !Number.isSafeInteger(finalizedHeadBlockTimeMs) ||
+    finalizedHeadBlockTimeMs <= 0 ||
+    !Number.isSafeInteger(windowSeconds) ||
+    windowSeconds < 30 ||
+    windowSeconds > 3_600 ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > 100
+  ) {
+    return [];
+  }
+  // A malformed binding snapshot must never be interpreted as permission to
+  // retire. getWork is a service-only RPC, but fail closed on contract drift.
+  if (
+    work.armedBindings.some(
+      (binding) => typeof binding.tokenMint !== "string" || binding.tokenMint.length === 0,
+    )
+  ) {
+    return [];
+  }
+  const armed = new Set(work.armedBindings.map((binding) => binding.tokenMint));
+  const liveRequestMints = new Set(
+    work.requests
+      .filter(
+        (request) =>
+          (request.status === "pending" || request.status === "settled") &&
+          parseIsoMs(request.expiresAt) > finalizedHeadBlockTimeMs,
+      )
+      .map((request) => request.tokenMint),
+  );
+  const dormantBeforeMs = finalizedHeadBlockTimeMs - windowSeconds * 1_000;
+  return work.mints
+    .filter((mint) => {
+      if (mint.status !== "active" || armed.has(mint.tokenMint)) return false;
+      if (liveRequestMints.has(mint.tokenMint)) return false;
+      if (mint.poisoned) return true;
+      const lastEventMs = parseIsoMs(mint.lastSupplyEventBlockTime);
+      return lastEventMs > 0 && lastEventMs <= dormantBeforeMs;
+    })
+    .sort((left, right) => {
+      const leftTime = parseIsoMs(left.lastSupplyEventBlockTime);
+      const rightTime = parseIsoMs(right.lastSupplyEventBlockTime);
+      return leftTime - rightTime || left.tokenMint.localeCompare(right.tokenMint);
+    })
+    .slice(0, limit)
+    .map((mint) => ({
+      tokenMint: mint.tokenMint,
+      scopeRevision: mint.scopeRevision,
+      reason: mint.poisoned ? "unsupported_after_enrollment" : "dormant_below_threshold",
+    }));
+}
 
 export class FreshTailObserverError extends Error {
   constructor(
@@ -1381,6 +1452,54 @@ export class FreshTailObserver {
     );
   }
 
+  private async retireInactiveMints(
+    head: FreshTailFinalizedHead,
+    config: FreshTailObserverConfig,
+    deadlineMs: number,
+  ): Promise<number> {
+    if (deadlineMs - Number(this.nowMs()) <= REQUEST_RESERVE_MS) return 0;
+    this.assertLease();
+    const work = await this.store.getWork(this.epoch!.epochId, this.lease!);
+    const candidates = selectFreshTailRetirementCandidates(
+      work,
+      head.blockTimeMs,
+      config.windowSeconds,
+    );
+    let retired = 0;
+    for (const candidate of candidates) {
+      if (deadlineMs - Number(this.nowMs()) <= REQUEST_RESERVE_MS) break;
+      this.assertLease();
+      const result = await this.store.retireMint(
+        this.epoch!.epochId,
+        this.lease!,
+        candidate.tokenMint,
+        candidate.scopeRevision,
+        candidate.reason,
+      );
+      if (result.ok) {
+        retired += 1;
+        continue;
+      }
+      // All of these mean authoritative state changed after getWork. They are
+      // safe no-ops and will be reconsidered from a fresh snapshot next cycle.
+      if (
+        result.reason === "scope_revision_conflict" ||
+        result.reason === "fresh_position_still_armed" ||
+        result.reason === "fresh_exit_still_unresolved" ||
+        result.reason === "fresh_request_still_live" ||
+        result.reason === "mint_not_found"
+      ) {
+        continue;
+      }
+      throw new FreshTailObserverError(
+        `retire_mint_${result.reason}`,
+        true,
+        `fresh-tail mint retirement failed: ${result.reason}`,
+      );
+    }
+    return retired;
+  }
+
   private requestCannotRewind(work: FreshTailWork, request: FreshTailWorkRequest): boolean {
     return (
       work.cursors.some(
@@ -1560,6 +1679,7 @@ export class FreshTailObserver {
       let requestsSettled = await this.drainRequests(config, deadlineMs, completedRequests);
       await this.coverHead(sampled.head, config, deadlineMs);
       requestsSettled += await this.drainRequests(config, deadlineMs, completedRequests);
+      await this.retireInactiveMints(sampled.head, config, deadlineMs);
       const successAt = new Date(Number(this.nowMs())).toISOString();
       await this.heartbeat(config, successAt, null);
       return {

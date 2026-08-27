@@ -191,6 +191,53 @@ test("restart resumes from the exact durable signature without a slot fallback",
   assert.deepEqual(processed, ["new"]);
 });
 
+test("a gap beyond eight pages fails closed without event or cursor writes", async () => {
+  const rows = Array.from({ length: 8_001 }, (_, index) => row(`new-${index}`, 9_000 - index));
+  rows.push(row("cursor-sig", 999));
+  const bySignature = new Map(rows.map((entry, index) => [entry.signature, index]));
+  const deepRpc = {
+    async getSignaturesForAddress(_wallet: unknown, options: { before?: string }) {
+      const start = options.before ? (bySignature.get(options.before) ?? rows.length) + 1 : 0;
+      return rows.slice(start, start + 1_000);
+    },
+    async getFirstAvailableBlock() {
+      return 1;
+    },
+    async getParsedTransactions() {
+      throw new Error("transactions must not load before the exact boundary is discovered");
+    },
+  } as FreshTailLaneConnection;
+  let eventWrites = 0;
+  let cursorWrites = 0;
+  await assert.rejects(
+    processFreshTailLane({
+      rpc: deepRpc,
+      cursor: cursor({
+        boundaryKind: "exact_signature",
+        lastSignature: "cursor-sig",
+        lastSlot: 999,
+        firstAvailableBlock: 1,
+      }),
+      head: { ...head, slot: 9_000 },
+      deadlineMs: Date.now() + 10_000,
+      assertLease: () => undefined,
+      persistTransaction: async () => {
+        eventWrites += 1;
+        return 0;
+      },
+      persistCursor: async () => {
+        cursorWrites += 1;
+      },
+    }),
+    (error: unknown) =>
+      error instanceof Error &&
+      "code" in error &&
+      (error as { code: string }).code === "page_limit",
+  );
+  assert.equal(eventWrites, 0);
+  assert.equal(cursorWrites, 0);
+});
+
 test("55-second candidate deadline reserves time for settlement and submission", () => {
   const trigger = 1_000_000;
   assert.equal(freshTailCandidateIsActionable(trigger, trigger + 50_999), true);

@@ -42,6 +42,24 @@ test("older durable request heads drain before discovery advances to the latest 
   assert.match(observerSource, /requestCannotRewind/);
 });
 
+test("dormant launch retirement runs only after current-head coverage and request drain", () => {
+  const cycle = observerSource.slice(observerSource.indexOf("async cycle(config"));
+  const latestCoverage = cycle.indexOf("this.coverHead(sampled.head");
+  const secondDrain = cycle.indexOf("this.drainRequests", latestCoverage);
+  const retirement = cycle.indexOf("this.retireInactiveMints", secondDrain);
+  const heartbeat = cycle.indexOf("this.heartbeat", retirement);
+  assert.ok(
+    latestCoverage >= 0 &&
+      secondDrain > latestCoverage &&
+      retirement > secondDrain &&
+      heartbeat > retirement,
+  );
+  assert.match(observerSource, /MAX_RETIREMENTS_PER_CYCLE = 25/);
+  assert.match(observerSource, /fresh_position_still_armed/);
+  assert.match(observerSource, /fresh_exit_still_unresolved/);
+  assert.match(observerSource, /fresh_request_still_live/);
+});
+
 test("market-cap evidence rejects stale prices and uses the exact reserve ratio", () => {
   const now = 1_000_000;
   const evidence = {
