@@ -55,7 +55,7 @@ test("migration records the immutable prepared signature, expiry, and exact raw 
   );
   assert.match(
     sql,
-    /create unique index if not exists trades_sell_signature_idx[\s\S]*where side = 'sell'/i,
+    /create unique index if not exists trades_sell_signature_idx\s+on public\.trades \(user_id, tx_sig, token_mint\)\s+where side = 'sell'/i,
   );
 });
 
@@ -100,6 +100,18 @@ test("apply RPC validates an exact debit and atomically writes trade, position, 
   assert.match(
     body.slice(replayAt, closedRejectionAt),
     /v_existing_trade\.amount_tokens \* power\(10::numeric, p_token_decimals\) <> v_sold_raw[\s\S]*persisted_trade_mismatch/i,
+  );
+  const duplicateGuard = body.match(
+    /if exists \([\s\S]*?from public\.trades t[\s\S]*?sell_signature_already_recorded'/i,
+  )?.[0];
+  assert.ok(duplicateGuard, "pre-apply sell-signature guard is missing");
+  assert.match(duplicateGuard, /t\.user_id = p_user_id/i);
+  assert.match(duplicateGuard, /t\.side = 'sell'/i);
+  assert.match(duplicateGuard, /t\.tx_sig = v_signature/i);
+  assert.doesNotMatch(
+    duplicateGuard,
+    /token_mint|valuation_source/i,
+    "the apply guard must reject any prior ledger row with the prepared signature",
   );
   const tradeAt = body.indexOf("insert into public.trades");
   const positionAt = body.indexOf("update public.positions set");
