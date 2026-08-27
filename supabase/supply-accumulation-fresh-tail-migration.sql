@@ -174,6 +174,9 @@ create table if not exists public.custody_fresh_tail_mint_rejections (
     references public.custody_fresh_tail_epochs(id, user_id)
 );
 
+create index if not exists custody_fresh_tail_rejections_recovery_idx
+  on public.custody_fresh_tail_mint_rejections (epoch_id, source_slot);
+
 -- This is a fresh-owned finalized ledger.  Authorization never reads the
 -- legacy supply_accumulation_events/state tables.
 create table if not exists public.custody_fresh_tail_supply_events (
@@ -516,6 +519,10 @@ alter table public.entry_signal_claims
 create unique index if not exists entry_signal_claims_fresh_tail_request_once_idx
   on public.entry_signal_claims (fresh_tail_request_id)
   where fresh_tail_request_id is not null;
+
+create index if not exists entry_signal_claims_fresh_tail_armed_idx
+  on public.entry_signal_claims (fresh_tail_epoch_id, token_mint, created_at)
+  where fresh_tail_monitoring_armed_at is not null;
 
 do $$
 begin
@@ -1762,10 +1769,81 @@ set search_path = pg_catalog, public, pg_temp
 as $$
 declare
   v_epoch public.custody_fresh_tail_epochs%rowtype;
+  v_root_floor_slot bigint;
+  v_active_mint_count bigint;
+  v_active_wallet_count bigint;
+  v_active_backscan_count bigint;
+  v_live_request_count bigint;
+  v_relevant_rejection_count bigint;
+  v_active_binding_count bigint;
 begin
   v_epoch := public.assert_custody_fresh_tail_lease(
     p_user_id, p_epoch_id, p_lease_token, p_lease_generation
   );
+
+  select min(coalesce(c.last_processed_slot, c.floor_slot))
+  into v_root_floor_slot
+  from public.custody_fresh_tail_cursors c
+  where c.epoch_id = p_epoch_id and c.scope_mint = '*'
+    and c.cursor_role = 'root';
+  v_root_floor_slot := coalesce(v_root_floor_slot, v_epoch.activation_slot);
+
+  select count(*) into v_active_mint_count
+  from public.custody_fresh_tail_mints m
+  where m.epoch_id = p_epoch_id and m.status = 'active';
+  select count(*) into v_active_wallet_count
+  from public.custody_fresh_tail_wallets w
+  join public.custody_fresh_tail_mints m
+    on m.epoch_id = w.epoch_id and m.token_mint = w.token_mint
+   and m.status = 'active'
+  where w.epoch_id = p_epoch_id;
+  select count(*) into v_active_backscan_count
+  from public.custody_fresh_tail_backscan_ranges r
+  join public.custody_fresh_tail_mints m
+    on m.epoch_id = r.epoch_id and m.token_mint = r.token_mint
+   and m.status = 'active'
+  where r.epoch_id = p_epoch_id;
+  select count(*) into v_live_request_count
+  from public.custody_fresh_tail_requests q
+  where q.epoch_id = p_epoch_id and q.status in ('pending', 'settled');
+  select count(*) into v_relevant_rejection_count
+  from public.custody_fresh_tail_mint_rejections r
+  where r.epoch_id = p_epoch_id and r.source_slot >= v_root_floor_slot;
+  select count(*) into v_active_binding_count
+  from public.entry_signal_claims c
+  join public.custody_fresh_tail_mints m
+    on m.epoch_id = c.fresh_tail_epoch_id and m.token_mint = c.token_mint
+   and m.status = 'active'
+  where c.user_id = p_user_id and c.fresh_tail_epoch_id = p_epoch_id
+    and c.fresh_tail_monitoring_armed_at is not null
+    and (
+      c.status in ('claimed', 'submitted', 'landed', 'uncertain')
+      or exists (
+        select 1 from public.positions p
+        where p.id = c.planned_position_id and p.user_id = c.user_id
+          and p.closed_at is null
+      )
+    );
+
+  -- Never construct an unbounded JSON work snapshot.  Crossing a cap stops
+  -- this isolated observer lane fail-closed; it cannot affect the main worker
+  -- or authorize an entry with an incomplete view.
+  if v_active_mint_count > 256
+     or v_active_wallet_count > 2048
+     or v_active_backscan_count > 2048
+     or v_live_request_count > 256
+     or v_relevant_rejection_count > 2048
+     or v_active_binding_count > 512 then
+    return jsonb_build_object(
+      'ok', false, 'reason', 'work_resource_cap',
+      'activeMintCount', v_active_mint_count,
+      'activeWalletCount', v_active_wallet_count,
+      'activeBackscanCount', v_active_backscan_count,
+      'liveRequestCount', v_live_request_count,
+      'relevantRejectionCount', v_relevant_rejection_count,
+      'activeBindingCount', v_active_binding_count
+    );
+  end if;
   return jsonb_build_object(
     'ok', true,
     'reason', 'loaded',
@@ -1820,7 +1898,8 @@ begin
         'poisonReason', m.poison_reason, 'retireReason', m.retire_reason,
         'retiredAt', m.retired_at
       ) order by m.token_mint)
-      from public.custody_fresh_tail_mints m where m.epoch_id = p_epoch_id
+      from public.custody_fresh_tail_mints m
+      where m.epoch_id = p_epoch_id and m.status = 'active'
     ), '[]'::jsonb),
     'rejections', coalesce((
       select jsonb_agg(jsonb_build_object(
@@ -1831,7 +1910,7 @@ begin
         'quarantined', r.quarantined, 'conflictCount', r.conflict_count
       ) order by r.token_mint)
       from public.custody_fresh_tail_mint_rejections r
-      where r.epoch_id = p_epoch_id
+      where r.epoch_id = p_epoch_id and r.source_slot >= v_root_floor_slot
     ), '[]'::jsonb),
     'wallets', coalesce((
       select jsonb_agg(jsonb_build_object(
@@ -1912,7 +1991,8 @@ begin
         'scopeRevision', q.scope_revision, 'settledRevision', q.settled_revision,
         'settledLeaseGeneration', q.settled_lease_generation
       ) order by q.created_at)
-      from public.custody_fresh_tail_requests q where q.epoch_id = p_epoch_id
+      from public.custody_fresh_tail_requests q
+      where q.epoch_id = p_epoch_id and q.status in ('pending', 'settled')
     ), '[]'::jsonb),
     'armedBindings', coalesce((
       select jsonb_agg(jsonb_build_object(
@@ -1922,7 +2002,19 @@ begin
         'armedAt', c.fresh_tail_monitoring_armed_at
       ) order by c.created_at)
       from public.entry_signal_claims c
+      join public.custody_fresh_tail_mints m
+        on m.epoch_id = c.fresh_tail_epoch_id and m.token_mint = c.token_mint
+       and m.status = 'active'
       where c.user_id = p_user_id and c.fresh_tail_epoch_id = p_epoch_id
+        and c.fresh_tail_monitoring_armed_at is not null
+        and (
+          c.status in ('claimed', 'submitted', 'landed', 'uncertain')
+          or exists (
+            select 1 from public.positions p
+            where p.id = c.planned_position_id and p.user_id = c.user_id
+              and p.closed_at is null
+          )
+        )
     ), '[]'::jsonb),
     'exitIntentHealth', coalesce((
       select jsonb_object_agg(status, count)
@@ -2110,7 +2202,6 @@ begin
         and c.fresh_tail_epoch_id = p_epoch_id
         and c.token_mint = v_token_mint
         and c.fresh_tail_monitoring_armed_at is not null
-        and c.source_slot is not null and v_existing.slot >= c.source_slot
       on conflict do nothing;
       return jsonb_build_object(
         'ok', false, 'reason', 'payload_conflict', 'epochId', p_epoch_id,
@@ -2459,7 +2550,6 @@ begin
         and c.fresh_tail_epoch_id = p_epoch_id
         and c.token_mint = v_token_mint
         and c.fresh_tail_monitoring_armed_at is not null
-        and c.source_slot is not null and v_existing.slot >= c.source_slot
       on conflict do nothing;
       return jsonb_build_object(
         'ok', false, 'reason', 'payload_conflict', 'epochId', p_epoch_id,
@@ -2787,8 +2877,8 @@ declare
   v_mint public.custody_fresh_tail_mints%rowtype;
   v_token_mint text := btrim(coalesce(p_token_mint, ''));
   v_reason text := lower(btrim(coalesce(p_reason, '')));
-  v_window_seconds integer;
   v_last_supply_at timestamptz;
+  v_latest_head_at timestamptz;
 begin
   v_epoch := public.assert_custody_fresh_tail_lease(
     p_user_id, p_epoch_id, p_lease_token, p_lease_generation
@@ -2839,6 +2929,17 @@ begin
     where c.user_id = p_user_id and c.fresh_tail_epoch_id = p_epoch_id
       and c.token_mint = v_token_mint
       and c.fresh_tail_monitoring_armed_at is not null
+      and (
+        c.status in ('claimed', 'submitted', 'landed', 'uncertain')
+        or (
+          c.status = 'persisted'
+          and not exists (
+            select 1 from public.positions p
+            where p.id = c.planned_position_id and p.user_id = c.user_id
+              and p.token_mint = c.token_mint and p.closed_at is not null
+          )
+        )
+      )
   ) or exists (
     select 1
     from public.positions p
@@ -2857,22 +2958,20 @@ begin
     return jsonb_build_object('ok', false, 'reason', 'fresh_exit_still_unresolved');
   end if;
   if v_reason = 'dormant_below_threshold' then
-    select greatest(
-      30,
-      least(3600, coalesce(c.supply_accumulation_window_seconds, 600))
-    )::integer
-    into v_window_seconds
-    from public.bot_config c
-    where c.user_id = p_user_id;
-    if v_window_seconds is null then
-      return jsonb_build_object('ok', false, 'reason', 'fresh_config_missing');
-    end if;
+    -- V1 owns only the first finalized hour of a launch campaign. Retirement
+    -- is permanent, so a later revival is deliberately outside this lane.
+    select max(h.block_time) into v_latest_head_at
+    from public.custody_fresh_tail_finalized_heads h
+    where h.epoch_id = p_epoch_id and h.user_id = p_user_id;
     select coalesce(max(e.block_time), v_mint.enrollment_block_time)
     into v_last_supply_at
     from public.custody_fresh_tail_supply_events e
     where e.epoch_id = p_epoch_id and e.token_mint = v_token_mint;
+    if v_latest_head_at is null then
+      return jsonb_build_object('ok', false, 'reason', 'finalized_head_missing');
+    end if;
     if v_last_supply_at is null
-       or v_last_supply_at > clock_timestamp() - make_interval(secs => v_window_seconds) then
+       or v_last_supply_at > v_latest_head_at - interval '1 hour' then
       return jsonb_build_object('ok', false, 'reason', 'mint_not_dormant');
     end if;
   end if;

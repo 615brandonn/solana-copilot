@@ -74,20 +74,19 @@ function binding(tokenMint: string): FreshTailArmedBinding {
   };
 }
 
-test("retires only old unclaimed launches in deterministic bounded order", () => {
+test("retires only campaigns inactive for one finalized hour in bounded order", () => {
   const candidates = selectFreshTailRetirementCandidates(
     {
       mints: [
         mint("new", "2026-08-27T19:55:00.000Z"),
-        mint("old-b", "2026-08-27T19:20:00.000Z", { scopeRevision: 4 }),
-        mint("old-a", "2026-08-27T19:10:00.000Z", { scopeRevision: 3 }),
+        mint("old-b", "2026-08-27T18:20:00.000Z", { scopeRevision: 4 }),
+        mint("old-a", "2026-08-27T18:10:00.000Z", { scopeRevision: 3 }),
         mint("retired", "2026-08-27T18:00:00.000Z", { status: "retired" }),
       ],
       requests: [],
       armedBindings: [],
     },
     headMs,
-    600,
     1,
   );
   assert.deepEqual(candidates, [
@@ -110,7 +109,6 @@ test("live requests and every armed binding keep the mint monitored", () => {
       armedBindings: [binding("armed")],
     },
     headMs,
-    600,
   );
   assert.deepEqual(
     candidates.map((candidate) => candidate.tokenMint),
@@ -127,7 +125,6 @@ test("poisoned unclaimed launches retire, while malformed binding data fails clo
     selectFreshTailRetirementCandidates(
       { mints: [poisoned], requests: [], armedBindings: [] },
       headMs,
-      600,
     ),
     [
       {
@@ -145,7 +142,6 @@ test("poisoned unclaimed launches retire, while malformed binding data fails clo
         armedBindings: [{ ...binding("poisoned"), tokenMint: "" }],
       },
       headMs,
-      600,
     ),
     [],
   );
@@ -163,7 +159,9 @@ test("SQL repeats every retirement safety check under the mint lock", () => {
   assert.match(retirement, /fresh_request_still_live/);
   assert.match(retirement, /fresh_position_still_armed/);
   assert.match(retirement, /fresh_exit_still_unresolved/);
-  assert.match(retirement, /supply_accumulation_window_seconds/);
+  assert.doesNotMatch(retirement, /supply_accumulation_window_seconds/);
+  assert.match(retirement, /interval '1 hour'/);
+  assert.match(retirement, /custody_fresh_tail_finalized_heads/);
   assert.match(retirement, /max\(e\.block_time\)/);
   assert.match(retirement, /mint_not_dormant/);
   assert.match(sql, /'lastSupplyEventBlockTime',[\s\S]*max\(e\.block_time\)/);

@@ -58,6 +58,7 @@ test("dormant launch retirement runs only after current-head coverage and reques
   assert.match(observerSource, /fresh_position_still_armed/);
   assert.match(observerSource, /fresh_exit_still_unresolved/);
   assert.match(observerSource, /fresh_request_still_live/);
+  assert.match(observerSource, /mint_not_dormant/);
 });
 
 test("market-cap evidence rejects stale prices and uses the exact reserve ratio", () => {
@@ -80,4 +81,15 @@ test("market-cap evidence rejects stale prices and uses the exact reserve ratio"
     ),
     null,
   );
+});
+
+test("historical tombstones and retired mints cannot pin a root cursor", () => {
+  const enrollment = observerSource.slice(
+    observerSource.indexOf("private async enrollDiscovery"),
+    observerSource.indexOf("private async valuationFor"),
+  );
+  const attestation = enrollment.slice(enrollment.indexOf("const attestation"));
+  assert.match(attestation, /attestation\.reason === "mint_tombstoned"/);
+  assert.match(attestation, /attestation\.reason === "mint_retired"/);
+  assert.ok(attestation.indexOf("return null") < attestation.indexOf("requireMutation"));
 });

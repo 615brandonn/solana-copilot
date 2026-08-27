@@ -60,6 +60,7 @@ const REQUEST_RESERVE_MS = 4_000;
 const PRICE_MAX_AGE_MS = 5_000;
 const MAX_FIXED_POINT_STEPS = 512;
 const MAX_RETIREMENTS_PER_CYCLE = 25;
+const LAUNCH_CAMPAIGN_RETENTION_SECONDS = 60 * 60;
 
 export type FreshTailObserverConfig = {
   observerEnabled: boolean;
@@ -126,22 +127,19 @@ export type FreshTailRetirementCandidate = {
 };
 
 /**
- * Selects only launch watches that can no longer create a live entry. The
- * database repeats the binding/position/intent checks under the mint advisory
- * lock, so this snapshot is an optimization rather than the safety boundary.
+ * Selects only launch watches outside v1's fixed one-hour launch campaign.
+ * Retirement is permanent: a later revival is intentionally not eligible for
+ * this lane. The database repeats the binding/position/intent/time checks under
+ * the mint advisory lock, so this snapshot is only an optimization.
  */
 export function selectFreshTailRetirementCandidates(
   work: Pick<FreshTailWork, "mints" | "requests" | "armedBindings">,
   finalizedHeadBlockTimeMs: number,
-  windowSeconds: number,
   limit = MAX_RETIREMENTS_PER_CYCLE,
 ): FreshTailRetirementCandidate[] {
   if (
     !Number.isSafeInteger(finalizedHeadBlockTimeMs) ||
     finalizedHeadBlockTimeMs <= 0 ||
-    !Number.isSafeInteger(windowSeconds) ||
-    windowSeconds < 30 ||
-    windowSeconds > 3_600 ||
     !Number.isSafeInteger(limit) ||
     limit < 1 ||
     limit > 100
@@ -167,7 +165,7 @@ export function selectFreshTailRetirementCandidates(
       )
       .map((request) => request.tokenMint),
   );
-  const dormantBeforeMs = finalizedHeadBlockTimeMs - windowSeconds * 1_000;
+  const dormantBeforeMs = finalizedHeadBlockTimeMs - LAUNCH_CAMPAIGN_RETENTION_SECONDS * 1_000;
   return work.mints
     .filter((mint) => {
       if (mint.status !== "active" || armed.has(mint.tokenMint)) return false;
@@ -692,18 +690,25 @@ export class FreshTailObserver {
       deadlineMs,
       Number(transaction.blockTime) * 1_000,
     );
-    const attested = requireMutation(
-      "attest_mint_creation",
-      await this.store.attestMintCreation(this.epoch!.epochId, this.lease!, {
-        enrollmentEventKey: rebound.supplyEvents[0]!.eventKey,
-        enrollmentTxSig: signature.signature,
-        enrollmentSlot: signature.slot,
-        enrollmentBlock: enrollmentHead,
-        enrollmentTargetWallet: root,
-        proof,
-        finalizedHead: head.slot >= enrollmentHead.slot ? head : enrollmentHead,
-      }),
-    );
+    const attestation = await this.store.attestMintCreation(this.epoch!.epochId, this.lease!, {
+      enrollmentEventKey: rebound.supplyEvents[0]!.eventKey,
+      enrollmentTxSig: signature.signature,
+      enrollmentSlot: signature.slot,
+      enrollmentBlock: enrollmentHead,
+      enrollmentTargetWallet: root,
+      proof,
+      finalizedHead: head.slot >= enrollmentHead.slot ? head : enrollmentHead,
+    });
+    // Bounded work snapshots intentionally omit historical tombstones and
+    // retired mints. A later root buy for either identity is permanently
+    // checkpointable, not a reason to pin the shared root cursor forever.
+    if (
+      !attestation.ok &&
+      (attestation.reason === "mint_tombstoned" || attestation.reason === "mint_retired")
+    ) {
+      return null;
+    }
+    const attested = requireMutation("attest_mint_creation", attestation);
     if (String(attested.tokenMint ?? proof.mint) !== proof.mint) {
       throw new FreshTailObserverError(
         "store_contract_invalid",
@@ -1454,17 +1459,12 @@ export class FreshTailObserver {
 
   private async retireInactiveMints(
     head: FreshTailFinalizedHead,
-    config: FreshTailObserverConfig,
     deadlineMs: number,
   ): Promise<number> {
     if (deadlineMs - Number(this.nowMs()) <= REQUEST_RESERVE_MS) return 0;
     this.assertLease();
     const work = await this.store.getWork(this.epoch!.epochId, this.lease!);
-    const candidates = selectFreshTailRetirementCandidates(
-      work,
-      head.blockTimeMs,
-      config.windowSeconds,
-    );
+    const candidates = selectFreshTailRetirementCandidates(work, head.blockTimeMs);
     let retired = 0;
     for (const candidate of candidates) {
       if (deadlineMs - Number(this.nowMs()) <= REQUEST_RESERVE_MS) break;
@@ -1487,6 +1487,7 @@ export class FreshTailObserver {
         result.reason === "fresh_position_still_armed" ||
         result.reason === "fresh_exit_still_unresolved" ||
         result.reason === "fresh_request_still_live" ||
+        result.reason === "mint_not_dormant" ||
         result.reason === "mint_not_found"
       ) {
         continue;
@@ -1679,7 +1680,7 @@ export class FreshTailObserver {
       let requestsSettled = await this.drainRequests(config, deadlineMs, completedRequests);
       await this.coverHead(sampled.head, config, deadlineMs);
       requestsSettled += await this.drainRequests(config, deadlineMs, completedRequests);
-      await this.retireInactiveMints(sampled.head, config, deadlineMs);
+      await this.retireInactiveMints(sampled.head, deadlineMs);
       const successAt = new Date(Number(this.nowMs())).toISOString();
       await this.heartbeat(config, successAt, null);
       return {

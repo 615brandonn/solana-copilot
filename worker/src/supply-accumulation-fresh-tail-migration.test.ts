@@ -152,6 +152,31 @@ test("restart discovery reads the active epoch without activation or lease secre
   assert.doesNotMatch(lookup, /\b(?:insert|update|delete)\b/i);
 });
 
+test("recovery work is lifecycle-filtered, indexed, and fails closed at fixed caps", () => {
+  const work = migration.slice(
+    migration.indexOf("create or replace function public.get_custody_fresh_tail_work("),
+    migration.indexOf("create or replace function public.record_custody_fresh_tail_supply_event("),
+  );
+  assert.match(work, /'reason', 'work_resource_cap'/i);
+  assert.match(work, /v_active_mint_count > 256/i);
+  assert.match(work, /v_active_wallet_count > 2048/i);
+  assert.match(work, /v_active_backscan_count > 2048/i);
+  assert.match(work, /v_live_request_count > 256/i);
+  assert.match(work, /v_relevant_rejection_count > 2048/i);
+  assert.match(work, /v_active_binding_count > 512/i);
+  assert.match(work, /m\.status = 'active'/i);
+  assert.match(work, /q\.status in \('pending', 'settled'\)/i);
+  assert.match(work, /r\.source_slot >= v_root_floor_slot/i);
+  assert.match(
+    migration,
+    /custody_fresh_tail_rejections_recovery_idx[\s\S]*\(epoch_id, source_slot\)/i,
+  );
+  assert.match(
+    migration,
+    /entry_signal_claims_fresh_tail_armed_idx[\s\S]*where fresh_tail_monitoring_armed_at is not null/i,
+  );
+});
+
 test("mint enrollment is epoch-level, strict Pump creation proof with durable rejections", () => {
   const signature = migration.slice(
     migration.indexOf("create or replace function public.attest_custody_fresh_tail_mint_creation("),
@@ -197,6 +222,18 @@ test("fresh supply authorization never depends on legacy aggregate rows", () => 
   assert.match(migration, /p_parser_domain text/i);
   assert.match(migration, /b8b6dbdcce44a2b61c55ba2fd74cd385fae489a95be291504eb8e7b15f88262d/i);
   assert.match(migration, /'parser_not_reviewed'/i);
+});
+
+test("parser-domain CASE comparisons use PostgreSQL-safe parentheses", () => {
+  assert.doesNotMatch(migration, /v_parser_domain\s*<>\s*case\b/i);
+  assert.match(
+    migration,
+    /v_parser_domain\s*<>\s*\(case when v_side = 'buy'[\s\S]*?else 'supply_sell_v1' end\)/i,
+  );
+  assert.match(
+    migration,
+    /v_parser_domain\s*<>\s*\(case v_kind[\s\S]*?when 'TERMINAL_OUTFLOW' then 'custody_terminal_v1'[\s\S]*?else '' end\)/i,
+  );
 });
 
 test("fresh custody transfers are one canonical conserving recipient batch", () => {
@@ -425,6 +462,10 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
     supplyWriter,
     /poisoned = true, poison_reason = 'supply_payload_conflict'[\s\S]*'durableConflict', true, 'terminalPoison', true/i,
   );
+  assert.doesNotMatch(
+    supplyWriter,
+    /fresh_tail_monitoring_armed_at is not null[\s\S]{0,200}v_existing\.slot >= c\.source_slot/i,
+  );
   assert.match(
     custodyWriter,
     /payload_fingerprint <> v_fingerprint[\s\S]*insert into public\.custody_fresh_tail_exit_intents[\s\S]*'custody', v_existing\.id, 'terminal_outflow'[\s\S]*'payload_conflict'/i,
@@ -433,9 +474,24 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
     custodyWriter,
     /poisoned = true, poison_reason = 'custody_payload_conflict'[\s\S]*'durableConflict', true, 'terminalPoison', true/i,
   );
+  assert.doesNotMatch(
+    custodyWriter,
+    /fresh_tail_monitoring_armed_at is not null[\s\S]{0,200}v_existing\.slot >= c\.source_slot/i,
+  );
   assert.doesNotMatch(migration, /insert into public\.sell_signal_claims/i);
   assert.doesNotMatch(migration, /insert into public\.trades/i);
   assert.doesNotMatch(migration, /update public\.positions/i);
+});
+
+test("retirement releases closed or failed entries but never an unresolved live entry", () => {
+  const retirement = migration.slice(
+    migration.indexOf("create or replace function public.retire_custody_fresh_tail_mint("),
+    migration.indexOf("create or replace function public.request_custody_fresh_tail_coverage("),
+  );
+  assert.match(retirement, /c\.status in \('claimed', 'submitted', 'landed', 'uncertain'\)/i);
+  assert.match(retirement, /c\.status = 'persisted'[\s\S]*p\.closed_at is not null/i);
+  assert.doesNotMatch(retirement, /fresh_tail_monitoring_armed_at is not null\s*\) or exists/i);
+  assert.match(retirement, /p\.closed_at is null[\s\S]*fresh_position_still_armed/i);
 });
 
 test("fresh entry landing stores one exact raw receipt with idempotent replay", () => {
@@ -481,6 +537,28 @@ test("RLS, grants, Doctor, and TypeScript mirrors cover the new contract", () =>
   for (const rpc of rpcs) {
     assert.match(doctor, new RegExp(`/rpc/${rpc}`));
   }
+});
+
+test("defined RPCs, the service-only grant loop, and install verification are exact sets", () => {
+  const declared = [
+    ...migration.matchAll(/^create or replace function public\.([a-z0-9_]+)\s*\(/gim),
+  ].map((match) => match[1]);
+  const grantBlock = migration.slice(
+    migration.indexOf("-- Every SECURITY DEFINER routine in this isolated namespace"),
+    migration.indexOf("-- Fail the transaction if a dependency was accidentally reordered"),
+  );
+  const grantNames = [...grantBlock.matchAll(/^\s*'([a-z0-9_]+)',?\s*$/gim)].map(
+    (match) => match[1],
+  );
+  const installArrays = [...migration.matchAll(/from unnest\(array\[([\s\S]*?)\]\) name/gim)];
+  assert.equal(installArrays.length, 2);
+  const verifiedNames = [...installArrays[1]![1].matchAll(/'([a-z0-9_]+)'/gim)].map(
+    (match) => match[1],
+  );
+  const expected = [...rpcs].sort();
+  assert.deepEqual([...declared].sort(), expected);
+  assert.deepEqual([...grantNames].sort(), expected);
+  assert.deepEqual([...verifiedNames].sort(), expected);
 });
 
 test("all declared identifiers fit PostgreSQL and hashes use qualified SHA-256", () => {
