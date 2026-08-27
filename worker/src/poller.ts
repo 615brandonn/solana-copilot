@@ -1,4 +1,5 @@
-import { Connection, PublicKey } from "@solana/web3.js";
+import { createHash } from "node:crypto";
+import { Connection, PublicKey, type ConfirmedSignatureInfo } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import pino from "pino";
 import { env } from "./env.js";
@@ -17,19 +18,14 @@ import {
   type WalletTokenDelta,
 } from "./swap-attribution.js";
 import { hasHostileExecutorSignal, hasVerifiedSwapSignal } from "./swap-signal.js";
-import {
-  planNextRpcSignaturePage,
-  planRpcSignaturePages,
-  sanitizeRpcCursorError,
-  type RpcCursorStore,
-  type RpcWalletCursor,
-} from "./rpc-cursor.js";
+import { sanitizeRpcCursorError, type RpcCursorStore, type RpcWalletCursor } from "./rpc-cursor.js";
 
 const log = pino({ level: env.LOG_LEVEL });
 const RPC_SIGNATURE_PAGE_SIZE = 1_000;
 const RPC_SIGNATURE_MAX_PAGES = 1_000;
 const RPC_RECOVERY_CHUNK_SIZE = 5_000;
 const RPC_READ_TIMEOUT_MS = 15_000;
+const MAX_STICKY_RECOVERY_FAILURES = 3;
 
 export type PollerHandler = (event: FeedEvent) => Promise<void> | void;
 
@@ -80,8 +76,46 @@ export type RpcWatchOptions = {
   anchorSlot?: number;
 };
 
+type RpcSignatureRequest = {
+  limit: number;
+  before?: string;
+};
+
+type CompactSignatureInfo = Pick<ConfirmedSignatureInfo, "signature" | "slot" | "blockTime">;
+
+type SignaturePageDescriptor = {
+  request: RpcSignatureRequest;
+  entryCount: number;
+  digest: string;
+  candidateMask: string;
+  candidateCount: number;
+};
+
+type ActiveRecoveryPage = {
+  pageIndex: number;
+  entries: CompactSignatureInfo[];
+  candidateIndexesOldestFirst: number[];
+  offset: number;
+};
+
+type SignatureRecoveryState = {
+  boundarySignature: string | null;
+  boundarySlot: number;
+  descriptors: SignaturePageDescriptor[];
+  pageTails: Set<string>;
+  firstPage: CompactSignatureInfo[] | null;
+  priorSlot: number;
+  oldestCandidateSlot?: number;
+  nextBefore?: string;
+  discoveryComplete: boolean;
+  remainingCount: number;
+  replayPageIndex: number;
+  activePage?: ActiveRecoveryPage;
+};
+
 export class RpcBackfillPoller {
   private watched = new Map<string, RpcWatchOptions>();
+  private watchedEntriesCache?: [string, RpcWatchOptions][];
   private timer?: NodeJS.Timeout;
   private lastPollAt?: number;
   private lastSuccessAt?: number;
@@ -102,14 +136,13 @@ export class RpcBackfillPoller {
   private walletFailureCounts = new Map<string, number>();
   private walletRetryAt = new Map<string, number>();
   private walletLaneInFlight = new Map<string, "live" | "recovery">();
-  private signatureDiscoveryPages = new Map<
-    string,
-    Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[]
-  >();
-  private recoveryQueues = new Map<
-    string,
-    Awaited<ReturnType<Connection["getSignaturesForAddress"]>>
-  >();
+  /**
+   * Only sticky recovery owners may retain signature history between turns.
+   * Each state stores O(page count) descriptors plus at most two compact RPC
+   * pages, rather than every signature object and a second flattened queue.
+   */
+  private recoveryOwners = new Set<string>();
+  private signatureRecoveries = new Map<string, SignatureRecoveryState>();
 
   constructor(
     private conn: Connection,
@@ -149,9 +182,10 @@ export class RpcBackfillPoller {
       currentAnchor !== undefined && nextAnchor !== undefined
         ? Math.min(currentAnchor, nextAnchor)
         : (currentAnchor ?? nextAnchor);
-    this.watched.set(wallet, {
-      anchorSlot: mergedAnchor,
-    });
+    if (!current || currentAnchor !== mergedAnchor) {
+      this.watched.set(wallet, { anchorSlot: mergedAnchor });
+      this.watchedEntriesCache = undefined;
+    }
     const cached = this.cursorCache.get(wallet);
     if (cached) {
       if (
@@ -179,13 +213,14 @@ export class RpcBackfillPoller {
   }
 
   unwatch(wallet: string) {
-    this.watched.delete(wallet);
+    if (this.watched.delete(wallet)) this.watchedEntriesCache = undefined;
     this.backlogWallets.delete(wallet);
     this.cursorHydrationPending.delete(wallet);
     this.walletFailureCounts.delete(wallet);
     this.walletRetryAt.delete(wallet);
-    this.signatureDiscoveryPages.delete(wallet);
-    this.recoveryQueues.delete(wallet);
+    this.cursorCache.delete(wallet);
+    this.cursorSuccessPersistedAt.delete(wallet);
+    this.releaseRecoveryOwnership(wallet, true);
     // Durable cursor intentionally survives unwatch/re-watch cycles.
   }
 
@@ -209,6 +244,8 @@ export class RpcBackfillPoller {
       lastRecoveryProgressAt: this.lastRecoveryProgressAt,
       processedSignatureCount: this.processedSignatureCount,
       inFlightWalletCount: this.walletsInFlight.size,
+      recoveryOwnerCount: this.recoveryOwners.size,
+      retainedRecoveryWalletCount: this.signatureRecoveries.size,
       failures: this.failures,
     };
   }
@@ -281,14 +318,38 @@ export class RpcBackfillPoller {
     return (
       this.backlogWallets.has(wallet) ||
       this.cursorHydrationPending.has(wallet) ||
-      this.signatureDiscoveryPages.has(wallet) ||
-      this.recoveryQueues.has(wallet)
+      this.signatureRecoveries.has(wallet)
     );
+  }
+
+  private recoveryConcurrency(): number {
+    const concurrency = Math.max(1, Math.trunc(Number(this.options.pollConcurrency ?? 8)));
+    const configured = Math.trunc(Number(this.options.recoveryConcurrency ?? concurrency));
+    return Math.max(1, Math.min(concurrency, configured || 1));
+  }
+
+  private acquireRecoveryOwnership(wallet: string): boolean {
+    if (this.recoveryOwners.has(wallet)) return true;
+    if (this.recoveryOwners.size >= this.recoveryConcurrency()) return false;
+    this.recoveryOwners.add(wallet);
+    return true;
+  }
+
+  private releaseRecoveryOwnership(wallet: string, discardState: boolean) {
+    this.recoveryOwners.delete(wallet);
+    if (discardState) this.signatureRecoveries.delete(wallet);
+  }
+
+  private watchedEntries(): [string, RpcWatchOptions][] {
+    if (!this.watchedEntriesCache) {
+      this.watchedEntriesCache = Array.from(this.watched.entries());
+    }
+    return this.watchedEntriesCache;
   }
 
   private async poll() {
     this.lastPollAt = Date.now();
-    const allEntries = Array.from(this.watched.entries());
+    const allEntries = this.watchedEntries();
     if (allEntries.length === 0) return;
     const concurrency = Math.max(1, Math.trunc(Number(this.options.pollConcurrency ?? 8)));
     const available = Math.max(0, concurrency - this.walletsInFlight.size);
@@ -296,22 +357,13 @@ export class RpcBackfillPoller {
     const configuredLimit = Math.trunc(Number(this.options.maxWalletsPerPoll ?? available));
     const launchLimit = Math.max(1, Math.min(available, configuredLimit || 1));
     const now = Date.now();
-    const configuredRecoveryConcurrency = Math.trunc(
-      Number(this.options.recoveryConcurrency ?? concurrency),
-    );
-    const recoveryConcurrency = Math.max(
-      1,
-      Math.min(concurrency, configuredRecoveryConcurrency || 1),
-    );
+    const recoveryConcurrency = this.recoveryConcurrency();
     let recoveryInFlight = Array.from(this.walletLaneInFlight.values()).filter(
       (lane) => lane === "recovery",
     ).length;
     let launched = 0;
 
-    const launch = (entryIndex: number, lane: "live" | "recovery") => {
-      const entry = allEntries[entryIndex];
-      if (!entry) return;
-      const [wallet, options] = entry;
+    const launch = (wallet: string, options: RpcWatchOptions, lane: "live" | "recovery") => {
       launched += 1;
       this.walletsInFlight.add(wallet);
       if (lane === "recovery") recoveryInFlight += 1;
@@ -319,30 +371,46 @@ export class RpcBackfillPoller {
       void this.runWalletPoll(wallet, options);
     };
 
-    // Recovery is selected independently of the live-wallet rotation. A large
-    // current watch set can therefore never hide a backlogged wallet beyond a
-    // small maxWalletsPerPoll slice. The separate offset keeps deep recovery
-    // wallets fair without disturbing the live round-robin.
-    const recoverySlots = Math.max(0, recoveryConcurrency - recoveryInFlight);
-    const recoveryLaunchLimit = Math.min(recoverySlots, launchLimit);
+    // Drop owners that completed or were unwatched outside the normal lane
+    // completion path. A productive owner otherwise remains sticky until its
+    // trusted boundary and replay queue are fully drained.
+    for (const wallet of this.recoveryOwners) {
+      if (!this.watched.has(wallet) || !this.isRecoveryWallet(wallet)) {
+        this.releaseRecoveryOwnership(wallet, !this.watched.has(wallet));
+      }
+    }
+
+    // Fill empty sticky slots using a separate round-robin. This full watch-set
+    // scan happens only when an owner slot opens, not every 750ms while deep
+    // recovery is active.
     const recoveryStart = this.recoveryPollOffset % allEntries.length;
     let recoveryScanned = 0;
-    let recoveryLaunched = 0;
-    let nextRecoveryOffset = recoveryStart;
-    while (recoveryScanned < allEntries.length && recoveryLaunched < recoveryLaunchLimit) {
+    while (recoveryScanned < allEntries.length && this.recoveryOwners.size < recoveryConcurrency) {
       const entryIndex = (recoveryStart + recoveryScanned) % allEntries.length;
       recoveryScanned += 1;
       const entry = allEntries[entryIndex];
       if (!entry) continue;
       const [wallet] = entry;
       if (!this.isRecoveryWallet(wallet)) continue;
+      if ((this.walletRetryAt.get(wallet) ?? 0) > now) continue;
+      if (!this.acquireRecoveryOwnership(wallet)) break;
+      this.recoveryPollOffset = (entryIndex + 1) % allEntries.length;
+    }
+
+    // Sticky owners alone use the reserved historical lanes. This bounds every
+    // retained discovery/replay state to recoveryConcurrency.
+    const recoverySlots = Math.max(0, recoveryConcurrency - recoveryInFlight);
+    const recoveryLaunchLimit = Math.min(recoverySlots, launchLimit);
+    let recoveryLaunched = 0;
+    for (const wallet of this.recoveryOwners) {
+      if (recoveryLaunched >= recoveryLaunchLimit) break;
       if (this.walletsInFlight.has(wallet)) continue;
       if ((this.walletRetryAt.get(wallet) ?? 0) > now) continue;
-      launch(entryIndex, "recovery");
+      const options = this.watched.get(wallet);
+      if (!options) continue;
+      launch(wallet, options, "recovery");
       recoveryLaunched += 1;
-      nextRecoveryOffset = (entryIndex + 1) % allEntries.length;
     }
-    if (recoveryLaunched > 0) this.recoveryPollOffset = nextRecoveryOffset;
 
     // Fill every remaining launch slot from the independent live rotation.
     // Recovery wallets above the configured cap stay in the recovery lane;
@@ -361,7 +429,7 @@ export class RpcBackfillPoller {
       if (this.isRecoveryWallet(wallet)) continue;
       if (this.walletsInFlight.has(wallet)) continue;
       if ((this.walletRetryAt.get(wallet) ?? 0) > now) continue;
-      launch(entryIndex, "live");
+      launch(wallet, entry[1], "live");
       liveLaunched += 1;
       nextLiveOffset = (entryIndex + 1) % allEntries.length;
     }
@@ -369,15 +437,32 @@ export class RpcBackfillPoller {
   }
 
   private async runWalletPoll(wallet: string, options: RpcWatchOptions): Promise<void> {
+    const lane = this.walletLaneInFlight.get(wallet);
     try {
       await this.pollWallet(wallet, options);
       this.walletFailureCounts.delete(wallet);
       this.walletRetryAt.delete(wallet);
+      if (lane === "recovery" && !this.isRecoveryWallet(wallet)) {
+        this.releaseRecoveryOwnership(wallet, false);
+      }
     } catch (error) {
       if (!this.watched.has(wallet)) return;
-      this.failures += 1;
       const failures = (this.walletFailureCounts.get(wallet) ?? 0) + 1;
       this.walletFailureCounts.set(wallet, failures);
+      // Preserve a bounded, already-verified discovery plan across transient
+      // RPC/DB/event failures. Rediscovering a six-figure history from page one
+      // after every timeout can prevent a wallet from ever reaching its durable
+      // boundary. Structural integrity failures delete the state at their
+      // detection site; invalid/new live wallets have no retained state. A
+      // bounded failure lease also prevents two permanently poisoned plans from
+      // monopolizing every historical lane forever. The durable cursor remains
+      // authoritative when an expired plan is safely rediscovered later.
+      const canRetainVerifiedPlan =
+        this.signatureRecoveries.has(wallet) && failures < MAX_STICKY_RECOVERY_FAILURES;
+      if (!canRetainVerifiedPlan) {
+        this.releaseRecoveryOwnership(wallet, true);
+      }
+      this.failures += 1;
       // A failed provider/database lane backs off independently. Other wallets
       // continue on the reserved scheduler slots instead of joining a retry
       // stampede behind one unhealthy address.
@@ -391,6 +476,7 @@ export class RpcBackfillPoller {
           const cursor = await this.cursorStore.markBacklog(wallet, error);
           this.cursorCache.set(wallet, cursor);
         } catch (cursorError) {
+          this.cursorCache.delete(wallet);
           log.warn(
             { wallet, error: sanitizeRpcCursorError(cursorError) },
             "RPC fallback could not persist backlog state",
@@ -411,14 +497,30 @@ export class RpcBackfillPoller {
     }
   }
 
+  private async markRecoveryBacklog(
+    wallet: string,
+    cursor: RpcWalletCursor,
+    error: unknown,
+  ): Promise<RpcWalletCursor> {
+    this.backlogWallets.add(wallet);
+    if (cursor.backlogDetected) return cursor;
+    const marked = await this.cursorStore.markBacklog(wallet, error);
+    this.cursorCache.set(wallet, marked);
+    this.applyCursorHealth(wallet, marked);
+    return marked;
+  }
+
   private async pollWallet(wallet: string, options: RpcWatchOptions) {
     const enforceWatchLifecycle = this.watched.has(wallet);
     let pubkey: PublicKey;
     try {
       pubkey = new PublicKey(wallet);
-    } catch {
+    } catch (cause) {
       log.warn({ wallet }, "rpc fallback skipped invalid wallet");
-      return;
+      // Returning successfully would let an invalid backlogged wallet retain a
+      // sticky recovery slot forever. Fail the lane so normal backoff releases
+      // its ephemeral state and gives the next durable backlog a turn.
+      throw new Error("RPC fallback watched wallet is invalid", { cause });
     }
 
     let cursor = this.cursorCache.get(wallet) ?? (await this.cursorStore.load(wallet));
@@ -433,8 +535,7 @@ export class RpcBackfillPoller {
       ) {
         const priorStartSlot = cursor.startSlot;
         cursor = await this.cursorStore.rewind(wallet, anchorSlot);
-        this.signatureDiscoveryPages.delete(wallet);
-        this.recoveryQueues.delete(wallet);
+        this.signatureRecoveries.delete(wallet);
         log.warn(
           { wallet, anchorSlot, priorStartSlot },
           "RPC cursor rewound to cover newly discovered earlier custody attribution",
@@ -481,84 +582,149 @@ export class RpcBackfillPoller {
       this.cursorCache.set(wallet, cursor);
     }
 
-    // A pre-existing durable cursor is always authoritative. The watch anchor
-    // only initializes a missing cursor; raising an older cursor to a newer DB
-    // state would skip an unprocessed recovery gap.
-    const recoveryBoundary = cursor;
-    let recoveryQueue = this.recoveryQueues.get(wallet);
-    // Find the trusted lower boundary before releasing any work. The previous
-    // 5,000-signature discovery cap could leave a busy wallet permanently
-    // backlogged. Once the boundary is found, transaction handling remains
-    // bounded to a durable 5,000-signature chunk per poll.
-    if (!recoveryQueue) {
-      const pages = this.signatureDiscoveryPages.get(wallet) ?? [];
-      const paging = {
-        pageSize: RPC_SIGNATURE_PAGE_SIZE,
-        maxPages: RPC_SIGNATURE_MAX_PAGES,
-      };
+    const configuredChunkSize = Math.trunc(
+      Number(this.options.recoveryChunkSize ?? RPC_RECOVERY_CHUNK_SIZE),
+    );
+    const chunkSize = Math.max(1, Math.min(RPC_RECOVERY_CHUNK_SIZE, configuredChunkSize || 1));
+
+    // A pre-existing durable cursor is always authoritative. Signature history
+    // is first discovered back to that trusted boundary without releasing any
+    // events. Only compact page descriptors survive between turns. Completed
+    // pages are then refetched and verified one at a time, oldest first.
+    let recovery = this.signatureRecoveries.get(wallet);
+    if (!recovery) recovery = createSignatureRecoveryState(cursor);
+
+    if (!recovery.discoveryComplete) {
       const configuredPageBudget = Math.trunc(
         Number(this.options.signaturePagesPerTurn ?? RPC_SIGNATURE_MAX_PAGES),
       );
       const pageBudget = Math.max(1, Math.min(RPC_SIGNATURE_MAX_PAGES, configuredPageBudget || 1));
       let pagesReadThisTurn = 0;
-      while (pagesReadThisTurn < pageBudget) {
-        const request = planNextRpcSignaturePage(pages, recoveryBoundary, paging);
-        if (!request) break;
+      while (!recovery.discoveryComplete && pagesReadThisTurn < pageBudget) {
+        const request: RpcSignatureRequest = {
+          limit: RPC_SIGNATURE_PAGE_SIZE,
+          ...(recovery.nextBefore ? { before: recovery.nextBefore } : {}),
+        };
         const page = await rpcReadWithTimeout(
           this.conn.getSignaturesForAddress(pubkey, request, "confirmed"),
           "signature page",
         );
         if (enforceWatchLifecycle && !this.watched.has(wallet)) {
-          this.signatureDiscoveryPages.delete(wallet);
+          this.signatureRecoveries.delete(wallet);
           return;
         }
-        pages.push(page);
+        try {
+          appendSignatureRecoveryPage(
+            recovery,
+            page,
+            request,
+            RPC_SIGNATURE_PAGE_SIZE,
+            RPC_SIGNATURE_MAX_PAGES,
+          );
+        } catch (error) {
+          this.signatureRecoveries.delete(wallet);
+          cursor = await this.markRecoveryBacklog(wallet, cursor, error);
+          throw error;
+        }
         pagesReadThisTurn += 1;
-        const pagePlan = planRpcSignaturePages(pages, recoveryBoundary, paging);
-        if (pagePlan.complete || pagePlan.backlogDetected) break;
+
+        // A live lane may discover a deep wallet. It may retain a plan only by
+        // claiming one of the bounded sticky recovery slots. Otherwise the
+        // durable cursor remains unchanged and the reserved scheduler retries.
+        if (!recovery.discoveryComplete && !this.acquireRecoveryOwnership(wallet)) {
+          cursor = await this.markRecoveryBacklog(
+            wallet,
+            cursor,
+            "RPC signature boundary discovery is waiting for a recovery slot",
+          );
+          return;
+        }
       }
 
-      const plan = planRpcSignaturePages(pages, recoveryBoundary, paging);
-      if (!plan.complete && !plan.backlogDetected) {
-        this.signatureDiscoveryPages.set(wallet, pages);
-        this.backlogWallets.add(wallet);
-        if (!cursor.backlogDetected) {
-          cursor = await this.cursorStore.markBacklog(
+      if (!recovery.discoveryComplete) {
+        if (!this.acquireRecoveryOwnership(wallet)) {
+          cursor = await this.markRecoveryBacklog(
             wallet,
-            "RPC signature boundary discovery is still in progress",
+            cursor,
+            "RPC signature boundary discovery is waiting for a recovery slot",
           );
-          this.cursorCache.set(wallet, cursor);
-          this.applyCursorHealth(wallet, cursor);
+          return;
         }
+        this.signatureRecoveries.set(wallet, recovery);
+        cursor = await this.markRecoveryBacklog(
+          wallet,
+          cursor,
+          "RPC signature boundary discovery is still in progress",
+        );
         this.lastRecoveryProgressAt = Date.now();
         this.lastSuccessAt = this.lastRecoveryProgressAt;
         return;
       }
-      if (plan.backlogDetected || !plan.complete) {
-        this.signatureDiscoveryPages.delete(wallet);
-        this.backlogWallets.add(wallet);
-        cursor = await this.cursorStore.markBacklog(
-          wallet,
-          plan.error ?? "RPC signature pagination backlog",
-        );
-        this.cursorCache.set(wallet, cursor);
-        this.applyCursorHealth(wallet, cursor);
-        throw new Error(plan.error ?? "RPC signature pagination backlog");
-      }
-
-      this.signatureDiscoveryPages.delete(wallet);
-      recoveryQueue = [...plan.signatures];
-      if (recoveryQueue.length > 0) this.recoveryQueues.set(wallet, recoveryQueue);
     }
 
-    const configuredChunkSize = Math.trunc(
-      Number(this.options.recoveryChunkSize ?? RPC_RECOVERY_CHUNK_SIZE),
-    );
-    const chunkSize = Math.max(1, Math.min(RPC_RECOVERY_CHUNK_SIZE, configuredChunkSize || 1));
-    const recoverySignatures = recoveryQueue?.slice(0, chunkSize) ?? [];
+    if (recovery.remainingCount > chunkSize && !this.acquireRecoveryOwnership(wallet)) {
+      cursor = await this.markRecoveryBacklog(
+        wallet,
+        cursor,
+        "RPC signature replay is waiting for a recovery slot",
+      );
+      return;
+    }
+    if (this.recoveryOwners.has(wallet)) this.signatureRecoveries.set(wallet, recovery);
 
-    for (let offset = 0; offset < recoverySignatures.length; offset += 50) {
-      const signatureBatch = recoverySignatures.slice(offset, offset + 50);
+    let processedThisTurn = 0;
+    while (processedThisTurn < chunkSize && recovery.replayPageIndex >= 0) {
+      let activePage = recovery.activePage;
+      if (!activePage || activePage.pageIndex !== recovery.replayPageIndex) {
+        const descriptor = recovery.descriptors[recovery.replayPageIndex];
+        if (!descriptor) {
+          this.signatureRecoveries.delete(wallet);
+          throw new Error("RPC recovery page descriptor is missing");
+        }
+        let page: readonly CompactSignatureInfo[];
+        if (recovery.replayPageIndex === 0) {
+          page = recovery.firstPage ?? [];
+        } else {
+          page = await rpcReadWithTimeout(
+            this.conn.getSignaturesForAddress(pubkey, descriptor.request, "confirmed"),
+            "recovery signature page",
+          );
+        }
+        if (!signaturePageMatchesDescriptor(page, descriptor)) {
+          this.signatureRecoveries.delete(wallet);
+          throw new Error("RPC signature page changed during bounded recovery");
+        }
+        activePage = {
+          pageIndex: recovery.replayPageIndex,
+          entries: page.map(compactSignatureInfo),
+          candidateIndexesOldestFirst: decodeCandidateIndexes(
+            descriptor.candidateMask,
+            descriptor.entryCount,
+          ).reverse(),
+          offset: 0,
+        };
+        recovery.activePage = activePage;
+      }
+
+      if (activePage.offset >= activePage.candidateIndexesOldestFirst.length) {
+        recovery.activePage = undefined;
+        recovery.replayPageIndex -= 1;
+        continue;
+      }
+
+      const batchSize = Math.min(
+        50,
+        chunkSize - processedThisTurn,
+        activePage.candidateIndexesOldestFirst.length - activePage.offset,
+      );
+      const signatureBatch = activePage.candidateIndexesOldestFirst
+        .slice(activePage.offset, activePage.offset + batchSize)
+        .map((index) => activePage.entries[index])
+        .filter((entry): entry is CompactSignatureInfo => entry !== undefined);
+      if (signatureBatch.length !== batchSize) {
+        this.signatureRecoveries.delete(wallet);
+        throw new Error("RPC recovery candidate descriptor is invalid");
+      }
       const txs = await rpcReadWithTimeout(
         this.conn.getParsedTransactions(
           signatureBatch.map((sig) => sig.signature),
@@ -586,7 +752,7 @@ export class RpcBackfillPoller {
           event.source = "rpc";
           event.delivery = "catchup";
           event.observedAtMs = Date.now();
-          log.info(
+          log.debug(
             {
               kind: event.kind,
               wallet: event.kind === "swap" ? event.wallet : event.from,
@@ -632,31 +798,31 @@ export class RpcBackfillPoller {
         this.processedSignatureCount += signatureBatch.length;
         this.lastRecoveryProgressAt = Date.now();
         this.lastSuccessAt = this.lastRecoveryProgressAt;
-        recoveryQueue?.splice(0, signatureBatch.length);
+        activePage.offset += signatureBatch.length;
+        recovery.remainingCount -= signatureBatch.length;
+        processedThisTurn += signatureBatch.length;
       }
     }
-    const remainingRecovery = recoveryQueue?.length ?? 0;
+    const remainingRecovery = recovery.remainingCount;
     if (remainingRecovery > 0) {
-      this.backlogWallets.add(wallet);
-      if (!cursor.backlogDetected) {
-        cursor = await this.cursorStore.markBacklog(
-          wallet,
-          new Error("RPC recovery backlog remains after safe chunk"),
-        );
-        this.cursorCache.set(wallet, cursor);
-        this.applyCursorHealth(wallet, cursor);
-      }
-      log.warn(
-        { wallet, processed: recoverySignatures.length, remaining: remainingRecovery },
+      cursor = await this.markRecoveryBacklog(
+        wallet,
+        cursor,
+        new Error("RPC recovery backlog remains after safe chunk"),
+      );
+      this.signatureRecoveries.set(wallet, recovery);
+      log.debug(
+        { wallet, processed: processedThisTurn, remaining: remainingRecovery },
         "RPC fallback advanced one durable recovery chunk",
       );
       return;
     }
-    this.recoveryQueues.delete(wallet);
+    this.signatureRecoveries.delete(wallet);
+    this.releaseRecoveryOwnership(wallet, false);
     const now = Date.now();
     const shouldPersistSuccess =
       cursor.backlogDetected ||
-      recoverySignatures.length > 0 ||
+      processedThisTurn > 0 ||
       now - (this.cursorSuccessPersistedAt.get(wallet) ?? 0) >= 5 * 60_000;
     if (shouldPersistSuccess) {
       cursor = await this.cursorStore.markSuccess(wallet);
@@ -668,6 +834,157 @@ export class RpcBackfillPoller {
     this.cursorHydrationPending.delete(wallet);
     this.backlogWallets.delete(wallet);
   }
+}
+
+function createSignatureRecoveryState(cursor: RpcWalletCursor): SignatureRecoveryState {
+  const boundarySlot = cursor.lastProcessedSlot ?? cursor.startSlot;
+  if (!Number.isSafeInteger(boundarySlot) || boundarySlot < 0) {
+    throw new Error("RPC recovery cursor contains an invalid boundary slot");
+  }
+  return {
+    boundarySignature: cursor.lastProcessedSignature?.trim() || null,
+    boundarySlot,
+    descriptors: [],
+    pageTails: new Set<string>(),
+    firstPage: null,
+    priorSlot: Number.POSITIVE_INFINITY,
+    nextBefore: undefined,
+    discoveryComplete: false,
+    remainingCount: 0,
+    replayPageIndex: -1,
+  };
+}
+
+function compactSignatureInfo(info: CompactSignatureInfo): CompactSignatureInfo {
+  return {
+    signature: info.signature,
+    slot: info.slot,
+    blockTime: info.blockTime ?? null,
+  };
+}
+
+function signaturePageDigest(page: readonly CompactSignatureInfo[]): string {
+  const digest = createHash("sha256");
+  for (const info of page) {
+    // `blockTime` is supplemental metadata and may legitimately move from null
+    // to a number between otherwise identical RPC reads. Cursor safety depends
+    // on the exact ordered signature/slot identity; the refetched blockTime is
+    // used for the eventual checkpoint.
+    digest.update(JSON.stringify([info.signature, info.slot]), "utf8");
+    digest.update("\n", "utf8");
+  }
+  return digest.digest("hex");
+}
+
+function setCandidateBit(mask: Buffer, index: number) {
+  mask[index >> 3] |= 1 << (index & 7);
+}
+
+function decodeCandidateIndexes(encodedMask: string, entryCount: number): number[] {
+  const mask = Buffer.from(encodedMask, "base64");
+  const indexes: number[] = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    if ((mask[index >> 3] & (1 << (index & 7))) !== 0) indexes.push(index);
+  }
+  return indexes;
+}
+
+function signaturePageMatchesDescriptor(
+  page: readonly CompactSignatureInfo[],
+  descriptor: SignaturePageDescriptor,
+): boolean {
+  return page.length === descriptor.entryCount && signaturePageDigest(page) === descriptor.digest;
+}
+
+/**
+ * Incrementally records one newest-first RPC page. The candidate mask captures
+ * exactly which page rows are newer than the original durable boundary, while
+ * the digest makes the later bounded refetch fail closed if provider history
+ * changes. No event is released until a trusted boundary is reached.
+ */
+function appendSignatureRecoveryPage(
+  state: SignatureRecoveryState,
+  page: readonly ConfirmedSignatureInfo[],
+  request: RpcSignatureRequest,
+  pageSize: number,
+  maxPages: number,
+) {
+  if (state.discoveryComplete) throw new Error("RPC signature discovery is already complete");
+  if (state.descriptors.length >= maxPages) {
+    throw new Error("RPC signature pagination page limit reached before cursor boundary");
+  }
+
+  const candidateMask = Buffer.alloc(Math.ceil(page.length / 8));
+  let candidateCount = 0;
+  let reachedBoundary = false;
+  for (const [index, info] of page.entries()) {
+    if (
+      typeof info?.signature !== "string" ||
+      info.signature.length === 0 ||
+      !Number.isSafeInteger(info.slot) ||
+      info.slot < 0
+    ) {
+      throw new Error("RPC signature page contains invalid signature data");
+    }
+    if (info.slot > state.priorSlot) {
+      throw new Error("RPC signature page has invalid signature order");
+    }
+    state.priorSlot = info.slot;
+    if (reachedBoundary) continue;
+    if (state.boundarySignature && info.signature === state.boundarySignature) {
+      reachedBoundary = true;
+      continue;
+    }
+    // Inclusive slot fallback deliberately replays the cursor slot. Excluding
+    // it when the exact signature disappeared could miss a sibling tx.
+    if (info.slot < state.boundarySlot) {
+      reachedBoundary = true;
+      continue;
+    }
+    // Do not retain a backlog-sized global de-duplication Set. A provider page
+    // overlap may replay the same source transaction, which is safe because
+    // event persistence is idempotent; validated slot order still prevents a
+    // cursor from crossing unseen history.
+    setCandidateBit(candidateMask, index);
+    candidateCount += 1;
+    state.oldestCandidateSlot = info.slot;
+  }
+
+  const tail = page.at(-1)?.signature;
+  if (tail) {
+    if (state.pageTails.has(tail)) {
+      throw new Error("RPC signature pagination made no progress");
+    }
+    state.pageTails.add(tail);
+    state.nextBefore = tail;
+  }
+
+  const compactPage = page.map(compactSignatureInfo);
+  if (state.descriptors.length === 0) state.firstPage = compactPage;
+  state.descriptors.push({
+    request: { ...request },
+    entryCount: page.length,
+    digest: signaturePageDigest(compactPage),
+    candidateMask: candidateMask.toString("base64"),
+    candidateCount,
+  });
+  state.remainingCount += candidateCount;
+
+  if (reachedBoundary) {
+    state.discoveryComplete = true;
+  } else if (page.length < pageSize) {
+    if (
+      (state.boundarySignature || state.boundarySlot > 0) &&
+      (state.oldestCandidateSlot === undefined || state.oldestCandidateSlot > state.boundarySlot)
+    ) {
+      throw new Error("RPC history gap before cursor boundary");
+    }
+    state.discoveryComplete = true;
+  } else if (state.descriptors.length >= maxPages) {
+    throw new Error("RPC signature pagination page limit reached before cursor boundary");
+  }
+
+  if (state.discoveryComplete) state.replayPageIndex = state.descriptors.length - 1;
 }
 
 async function rpcReadWithTimeout<T>(request: Promise<T>, label: string): Promise<T> {

@@ -756,7 +756,9 @@ test("RPC poller durably drains more than 5,000 signatures without skipping", as
   assert.equal(new Set(parsedSignatures).size, 5_000);
   assert.equal(parsedSignatures[0], "sig-101");
   assert.equal(parsedSignatures.at(-1), "sig-5100");
-  assert.equal(advances.length, 100);
+  // Bounded page replay checkpoints at page boundaries as well as every 50
+  // signatures, so the first 5,000-signature turn uses one extra checkpoint.
+  assert.equal(advances.length, 101);
   assert.equal(advances[0], "sig-150");
   assert.equal(advances.at(-1), "sig-5100");
   assert.equal(current.lastProcessedSignature, "sig-5100");
@@ -768,14 +770,14 @@ test("RPC poller durably drains more than 5,000 signatures without skipping", as
   assert.equal(parsedSignatures.length, 5_101);
   assert.equal(new Set(parsedSignatures).size, 5_101);
   assert.equal(parsedSignatures.at(-1), "sig-5201");
-  assert.equal(advances.length, 103);
+  assert.equal(advances.length, 104);
   assert.equal(advances.at(-1), "sig-5201");
-  assert.equal(new Set(advances).size, 103);
+  assert.equal(new Set(advances).size, 104);
   assert.equal(successMarks, 1);
   assert.equal(poller.health().backlogWalletCount, 0);
 });
 
-test("custody time-slices deep signature discovery and reuses the in-memory recovery queue", async () => {
+test("custody time-slices deep discovery when refetched block times become available", async () => {
   const signatures = Array.from({ length: 1_101 }, (_, index) => {
     const slot = 1_201 - index;
     return {
@@ -825,7 +827,12 @@ test("custody time-slices deep signature discovery and reuses the in-memory reco
       const start = options.before
         ? signatures.findIndex((row) => row.signature === options.before) + 1
         : 0;
-      return signatures.slice(start, start + options.limit);
+      return signatures.slice(start, start + options.limit).map((row) => ({
+        ...row,
+        // Discovery can observe null and the verified refetch can later obtain
+        // the canonical block time without changing page identity.
+        blockTime: signaturePageCalls <= 2 ? null : row.blockTime,
+      }));
     },
     async getParsedTransactions(requested: string[]) {
       handled.push(...requested);
@@ -856,13 +863,176 @@ test("custody time-slices deep signature discovery and reuses the in-memory reco
   await (poller as any).pollWallet(target, {});
   assert.equal(signaturePageCalls, 1);
   assert.equal(handled.length, 0);
+  const discovery = (poller as any).signatureRecoveries.get(target);
+  assert.equal(discovery.descriptors.length, 1);
+  assert.equal(discovery.firstPage.length, 1_000);
+  assert.equal("pages" in discovery, false);
   await (poller as any).pollWallet(target, {});
-  assert.equal(signaturePageCalls, 2);
+  // The oldest descriptor is refetched once and verified before replay. The
+  // active compact page is then reused by the next recovery turn.
+  assert.equal(signaturePageCalls, 3);
   assert.equal(handled.length, 50);
   await (poller as any).pollWallet(target, {});
-  assert.equal(signaturePageCalls, 2);
+  assert.equal(signaturePageCalls, 3);
   assert.equal(handled.length, 100);
   assert.deepEqual(handled.slice(0, 3), ["sig-101", "sig-102", "sig-103"]);
+});
+
+test("a 100k-signature recovery retains descriptors and at most two compact pages", async () => {
+  const newestSlot = 100_100;
+  let current = testCursor(target, {
+    startSlot: 100,
+    lastProcessedSignature: "sig-100",
+    lastProcessedSlot: 100,
+    backlogDetected: true,
+  });
+  let signaturePageCalls = 0;
+  let advances = 0;
+  const store: RpcCursorStore = {
+    async load() {
+      return { ...current };
+    },
+    async ensure() {
+      return { ...current };
+    },
+    async advance(_wallet, signature, slot, blockTime) {
+      advances += 1;
+      current = {
+        ...current,
+        lastProcessedSignature: signature,
+        lastProcessedSlot: slot,
+        lastBlockTime: blockTime,
+      };
+      return { ...current };
+    },
+    async markBacklog() {
+      current = { ...current, backlogDetected: true };
+      return { ...current };
+    },
+    async markSuccess() {
+      current = { ...current, backlogDetected: false };
+      return { ...current };
+    },
+  };
+  const connection = {
+    async getSignaturesForAddress(_wallet: unknown, options: { before?: string; limit: number }) {
+      signaturePageCalls += 1;
+      const startingSlot = options.before
+        ? Number(options.before.slice("sig-".length)) - 1
+        : newestSlot;
+      const page = [];
+      for (let slot = startingSlot; slot >= 100 && page.length < options.limit; slot -= 1) {
+        page.push({
+          signature: `sig-${slot}`,
+          slot,
+          err: null,
+          memo: null,
+          blockTime: slot,
+        });
+      }
+      return page;
+    },
+    async getParsedTransactions(requested: string[]) {
+      return requested.map((signature) => ({
+        slot: Number(signature.slice("sig-".length)),
+        blockTime: null,
+        transaction: {
+          signatures: [signature],
+          message: { accountKeys: [{ pubkey: target, signer: true }] },
+        },
+        meta: {
+          err: null,
+          fee: 5_000,
+          preBalances: [1_000_000_000],
+          postBalances: [999_995_000],
+          preTokenBalances: [],
+          postTokenBalances: [],
+          logMessages: [],
+        },
+      }));
+    },
+  };
+  const poller = new RpcBackfillPoller(connection as any, async () => {}, store, 1_200, true, {
+    signaturePagesPerTurn: 1_000,
+    recoveryChunkSize: 1,
+  });
+
+  await (poller as any).pollWallet(target, {});
+  const recovery = (poller as any).signatureRecoveries.get(target);
+  assert.equal(signaturePageCalls, 103);
+  assert.equal(recovery.descriptors.length, 101);
+  assert.equal(recovery.firstPage.length, 1_000);
+  assert.equal(recovery.activePage.entries.length, 1_000);
+  assert.equal(recovery.remainingCount, 99_999);
+  assert.equal("pages" in recovery, false);
+  assert.equal("queue" in recovery, false);
+  assert.equal(advances, 1);
+  assert.equal(current.lastProcessedSignature, "sig-101");
+});
+
+test("a changed refetched page fails closed without advancing and releases its recovery slot", async () => {
+  const signatures = Array.from({ length: 1_101 }, (_, index) => {
+    const slot = 1_201 - index;
+    return { signature: `sig-${slot}`, slot, err: null, memo: null, blockTime: slot };
+  });
+  signatures.push({ signature: "sig-100", slot: 100, err: null, memo: null, blockTime: 100 });
+  let signatureCalls = 0;
+  let advances = 0;
+  const store: RpcCursorStore = {
+    async load() {
+      return testCursor(target, { backlogDetected: true });
+    },
+    async ensure() {
+      return testCursor(target, { backlogDetected: true });
+    },
+    async advance() {
+      advances += 1;
+      return testCursor(target, { backlogDetected: true });
+    },
+    async markBacklog() {
+      return testCursor(target, { backlogDetected: true });
+    },
+    async markSuccess() {
+      return testCursor(target);
+    },
+  };
+  const connection = {
+    async getSignaturesForAddress(_wallet: unknown, options: { before?: string; limit: number }) {
+      signatureCalls += 1;
+      const start = options.before
+        ? signatures.findIndex((row) => row.signature === options.before) + 1
+        : 0;
+      const page = signatures.slice(start, start + options.limit).map((row) => ({ ...row }));
+      if (signatureCalls === 3 && page[0]) page[0].signature = "provider-page-changed";
+      return page;
+    },
+    async getParsedTransactions() {
+      throw new Error("changed signature page must not be decoded");
+    },
+  };
+  const poller = new RpcBackfillPoller(connection as any, async () => {}, store, 1_200, true, {
+    pollConcurrency: 2,
+    recoveryConcurrency: 1,
+    maxWalletsPerPoll: 1,
+    signaturePagesPerTurn: 1,
+    recoveryChunkSize: 50,
+    deferInitialCursorHydration: true,
+  });
+  poller.watch(target);
+  (poller as any).cursorHydrationPending.clear();
+  (poller as any).backlogWallets.add(target);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal((poller as any).signatureRecoveries.size, 1);
+  assert.equal((poller as any).recoveryOwners.size, 1);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(advances, 0);
+  assert.equal(poller.health().failures, 1);
+  assert.equal((poller as any).signatureRecoveries.size, 0);
+  assert.equal((poller as any).recoveryOwners.size, 0);
 });
 
 test("a failed batch checkpoint replays idempotently without skipping handled transactions", async () => {
@@ -1597,7 +1767,7 @@ test("historical recovery cannot consume the lane reserved for current wallets",
   await new Promise<void>((resolve) => setImmediate(resolve));
 });
 
-test("reserved recovery reaches backlog behind 10k live wallets and rotates fairly", async () => {
+test("reserved recovery reaches backlog behind 10k live wallets and keeps owners sticky", async () => {
   const liveWallets = Array.from({ length: 10_000 }, (_, index) => `live-wallet-${index}`);
   const recoveryWallets = Array.from({ length: 3 }, (_, index) => `recovery-wallet-${index}`);
   const started: string[] = [];
@@ -1643,14 +1813,16 @@ test("reserved recovery reaches backlog behind 10k live wallets and rotates fair
   await (poller as any).poll();
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(started.slice(4), [
-    recoveryWallets[2],
     recoveryWallets[0],
+    recoveryWallets[1],
     liveWallets[2],
     liveWallets[3],
   ]);
+  assert.equal((poller as any).recoveryOwners.size, 2);
+  assert.equal((poller as any).recoveryOwners.has(recoveryWallets[2]), false);
 });
 
-test("a rejected recovery lane backs off and the next reserved wallet runs first", async () => {
+test("a rejected recovery lane without a verified plan gives the next backlog a turn", async () => {
   const liveWallets = ["live-wallet-one", "live-wallet-two"];
   const recoveryWallets = ["recovery-wallet-one", "recovery-wallet-two"];
   const started: string[] = [];
@@ -1681,7 +1853,9 @@ test("a rejected recovery lane backs off and the next reserved wallet runs first
   });
   (poller as any).pollWallet = async (wallet: string) => {
     started.push(wallet);
-    if (wallet === recoveryWallets[0]) throw new Error("recovery handler rejected");
+    if (wallet === recoveryWallets[0]) {
+      throw new Error("recovery handler rejected");
+    }
   };
   for (const wallet of [...liveWallets, ...recoveryWallets]) poller.watch(wallet);
   (poller as any).cursorHydrationPending.clear();
@@ -1692,6 +1866,8 @@ test("a rejected recovery lane backs off and the next reserved wallet runs first
   assert.deepEqual(started, [recoveryWallets[0], liveWallets[0]]);
   assert.equal(backlogMarks, 1);
   assert.ok(((poller as any).walletRetryAt.get(recoveryWallets[0]) as number) > Date.now());
+  assert.equal((poller as any).recoveryOwners.has(recoveryWallets[0]), false);
+  assert.equal((poller as any).signatureRecoveries.has(recoveryWallets[0]), false);
 
   await (poller as any).poll();
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1700,7 +1876,254 @@ test("a rejected recovery lane backs off and the next reserved wallet runs first
   assert.equal(poller.health().failures, 1);
 });
 
-test("recovery lanes rotate instead of relaunching the first deep wallet", async () => {
+test("a transient failure preserves a verified bounded plan for its sticky owner", async () => {
+  const recoveryWallets = ["recovery-wallet-one", "recovery-wallet-two"];
+  const started: string[] = [];
+  let firstAttempt = true;
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet);
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 1,
+    recoveryConcurrency: 1,
+    maxWalletsPerPoll: 1,
+    deferInitialCursorHydration: true,
+  });
+  (poller as any).pollWallet = async (wallet: string) => {
+    started.push(wallet);
+    if (wallet === recoveryWallets[0] && firstAttempt) {
+      firstAttempt = false;
+      (poller as any).signatureRecoveries.set(wallet, { verifiedBoundedPlan: true });
+      throw new Error("temporary RPC timeout");
+    }
+    (poller as any).signatureRecoveries.delete(wallet);
+    (poller as any).backlogWallets.delete(wallet);
+  };
+  for (const wallet of recoveryWallets) poller.watch(wallet);
+  (poller as any).cursorHydrationPending.clear();
+  for (const wallet of recoveryWallets) (poller as any).backlogWallets.add(wallet);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, [recoveryWallets[0]]);
+  assert.equal((poller as any).recoveryOwners.has(recoveryWallets[0]), true);
+  assert.equal((poller as any).signatureRecoveries.has(recoveryWallets[0]), true);
+
+  // Simulate the bounded retry delay elapsing. The same owner resumes its
+  // verified plan rather than restarting discovery or ceding it to wallet two.
+  (poller as any).walletRetryAt.set(recoveryWallets[0], 0);
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, [recoveryWallets[0], recoveryWallets[0]]);
+  assert.equal((poller as any).recoveryOwners.size, 0);
+  assert.equal((poller as any).signatureRecoveries.size, 0);
+});
+
+test("a permanently failing verified plan expires its sticky lease and rotates recovery", async () => {
+  const recoveryWallets = ["recovery-wallet-one", "recovery-wallet-two"];
+  const started: string[] = [];
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet);
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 1,
+    recoveryConcurrency: 1,
+    maxWalletsPerPoll: 1,
+    deferInitialCursorHydration: true,
+  });
+  (poller as any).pollWallet = async (wallet: string) => {
+    started.push(wallet);
+    if (wallet === recoveryWallets[0]) {
+      (poller as any).signatureRecoveries.set(wallet, { verifiedBoundedPlan: true });
+      throw new Error("permanently unavailable historical transaction");
+    }
+    (poller as any).signatureRecoveries.delete(wallet);
+    (poller as any).backlogWallets.delete(wallet);
+  };
+  for (const wallet of recoveryWallets) poller.watch(wallet);
+  (poller as any).cursorHydrationPending.clear();
+  for (const wallet of recoveryWallets) (poller as any).backlogWallets.add(wallet);
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    (poller as any).walletRetryAt.set(recoveryWallets[0], 0);
+    await (poller as any).poll();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal((poller as any).recoveryOwners.has(recoveryWallets[0]), false);
+  assert.equal((poller as any).signatureRecoveries.has(recoveryWallets[0]), false);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(started.at(-1), recoveryWallets[1]);
+  assert.equal((poller as any).recoveryOwners.size, 0);
+  assert.ok((poller as any).signatureRecoveries.size <= 1);
+});
+
+test("invalid backlog wallets release reserved lanes instead of starving valid recovery", async () => {
+  const invalidWallets = ["invalid-wallet-one", "invalid-wallet-two"];
+  const validWallet = Keypair.generate().publicKey.toBase58();
+  const requestedWallets: string[] = [];
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async ensure(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async advance(wallet, signature, slot, blockTime) {
+      return testCursor(wallet, {
+        lastProcessedSignature: signature,
+        lastProcessedSlot: slot,
+        lastBlockTime: blockTime,
+        backlogDetected: true,
+      });
+    },
+    async markBacklog(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const connection = {
+    async getSignaturesForAddress(wallet: { toBase58(): string }) {
+      requestedWallets.push(wallet.toBase58());
+      return [
+        {
+          signature: "sig-100",
+          slot: 100,
+          err: null,
+          memo: null,
+          blockTime: 1_000,
+        },
+      ];
+    },
+    async getParsedTransactions() {
+      return [];
+    },
+  };
+  const poller = new RpcBackfillPoller(connection as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 2,
+    recoveryConcurrency: 2,
+    maxWalletsPerPoll: 2,
+    deferInitialCursorHydration: true,
+  });
+  for (const wallet of [...invalidWallets, validWallet]) poller.watch(wallet);
+  (poller as any).cursorHydrationPending.clear();
+  for (const wallet of [...invalidWallets, validWallet]) {
+    (poller as any).backlogWallets.add(wallet);
+  }
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal((poller as any).recoveryOwners.size, 0);
+  assert.equal(poller.health().failures, 2);
+
+  await (poller as any).poll();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(requestedWallets, [validWallet]);
+  assert.equal((poller as any).recoveryOwners.has(validWallet), false);
+  assert.equal((poller as any).backlogWallets.has(validWallet), false);
+});
+
+test("many backlogs retain at most the configured number of sticky recovery states", async () => {
+  const liveWallets = Array.from({ length: 20 }, (_, index) => `live-stress-${index}`);
+  const recoveryWallets = Array.from({ length: 30 }, (_, index) => `recovery-stress-${index}`);
+  const recoverySet = new Set(recoveryWallets);
+  const callsByRecovery = new Map<string, number>();
+  let liveCalls = 0;
+  let maximumOwners = 0;
+  let maximumRetainedStates = 0;
+  const store: RpcCursorStore = {
+    async load(wallet) {
+      return testCursor(wallet);
+    },
+    async ensure(wallet) {
+      return testCursor(wallet);
+    },
+    async advance(wallet) {
+      return testCursor(wallet);
+    },
+    async markBacklog(wallet) {
+      return testCursor(wallet, { backlogDetected: true });
+    },
+    async markSuccess(wallet) {
+      return testCursor(wallet);
+    },
+  };
+  const poller = new RpcBackfillPoller({} as any, async () => {}, store, 1_200, false, {
+    pollConcurrency: 6,
+    recoveryConcurrency: 3,
+    maxWalletsPerPoll: 6,
+    deferInitialCursorHydration: true,
+  });
+  (poller as any).pollWallet = async (wallet: string) => {
+    if (!recoverySet.has(wallet) || (poller as any).walletLaneInFlight.get(wallet) !== "recovery") {
+      liveCalls += 1;
+      return;
+    }
+    const calls = (callsByRecovery.get(wallet) ?? 0) + 1;
+    callsByRecovery.set(wallet, calls);
+    (poller as any).signatureRecoveries.set(wallet, { retained: true });
+    maximumOwners = Math.max(maximumOwners, (poller as any).recoveryOwners.size);
+    maximumRetainedStates = Math.max(
+      maximumRetainedStates,
+      (poller as any).signatureRecoveries.size,
+    );
+    if (calls === 3) {
+      (poller as any).signatureRecoveries.delete(wallet);
+      (poller as any).backlogWallets.delete(wallet);
+    }
+  };
+  for (const wallet of [...liveWallets, ...recoveryWallets]) poller.watch(wallet);
+  (poller as any).cursorHydrationPending.clear();
+  for (const wallet of recoveryWallets) (poller as any).backlogWallets.add(wallet);
+
+  for (let turn = 0; turn < 35; turn += 1) {
+    await (poller as any).poll();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(maximumOwners, 3);
+  assert.equal(maximumRetainedStates, 3);
+  assert.ok(liveCalls >= 35 * 3);
+  assert.deepEqual(
+    recoveryWallets.map((wallet) => callsByRecovery.get(wallet)),
+    recoveryWallets.map(() => 3),
+  );
+  assert.equal((poller as any).recoveryOwners.size, 0);
+  assert.equal((poller as any).signatureRecoveries.size, 0);
+});
+
+test("a sticky recovery owner drains before the next backlog wallet gets the lane", async () => {
   const recoveryWallets = Array.from({ length: 3 }, () => Keypair.generate().publicKey.toBase58());
   const started: string[] = [];
   let releaseTurn: (() => void) | undefined;
@@ -1727,11 +2150,16 @@ test("recovery lanes rotate instead of relaunching the first deep wallet", async
     maxWalletsPerPoll: 2,
     deferInitialCursorHydration: true,
   });
+  const callsByWallet = new Map<string, number>();
   (poller as any).pollWallet = async (wallet: string) => {
+    if ((poller as any).walletLaneInFlight.get(wallet) !== "recovery") return;
     started.push(wallet);
+    const calls = (callsByWallet.get(wallet) ?? 0) + 1;
+    callsByWallet.set(wallet, calls);
     await new Promise<void>((resolve) => {
       releaseTurn = resolve;
     });
+    if (calls === 2) (poller as any).backlogWallets.delete(wallet);
   };
   for (const wallet of recoveryWallets) {
     poller.watch(wallet);
@@ -1739,7 +2167,7 @@ test("recovery lanes rotate instead of relaunching the first deep wallet", async
   }
   (poller as any).cursorHydrationPending.clear();
 
-  for (let turn = 0; turn < recoveryWallets.length; turn += 1) {
+  for (let turn = 0; turn < recoveryWallets.length * 2; turn += 1) {
     await (poller as any).poll();
     assert.equal(started.length, turn + 1);
     // Exercise a timer turn while the sole recovery lane is saturated. It must
@@ -1750,7 +2178,10 @@ test("recovery lanes rotate instead of relaunching the first deep wallet", async
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
 
-  assert.deepEqual(started, recoveryWallets);
+  assert.deepEqual(
+    started,
+    recoveryWallets.flatMap((wallet) => [wallet, wallet]),
+  );
 });
 
 test("a failing wallet backs off independently while healthy wallets keep polling", async () => {

@@ -294,7 +294,10 @@ export class CustodyRuntime {
         "custody duplicate payload conflict quarantined; cursor may continue",
       );
     }
-    log.info(
+    // One historical transaction can fan out into several observations. Keep
+    // routine idempotent persistence out of the production info stream; the
+    // poller heartbeat and recovery-chunk warnings retain operational progress.
+    log.debug(
       {
         eventKind: event.kind,
         mint: event.tokenMint,
