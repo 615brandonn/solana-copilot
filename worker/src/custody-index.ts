@@ -12,9 +12,9 @@ import { createSupabaseRpcCursorStore } from "./rpc-cursor.js";
 import { createSupabaseCustodyStore } from "./custody-store.js";
 import { CustodyRuntime } from "./custody-runtime.js";
 import { CustodyWatchRegistry } from "./custody-watch-registry.js";
-import { refreshCustodyWalletLearning } from "./custody-learning.js";
 
 const log = pino({ level: env.LOG_LEVEL });
+const ACTIVE_WATCH_RECONCILE_INTERVAL_MS = 5 * 60_000;
 // Custody is observation-only and can safely wait longer for its serialized
 // per-mint evidence writers. The trading worker retains db.ts's 5s default.
 const db = createBotDb(30_000);
@@ -228,9 +228,9 @@ async function main(): Promise<void> {
         await new Promise<void>((resolve) => setTimeout(resolve, 25));
       }
 
-      // Registry updates above are incremental. Refresh the complete durable
-      // scope once per productive burst, not once per 25-row batch.
-      if (appliedCount > 0) await reconcileActiveWatches();
+      // Registry updates above are exact and incremental. The periodic durable
+      // sweep repairs any drift; reloading the entire high-cardinality watch
+      // table after every productive replay burst only amplifies DB and GC load.
       const resolvedCount = appliedCount + expiredCount + terminalCount;
       if (processedCount > 0) {
         const fields = {
@@ -345,32 +345,16 @@ async function main(): Promise<void> {
       });
   }, 3_000);
 
+  // Event results update the registry immediately. This full durable sweep is
+  // only drift repair, so keep it infrequent enough that a 30k-row watch set
+  // does not create a constant allocation and database-query treadmill.
   setInterval(() => {
     if (!currentConfig.enabled) return;
     reconcileActiveWatches().catch((error) => {
       lastError = safeDiagnostic(error);
       log.warn({ error: lastError }, "custody subscription reconciliation failed");
     });
-  }, 60_000);
-
-  let custodyLearningRunning = false;
-  setInterval(() => {
-    if (!currentConfig.enabled || custodyLearningRunning) return;
-    custodyLearningRunning = true;
-    refreshCustodyWalletLearning(db, env.HELIX_USER_ID)
-      .then((updated) => {
-        if (updated > 0) log.info({ updated }, "custody wallet behavior profiles learned");
-      })
-      .catch((error) =>
-        log.warn(
-          { error: safeDiagnostic(error) },
-          "custody learning refresh failed; observations and trading are unaffected",
-        ),
-      )
-      .finally(() => {
-        custodyLearningRunning = false;
-      });
-  }, 5 * 60_000);
+  }, ACTIVE_WATCH_RECONCILE_INTERVAL_MS);
 
   async function writeHeartbeat() {
     const fallback = poller.health();
