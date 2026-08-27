@@ -17284,10 +17284,13 @@ create unique index if not exists sell_signal_claims_bot_signature_idx
   on public.sell_signal_claims (user_id, bot_tx_sig)
   where bot_tx_sig is not null;
 
--- Makes transaction-ledger replay deterministic. Existing duplicates make the
--- migration fail instead of silently choosing an accounting row.
+-- Makes transaction-ledger replay deterministic per sold asset. A single
+-- finalized transaction may legitimately contain sells for multiple mints
+-- (for example, the historical on-chain reconstruction), while a duplicate
+-- ledger row for the same signature and mint must still fail closed. Durable
+-- v1 attempts additionally own a globally unique claim bot_tx_sig.
 create unique index if not exists trades_sell_signature_idx
-  on public.trades (user_id, tx_sig)
+  on public.trades (user_id, tx_sig, token_mint)
   where side = 'sell';
 
 create or replace function public.prepare_sell_claim_attempt_v1(
