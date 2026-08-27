@@ -307,20 +307,31 @@ test("settle and final gate require all roots, descendants, backscans, and no po
 
 test("post-entry exits are permanent exact-once evidence, not SQL money movement", () => {
   assert.match(migration, /create table if not exists public\.custody_fresh_tail_exit_intents/i);
+  assert.match(
+    migration,
+    /add constraint custody_fresh_tail_exit_intents_disposition_check[\s\S]*not valid;[\s\S]*validate constraint custody_fresh_tail_exit_intents_disposition_check;/i,
+  );
   assert.match(migration, /custody_fresh_tail_exit_supply_once_idx/i);
   assert.match(migration, /custody_fresh_tail_exit_custody_once_idx/i);
   assert.match(migration, /for update skip locked/i);
   assert.match(migration, /claim_generation = i\.claim_generation \+ 1/i);
+  assert.match(
+    migration,
+    /i\.status = 'retry'[\s\S]*i\.updated_at <= clock_timestamp\(\) - interval '1 second'/i,
+  );
+  assert.match(
+    migration,
+    /order by case when i\.status = 'pending' then 0 else 1 end, i\.created_at, i\.id/i,
+  );
   assert.match(migration, /disabled_by_policy/i);
   assert.match(migration, /position_not_live/i);
   assert.match(
     migration,
-    /when v_disposition in \([\s\S]*'retry'[\s\S]*'position_not_live'[\s\S]*'disabled_by_policy'[\s\S]*'duplicate_sell_claim'[\s\S]*\) then 'retry'/i,
+    /when v_disposition in \([\s\S]*'retry'[\s\S]*'position_not_live'[\s\S]*'duplicate_sell_claim'[\s\S]*\) then 'retry'/i,
   );
-  assert.doesNotMatch(migration, /when v_disposition = 'position_not_live' then 'dismissed'/i);
-  assert.doesNotMatch(
+  assert.match(
     migration,
-    /when v_disposition = '(?:disabled_by_policy|duplicate_sell_claim)' then 'dismissed'/i,
+    /when v_disposition in \([\s\S]*'disabled_by_policy'[\s\S]*'entry_failed'[\s\S]*'position_closed'[\s\S]*\) then 'dismissed'/i,
   );
   const resolver = migration.slice(
     migration.indexOf("create or replace function public.resolve_custody_fresh_tail_exit_intent("),
@@ -328,13 +339,26 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
       "create or replace function public.check_supply_accumulation_fresh_custody_gate(",
     ),
   );
-  assert.doesNotMatch(resolver, /then 'dismissed'/i);
+  assert.match(resolver, /then 'dismissed'/i);
   assert.match(migration, /claim_custody_fresh_tail_uncertain_intents/i);
+  assert.equal(
+    migration.match(/p_claim_seconds integer default 180/gi)?.length,
+    2,
+    "both exit claim APIs require the long recovery lease",
+  );
+  assert.equal(migration.match(/p_claim_seconds not between 180 and 600/gi)?.length, 2);
+  assert.equal(
+    migration.match(
+      /'classificationReliable', coalesce\(se\.classification_reliable, ce\.classification_reliable\),[\s\S]{0,100}'watchable', ce\.watchable/gi,
+    )?.length,
+    2,
+    "normal and uncertain claim payloads must satisfy the same strict parser",
+  );
   assert.match(migration, /v_expected not in \('claimed', 'uncertain'\)/i);
   assert.match(migration, /'pre_submit_uncertain_required'/i);
   assert.match(
     migration,
-    /v_expected = 'claimed' and v_disposition = 'uncertain'[\s\S]*p_sell_claim_id is null[\s\S]*p_bot_tx_sig[\s\S]*'prepared_sell_evidence_required'/i,
+    /v_disposition in \('uncertain', 'resolved'\)[\s\S]*v_expected = 'uncertain' and v_disposition = 'retry'[\s\S]*p_sell_claim_id is null[\s\S]*p_bot_tx_sig[\s\S]*'prepared_sell_evidence_required'/i,
   );
   assert.match(
     migration,
@@ -347,6 +371,31 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
   assert.match(resolver, /'resolution_evidence_mismatch'/i);
   assert.match(
     resolver,
+    /from public\.custody_fresh_tail_roots r[\s\S]*r\.epoch_id = v_intent\.epoch_id[\s\S]*r\.wallet = v_source_wallet/i,
+  );
+  assert.match(
+    resolver,
+    /v_sell_claim\.position_id <> v_intent\.position_id[\s\S]*v_sell_claim\.source_tx_sig <> v_source_tx_sig[\s\S]*v_sell_claim\.source_wallet <> v_source_wallet[\s\S]*v_sell_claim\.trigger_kind <> v_expected_trigger[\s\S]*v_sell_claim\.bot_tx_sig is distinct from btrim\(p_bot_tx_sig\)/i,
+  );
+  assert.match(
+    resolver,
+    /v_sell_claim\.recovery_version is distinct from 1[\s\S]*v_sell_claim\.recent_blockhash[\s\S]*v_sell_claim\.last_valid_block_height <= 0[\s\S]*v_sell_claim\.executed_sell_amount_raw is null[\s\S]*v_sell_claim\.prepared_wallet_balance_raw is null[\s\S]*v_sell_claim\.position_amount_before_raw is null[\s\S]*v_sell_claim\.token_decimals is null/i,
+  );
+  assert.match(
+    resolver,
+    /v_disposition = 'resolved'[\s\S]*v_sell_claim\.status <> 'landed'[\s\S]*v_sell_claim\.trade_id is null[\s\S]*v_sell_claim\.persisted_at is null[\s\S]*v_sell_claim\.receipt_pre_amount_raw is null[\s\S]*v_sell_claim\.receipt_post_amount_raw is null/i,
+  );
+  assert.match(resolver, /v_disposition = 'entry_failed'[\s\S]*status <> 'failed_pre_submit'/i);
+  assert.match(
+    resolver,
+    /v_disposition = 'position_closed'[\s\S]*closed_at is null[\s\S]*amount_remaining_raw[\s\S]*<> '0'/i,
+  );
+  assert.match(
+    resolver,
+    /v_disposition = 'disabled_by_policy'[\s\S]*to_jsonb\(v_config\)[\s\S]*mirror_custody_sell_exit_enabled/i,
+  );
+  assert.match(
+    resolver,
     /when v_expected = 'uncertain' and v_disposition = 'resolved'[\s\S]*then sell_claim_id else p_sell_claim_id end/i,
   );
   assert.match(
@@ -354,6 +403,12 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
     /when v_expected = 'uncertain' and v_disposition = 'resolved'[\s\S]*then bot_tx_sig else nullif/i,
   );
   assert.match(migration, /when v_status = 'uncertain' then claim_token/i);
+  assert.equal(
+    migration.match(/direct_target_sell_exit_mode = 'proportional'/gi)?.length,
+    3,
+    "proportional exits must block activation, coverage, and final candidates",
+  );
+  assert.match(migration, /'proportional_exit_proof_unavailable'/i);
   const supplyWriter = migration.slice(
     migration.indexOf("create or replace function public.record_custody_fresh_tail_supply_event("),
     migration.indexOf("create or replace function public.record_custody_fresh_tail_custody_event("),

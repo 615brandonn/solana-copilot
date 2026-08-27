@@ -12347,7 +12347,7 @@ create table if not exists public.custody_fresh_tail_exit_intents (
     check (status in ('pending', 'claimed', 'retry', 'uncertain', 'resolved', 'dismissed')),
   disposition text check (disposition is null or disposition in (
     'resolved', 'retry', 'uncertain', 'disabled_by_policy',
-    'position_not_live', 'duplicate_sell_claim'
+    'position_not_live', 'duplicate_sell_claim', 'entry_failed', 'position_closed'
   )),
   worker_id text,
   claim_token uuid,
@@ -12382,6 +12382,20 @@ create table if not exists public.custody_fresh_tail_exit_intents (
     )
   )
 );
+
+-- Keep reruns additive while allowing the drainer to distinguish a position
+-- that is merely not persisted yet from terminal no-action outcomes.
+alter table public.custody_fresh_tail_exit_intents
+  drop constraint if exists custody_fresh_tail_exit_intents_disposition_check;
+alter table public.custody_fresh_tail_exit_intents
+  add constraint custody_fresh_tail_exit_intents_disposition_check check (
+    disposition is null or disposition in (
+      'resolved', 'retry', 'uncertain', 'disabled_by_policy',
+      'position_not_live', 'duplicate_sell_claim', 'entry_failed', 'position_closed'
+    )
+  ) not valid;
+alter table public.custody_fresh_tail_exit_intents
+  validate constraint custody_fresh_tail_exit_intents_disposition_check;
 
 create index if not exists custody_fresh_tail_exit_intents_drain_idx
   on public.custody_fresh_tail_exit_intents (user_id, status, created_at);
@@ -13025,6 +13039,8 @@ begin
     return jsonb_build_object('ok', false, 'reason', 'supply_accumulation_disabled');
   elsif v_config.custody_journey_enabled is not true then
     return jsonb_build_object('ok', false, 'reason', 'custody_journey_disabled');
+  elsif v_config.direct_target_sell_exit_mode = 'proportional' then
+    return jsonb_build_object('ok', false, 'reason', 'proportional_exit_proof_unavailable');
   elsif coalesce(cardinality(v_config_roots), 0) <> 3
         or v_config_roots is distinct from v_roots then
     return jsonb_build_object('ok', false, 'reason', 'configured_roots_mismatch');
@@ -13684,8 +13700,8 @@ begin
      or p_amount_raw is null or p_amount_raw <= 0
      or p_total_supply_raw is distinct from 1000000000000000::numeric
      or p_decimals is distinct from 6
-     or v_parser_domain <> case when v_side = 'buy'
-       then 'pump_root_buy_v1' else 'supply_sell_v1' end
+     or v_parser_domain <> (case when v_side = 'buy'
+       then 'pump_root_buy_v1' else 'supply_sell_v1' end)
      or v_abi = '' or v_head_hash = ''
      or p_finalized_head_slot is null or p_finalized_head_slot < p_slot
      or (p_market_data_reliable and (
@@ -13942,13 +13958,13 @@ begin
      or p_source_post_raw is null or p_source_post_raw < 0
      or p_decimals is distinct from 6
      or p_watchable is null
-     or v_classification = '' or v_parser_domain <> case v_kind
+     or v_classification = '' or v_parser_domain <> (case v_kind
        when 'TARGET_BUY' then 'custody_target_buy_v1'
        when 'TRANSFER' then 'custody_transfer_v1'
        when 'SELL' then 'custody_sell_v1'
        when 'UNRESOLVED_OUTFLOW' then 'custody_unresolved_v1'
        when 'TERMINAL_OUTFLOW' then 'custody_terminal_v1'
-       else '' end
+       else '' end)
      or v_abi = '' or v_head_hash = ''
      or p_finalized_head_slot is null or p_finalized_head_slot < p_slot
      or jsonb_typeof(coalesce(p_recipients, 'null'::jsonb)) <> 'array' then
@@ -14674,7 +14690,8 @@ begin
   select * into v_config
   from public.bot_config where user_id = p_user_id for update;
   if not found or v_config.supply_accumulation_mode_enabled is not true
-     or v_config.custody_journey_enabled is not true then
+     or v_config.custody_journey_enabled is not true
+     or v_config.direct_target_sell_exit_mode = 'proportional' then
     return jsonb_build_object('ok', false, 'reason', 'strategy_not_enabled');
   end if;
   if v_config.supply_accumulation_window_seconds is null
@@ -15813,7 +15830,7 @@ create or replace function public.claim_custody_fresh_tail_exit_intents(
   p_user_id uuid,
   p_worker_id text,
   p_limit integer default 25,
-  p_claim_seconds integer default 30
+  p_claim_seconds integer default 180
 )
 returns jsonb
 language plpgsql
@@ -15829,7 +15846,7 @@ begin
   end if;
   if p_user_id is null or v_worker = ''
      or p_limit is null or p_limit not between 1 and 100
-     or p_claim_seconds is null or p_claim_seconds not between 5 and 300 then
+     or p_claim_seconds is null or p_claim_seconds not between 180 and 600 then
     return jsonb_build_object('ok', false, 'reason', 'invalid_intent_claim');
   end if;
 
@@ -15838,10 +15855,14 @@ begin
     from public.custody_fresh_tail_exit_intents i
     where i.user_id = p_user_id
       and (
-        i.status in ('pending', 'retry')
+        i.status = 'pending'
+        or (
+          i.status = 'retry'
+          and i.updated_at <= clock_timestamp() - interval '1 second'
+        )
         or (i.status = 'claimed' and i.claim_expires_at <= clock_timestamp())
       )
-    order by i.created_at, i.id
+    order by case when i.status = 'pending' then 0 else 1 end, i.created_at, i.id
     for update skip locked
     limit p_limit
   ), claimed as (
@@ -15890,7 +15911,7 @@ create or replace function public.claim_custody_fresh_tail_uncertain_intents(
   p_user_id uuid,
   p_worker_id text,
   p_limit integer default 25,
-  p_claim_seconds integer default 30
+  p_claim_seconds integer default 180
 )
 returns jsonb
 language plpgsql
@@ -15906,7 +15927,7 @@ begin
   end if;
   if p_user_id is null or v_worker = ''
      or p_limit is null or p_limit not between 1 and 100
-     or p_claim_seconds is null or p_claim_seconds not between 5 and 300 then
+     or p_claim_seconds is null or p_claim_seconds not between 180 and 600 then
     return jsonb_build_object('ok', false, 'reason', 'invalid_uncertain_claim');
   end if;
 
@@ -15944,6 +15965,9 @@ begin
     'amountRaw', coalesce(se.amount_raw, ce.amount_raw)::text,
     'decimals', coalesce(se.decimals, ce.decimals),
     'recipients', coalesce(ce.recipients, '[]'::jsonb),
+    'classification', ce.classification,
+    'classificationReliable', coalesce(se.classification_reliable, ce.classification_reliable),
+    'watchable', ce.watchable,
     'priorSellClaimId', i.sell_claim_id, 'priorBotTxSig', i.bot_tx_sig,
     'priorErrorCode', i.error_code, 'status', i.status
   ) order by i.updated_at, i.id), '[]'::jsonb) into v_intents
@@ -15975,8 +15999,16 @@ set search_path = pg_catalog, public, pg_temp
 as $$
 declare
   v_intent public.custody_fresh_tail_exit_intents%rowtype;
+  v_sell_claim public.sell_signal_claims%rowtype;
+  v_entry_claim public.entry_signal_claims%rowtype;
+  v_position public.positions%rowtype;
+  v_config public.bot_config%rowtype;
   v_disposition text := lower(btrim(coalesce(p_disposition, '')));
   v_expected text := lower(btrim(coalesce(p_expected_status, '')));
+  v_source_tx_sig text;
+  v_source_wallet text;
+  v_expected_trigger text;
+  v_source_is_root boolean := false;
   v_status text;
 begin
   if coalesce(auth.role(), '') <> 'service_role' then
@@ -15987,7 +16019,7 @@ begin
      or v_expected not in ('claimed', 'uncertain')
      or v_disposition not in (
        'resolved', 'retry', 'uncertain', 'disabled_by_policy',
-       'position_not_live', 'duplicate_sell_claim'
+       'position_not_live', 'duplicate_sell_claim', 'entry_failed', 'position_closed'
      ) then
     return jsonb_build_object('ok', false, 'reason', 'invalid_intent_resolution');
   end if;
@@ -16002,31 +16034,93 @@ begin
      or v_intent.claim_expires_at <= clock_timestamp() then
     return jsonb_build_object('ok', false, 'reason', 'intent_claim_fenced');
   end if;
-  if v_disposition = 'resolved'
-     and (
-       p_sell_claim_id is null
-       or nullif(btrim(coalesce(p_bot_tx_sig, '')), '') is null
-     ) then
-    return jsonb_build_object('ok', false, 'reason', 'resolution_evidence_required');
+
+  if v_intent.source_domain = 'supply' then
+    select e.tx_sig, e.target_wallet into v_source_tx_sig, v_source_wallet
+    from public.custody_fresh_tail_supply_events e
+    where e.id = v_intent.supply_event_id
+      and e.epoch_id = v_intent.epoch_id
+      and e.user_id = p_user_id;
+  else
+    select e.tx_sig, e.source_wallet into v_source_tx_sig, v_source_wallet
+    from public.custody_fresh_tail_custody_events e
+    where e.id = v_intent.custody_event_id
+      and e.epoch_id = v_intent.epoch_id
+      and e.user_id = p_user_id;
   end if;
+  if not found or nullif(btrim(coalesce(v_source_tx_sig, '')), '') is null
+     or nullif(btrim(coalesce(v_source_wallet, '')), '') is null then
+    return jsonb_build_object('ok', false, 'reason', 'intent_source_event_missing');
+  end if;
+  v_source_is_root := exists (
+    select 1 from public.custody_fresh_tail_roots r
+    where r.epoch_id = v_intent.epoch_id and r.user_id = p_user_id
+      and r.wallet = v_source_wallet
+  );
+  v_expected_trigger := case v_intent.trigger_kind
+    when 'direct_target_sell' then 'direct_target_sell'
+    when 'mirror_custody_sell' then 'mirror_custody_sell'
+    when 'terminal_outflow' then case when v_source_is_root
+      then 'target_terminal_outflow' else 'terminal_outflow' end
+    else null
+  end;
+  if v_expected_trigger is null then
+    return jsonb_build_object('ok', false, 'reason', 'intent_trigger_invalid');
+  end if;
+
   if v_expected = 'claimed' and v_disposition = 'resolved' then
     return jsonb_build_object(
       'ok', false, 'reason', 'pre_submit_uncertain_required'
     );
   end if;
-  if v_expected = 'claimed' and v_disposition = 'uncertain'
-     and (
-       p_sell_claim_id is null
-       or nullif(btrim(coalesce(p_bot_tx_sig, '')), '') is null
-     ) then
-    -- Uncertain means an exact locally signed attempt may have reached the
-    -- network.  Without both durable claim identity and its signature there is
-    -- nothing a restart reconciler can prove, so signatureless failures remain
-    -- pre-submit retry outcomes instead.
-    return jsonb_build_object(
-      'ok', false, 'reason', 'prepared_sell_evidence_required'
-    );
+  if v_disposition in ('uncertain', 'resolved')
+     or (v_expected = 'uncertain' and v_disposition = 'retry') then
+    if p_sell_claim_id is null
+       or nullif(btrim(coalesce(p_bot_tx_sig, '')), '') is null then
+      return jsonb_build_object(
+        'ok', false, 'reason', 'prepared_sell_evidence_required'
+      );
+    end if;
+    select * into v_sell_claim
+    from public.sell_signal_claims c
+    where c.id = p_sell_claim_id and c.user_id = p_user_id
+    for update;
+    if not found
+       or v_sell_claim.position_id <> v_intent.position_id
+       or v_sell_claim.source_tx_sig <> v_source_tx_sig
+       or v_sell_claim.source_wallet <> v_source_wallet
+       or v_sell_claim.trigger_kind <> v_expected_trigger
+       or v_sell_claim.bot_tx_sig is distinct from btrim(p_bot_tx_sig)
+       or v_sell_claim.recovery_version is distinct from 1
+       or nullif(btrim(coalesce(v_sell_claim.recent_blockhash, '')), '') is null
+       or v_sell_claim.last_valid_block_height is null
+       or v_sell_claim.last_valid_block_height <= 0
+       or v_sell_claim.executed_sell_amount_raw is null
+       or v_sell_claim.prepared_wallet_balance_raw is null
+       or v_sell_claim.position_amount_before_raw is null
+       or v_sell_claim.token_decimals is null then
+      return jsonb_build_object('ok', false, 'reason', 'sell_claim_evidence_mismatch');
+    end if;
+    if v_expected = 'claimed' and v_disposition = 'uncertain'
+       and v_sell_claim.status not in ('submitted', 'uncertain', 'landed') then
+      return jsonb_build_object('ok', false, 'reason', 'sell_claim_not_uncertain');
+    end if;
+    if v_expected = 'uncertain' and v_disposition = 'retry'
+       and v_sell_claim.status <> 'failed_pre_submit' then
+      return jsonb_build_object('ok', false, 'reason', 'sell_claim_retry_not_proven');
+    end if;
+    if v_disposition = 'resolved'
+       and (
+         v_sell_claim.status <> 'landed'
+         or v_sell_claim.trade_id is null
+         or v_sell_claim.persisted_at is null
+         or v_sell_claim.receipt_pre_amount_raw is null
+         or v_sell_claim.receipt_post_amount_raw is null
+       ) then
+      return jsonb_build_object('ok', false, 'reason', 'sell_claim_not_landed_exact');
+    end if;
   end if;
+
   if v_expected = 'uncertain' and v_disposition = 'resolved'
      and (
        v_intent.sell_claim_id is null
@@ -16042,19 +16136,56 @@ begin
       'ok', false, 'reason', 'resolution_evidence_mismatch'
     );
   end if;
+
+  if v_disposition = 'entry_failed' then
+    select * into v_entry_claim
+    from public.entry_signal_claims c
+    where c.id = v_intent.entry_claim_id and c.user_id = p_user_id;
+    if not found or v_entry_claim.status <> 'failed_pre_submit' then
+      return jsonb_build_object('ok', false, 'reason', 'entry_failure_not_proven');
+    end if;
+  elsif v_disposition = 'position_closed' then
+    select * into v_position
+    from public.positions p
+    where p.id = v_intent.position_id and p.user_id = p_user_id;
+    if not found or (
+      v_position.closed_at is null
+      and coalesce(v_position.amount_remaining_raw, '') <> '0'
+    ) then
+      return jsonb_build_object('ok', false, 'reason', 'closed_position_not_proven');
+    end if;
+  elsif v_disposition = 'disabled_by_policy' then
+    select * into v_config
+    from public.bot_config c where c.user_id = p_user_id;
+    if not found or not (
+      (v_intent.trigger_kind = 'direct_target_sell'
+        and v_config.direct_target_sell_exit_mode = 'off')
+      or (v_intent.trigger_kind = 'mirror_custody_sell'
+        and coalesce(
+          (to_jsonb(v_config) ->> 'mirror_custody_sell_exit_enabled')::boolean,
+          false
+        ) is not true)
+      or (v_intent.trigger_kind = 'terminal_outflow' and v_source_is_root
+        and v_config.target_terminal_outflow_exit_enabled is not true)
+      or (v_intent.trigger_kind = 'terminal_outflow' and not v_source_is_root
+        and v_config.terminal_outflow_exit_enabled is not true)
+    ) then
+      return jsonb_build_object('ok', false, 'reason', 'disabled_policy_not_proven');
+    end if;
+  end if;
+
   v_status := case
     when v_disposition = 'resolved' then 'resolved'
     -- A sell may be observed after entry submission but before the planned
     -- position is persisted.  Mere position absence is not proof that the buy
     -- failed, so it must remain retryable rather than permanently dismissed.
-    -- None of the non-resolution dispositions proves that the entry never
-    -- landed or that an existing sell claim will complete.  Keep every one
-    -- retryable; this RPC intentionally has no terminal-dismiss transition.
     when v_disposition in (
-      'retry', 'position_not_live', 'disabled_by_policy',
-      'duplicate_sell_claim'
+      'retry', 'position_not_live', 'duplicate_sell_claim'
     ) then 'retry'
     when v_disposition = 'uncertain' then 'uncertain'
+    when v_disposition in (
+      'disabled_by_policy', 'entry_failed', 'position_closed'
+    ) then 'dismissed'
     else 'dismissed'
   end;
   update public.custody_fresh_tail_exit_intents set
@@ -16211,7 +16342,8 @@ begin
   select * into v_config from public.bot_config where user_id = p_user_id;
   if not found or v_config.enabled is not true
      or v_config.supply_accumulation_mode_enabled is not true
-     or v_config.custody_journey_enabled is not true then
+     or v_config.custody_journey_enabled is not true
+     or v_config.direct_target_sell_exit_mode = 'proportional' then
     return jsonb_build_object('safe', false, 'reason', 'strategy_not_enabled');
   end if;
   if v_config.supply_accumulation_window_seconds is null

@@ -49,7 +49,10 @@ import {
   createSupabaseFollowerBalanceStore,
   FollowerBalanceReconciler,
 } from "./follower-balance-reconciler.js";
-import { evaluateEntryMonitoringGate } from "./entry-monitoring-gate.js";
+import {
+  evaluateEntryMonitoringGate,
+  evaluateFreshTailEntryMonitoringGate,
+} from "./entry-monitoring-gate.js";
 import { priceUsd } from "./prices.js";
 import {
   checkCoordinatedEntry,
@@ -85,6 +88,12 @@ import {
   freshTailCandidateIsUsable,
   type FreshTailEntryCandidate,
 } from "./fresh-tail-entry-store.js";
+import {
+  createFreshTailExitStore,
+  type FreshTailExitEvidence,
+  type FreshTailExitIntent,
+} from "./fresh-tail-exit-store.js";
+import { planFreshTailExit } from "./fresh-tail-exit-policy.js";
 import {
   SupplyAccumulationStore,
   supplyEventKey,
@@ -476,6 +485,28 @@ async function main() {
     createRpcFollowerTokenBalanceReader(rpc),
     6,
   );
+  const freshTailExitRuntime = {
+    running: false,
+    lastSuccessAt: 0,
+    lastError: null as string | null,
+    unresolvedUncertainCount: 0,
+  };
+  const sellRecoveryRuntime = {
+    running: false,
+    lastSuccessAt: 0,
+    lastError: null as string | null,
+  };
+  const exactSellRecoveryRuntimeReady = (nowMs = Date.now()) =>
+    sellRecoveryRuntime.lastSuccessAt > 0 &&
+    nowMs - sellRecoveryRuntime.lastSuccessAt <= 15_000 &&
+    sellRecoveryRuntime.lastError === null;
+  const exactFreshTailExitRuntimeReady = (nowMs = Date.now()) =>
+    freshTailExitRuntime.lastSuccessAt > 0 &&
+    nowMs - freshTailExitRuntime.lastSuccessAt <= 5_000 &&
+    freshTailExitRuntime.lastError === null &&
+    freshTailExitRuntime.unresolvedUncertainCount === 0;
+  const freshTailExitRuntimeReady = (nowMs = Date.now()) =>
+    exactSellRecoveryRuntimeReady(nowMs) && exactFreshTailExitRuntimeReady(nowMs);
   const currentEntryMonitoringGate = () => {
     const geyser = feed.health();
     const rpcFallback = poller.health();
@@ -486,10 +517,36 @@ async function main() {
       followerBalances: followerBalanceReconciler.health(),
     });
   };
+  const currentFreshTailEntryMonitoringGate = () => {
+    const geyser = feed.health();
+    const rpcFallback = poller.health();
+    const gate = evaluateFreshTailEntryMonitoringGate({
+      geyserConnected: Boolean(geyser.connected),
+      rpcLastSuccessAt: rpcFallback.lastSuccessAt ?? null,
+    });
+    const reasons = [...gate.reasons];
+    if (!exactSellRecoveryRuntimeReady()) {
+      reasons.push("exact sell-claim reconciliation is not healthy");
+    }
+    if (!exactFreshTailExitRuntimeReady()) {
+      reasons.push("fresh-tail exact exit drainer is not healthy or has an uncertain exit");
+    }
+    return {
+      blocked: reasons.length > 0,
+      reasons,
+    };
+  };
+  const currentCopyBuyMonitoringGate = (freshTailEntry: boolean) =>
+    freshTailEntry ? currentFreshTailEntryMonitoringGate() : currentEntryMonitoringGate();
   const coordinatedBuys = new CoordinatedBuyTracker();
   const supplyAccumulationStore = new SupplyAccumulationStore(db, cfg.user_id);
   const supplyAccumulationScaleStore = new SupplyAccumulationScaleStore(db, cfg.user_id);
   const freshTailEntryStore = createFreshTailEntryStore(db, cfg.user_id);
+  const freshTailExitStore = createFreshTailExitStore(
+    db,
+    cfg.user_id,
+    `trading:${process.pid}:${randomUUID()}`,
+  );
 
   // Cumulative USDC the target has committed to each mint over a rolling window
   // (his real conviction). Used by the USDC-conviction gate/sizing when enabled.
@@ -908,6 +965,21 @@ async function main() {
       return resolved;
     } finally {
       reconcilingSellClaims = false;
+    }
+  }
+
+  async function runSellClaimReconciliation(): Promise<void> {
+    if (sellRecoveryRuntime.running) return;
+    sellRecoveryRuntime.running = true;
+    try {
+      await reconcileUnresolvedSellClaims();
+      sellRecoveryRuntime.lastSuccessAt = Date.now();
+      sellRecoveryRuntime.lastError = null;
+    } catch (error) {
+      sellRecoveryRuntime.lastError = safeDiagnostic(error);
+      throw error;
+    } finally {
+      sellRecoveryRuntime.running = false;
     }
   }
 
@@ -2161,6 +2233,27 @@ async function main() {
   }
   await monitor.reconcileFollowersFromDatabase();
 
+  // No fresh entry may be polled until the exact sell-claim reconciler and the
+  // finalized fresh-tail exit outbox have both completed a startup pass. A
+  // missing migration or an unhealthy drainer therefore disables only fresh
+  // entries while every legacy monitor and exit path continues to start.
+  await runSellClaimReconciliation().catch((err) =>
+    log.error({ err: safeDiagnostic(err) }, "startup sell-claim reconciliation failed closed"),
+  );
+  await drainFreshTailExitIntents().catch((err) =>
+    log.error({ err: safeDiagnostic(err) }, "startup fresh-tail exit drain failed closed"),
+  );
+  setInterval(() => {
+    drainFreshTailExitIntents().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "fresh-tail exit drain failed closed"),
+    );
+  }, 500);
+  setInterval(() => {
+    runSellClaimReconciliation().catch((err) =>
+      log.error({ err: safeDiagnostic(err) }, "sell-claim reconciliation failed closed"),
+    );
+  }, 5_000);
+
   // A scale claim always belongs to an already-open Supply position. Restore
   // that position's original monitor context before applying a landed scale so
   // any durable target sell discovered during recovery can execute against the
@@ -2207,6 +2300,7 @@ async function main() {
       freshTailEntryPollRunning ||
       !cfg.enabled ||
       entryConfigTransitioning ||
+      !freshTailExitRuntimeReady() ||
       automaticEntryStrategy(cfg) !== "supply_accumulation" ||
       cfg.supply_accumulation_mode_enabled !== true ||
       cfg.custody_journey_enabled !== true
@@ -2378,6 +2472,20 @@ async function main() {
         rpcFallback: poller.health(),
         followerBalanceReconciliation: followerBalanceReconciler.health(),
         entryMonitoringGate: currentEntryMonitoringGate(),
+        freshTailEntryMonitoringGate: currentFreshTailEntryMonitoringGate(),
+        freshTailExitDrainer: {
+          running: freshTailExitRuntime.running,
+          ready: exactFreshTailExitRuntimeReady(),
+          unresolvedUncertainCount: freshTailExitRuntime.unresolvedUncertainCount,
+          lastSuccessAt: toIsoTimestamp(freshTailExitRuntime.lastSuccessAt),
+          lastError: freshTailExitRuntime.lastError,
+        },
+        exactSellClaimReconciliation: {
+          running: sellRecoveryRuntime.running,
+          ready: exactSellRecoveryRuntimeReady(),
+          lastSuccessAt: toIsoTimestamp(sellRecoveryRuntime.lastSuccessAt),
+          lastError: sellRecoveryRuntime.lastError,
+        },
         strategyRecorder: strategyRecorder.health(),
       },
       "stream heartbeat",
@@ -3064,6 +3172,8 @@ async function main() {
       markCoordinatedExit?: boolean;
       markFollowerSellerExit?: boolean;
       mirroredSoldFraction?: number;
+      onClaimIdentified?: (claim: { id: string; status: string; botTxSig: string | null }) => void;
+      onClaimPrepared?: (claim: { id: string; botTxSig: string }) => void;
     } = {},
     tradeLockHeld = false,
   ): Promise<ExecuteResult | null> {
@@ -3101,6 +3211,8 @@ async function main() {
         .select("id")
         .maybeSingle();
       let claim = insertedClaim as { id: string } | null;
+      let claimStatus = "claimed";
+      let claimBotTxSig: string | null = null;
       if (claimError?.code === "23505") {
         const { data: existingClaim, error: existingClaimError } = await db
           .from("sell_signal_claims")
@@ -3116,6 +3228,13 @@ async function main() {
           );
         }
         if (!existingClaim || !canReclaimSellClaim(existingClaim.status)) {
+          if (existingClaim) {
+            options.onClaimIdentified?.({
+              id: existingClaim.id,
+              status: existingClaim.status,
+              botTxSig: existingClaim.bot_tx_sig ?? null,
+            });
+          }
           if (event) {
             recordStrategyDecision(event, "tracked", "duplicate durable sell signal ignored", {
               position_id: positionId,
@@ -3180,12 +3299,19 @@ async function main() {
           );
         }
         claim = reclaimed;
+        claimStatus = "claimed";
+        claimBotTxSig = null;
       }
       if ((claimError && claimError.code !== "23505") || !claim) {
         throw new Error(
           `sell signal claim failed: ${safeDiagnostic(claimError ?? "missing claim")}`,
         );
       }
+      options.onClaimIdentified?.({
+        id: claim.id,
+        status: claimStatus,
+        botTxSig: claimBotTxSig,
+      });
 
       const updateClaim = async (values: Record<string, unknown>, required = false) => {
         const { error } = await db
@@ -3262,6 +3388,7 @@ async function main() {
           tokenDecimals: prepared.tokenDecimals,
         });
         preparedBotTxSig = prepared.txSig;
+        options.onClaimPrepared?.({ id: claim.id, botTxSig: prepared.txSig });
       };
       const authorizePreparedSell = async () => {
         if (!preparedBotTxSig) return false;
@@ -3328,7 +3455,11 @@ async function main() {
         }
         return result;
       } catch (err) {
-        if (isPostSubmissionError(err) && preparedBotTxSig) {
+        // Once an exact signed attempt is durably prepared, an unexpected
+        // throw is not proof that it stayed local. Quarantine it even when the
+        // transport failed to wrap the error as SubmissionUncertainError; the
+        // finalized-chain reconciler is the only authority allowed to retry.
+        if (preparedBotTxSig) {
           await sellClaimRecoveryStore
             .markUncertain(claim.id, preparedBotTxSig, safeDiagnostic(err))
             .catch((statusError) =>
@@ -3355,6 +3486,370 @@ async function main() {
     return tradeLockHeld
       ? exitExecutionQueue.run(positionId, runClaimedExit)
       : tradeExecutionQueue.run(mint, () => exitExecutionQueue.run(positionId, runClaimedExit));
+  }
+
+  type FreshTailSellClaimIdentity = {
+    id: string;
+    status: string;
+    botTxSig: string | null;
+  };
+
+  async function resolveFreshTailLandedIntent(
+    intent: FreshTailExitIntent,
+    evidence: FreshTailExitEvidence,
+  ): Promise<void> {
+    await freshTailExitStore.resolve(intent, "claimed", "uncertain", evidence, null);
+    await freshTailExitStore.resolve(
+      {
+        ...intent,
+        status: "uncertain",
+        priorSellClaimId: evidence.sellClaimId,
+        priorBotTxSig: evidence.botTxSig,
+      },
+      "uncertain",
+      "resolved",
+      evidence,
+      null,
+    );
+  }
+
+  async function loadFreshTailSellClaim(
+    intent: FreshTailExitIntent,
+    sourceTxSig: string,
+    sourceWallet: string,
+    triggerKind: SellTriggerKind,
+  ): Promise<FreshTailSellClaimIdentity | null> {
+    const { data, error } = await db
+      .from("sell_signal_claims")
+      .select("id,status,bot_tx_sig")
+      .eq("user_id", cfg.user_id)
+      .eq("position_id", intent.positionId)
+      .eq("source_tx_sig", sourceTxSig)
+      .eq("source_wallet", sourceWallet)
+      .eq("trigger_kind", triggerKind)
+      .maybeSingle();
+    if (error) {
+      throw new Error(`fresh-tail sell claim lookup failed: ${safeDiagnostic(error)}`);
+    }
+    if (!data) return null;
+    return {
+      id: String(data.id),
+      status: String(data.status),
+      botTxSig: data.bot_tx_sig ? String(data.bot_tx_sig) : null,
+    };
+  }
+
+  async function processFreshTailExitIntent(intent: FreshTailExitIntent): Promise<void> {
+    const [{ data: epochRoot, error: rootError }, { data: entryClaim, error: entryError }] =
+      await Promise.all([
+        db
+          .from("custody_fresh_tail_roots")
+          .select("wallet")
+          .eq("user_id", cfg.user_id)
+          .eq("epoch_id", intent.epochId)
+          .eq("wallet", intent.sourceWallet)
+          .maybeSingle(),
+        db
+          .from("entry_signal_claims")
+          .select(
+            "id,status,entry_strategy,planned_position_id,token_mint,source_slot,fresh_tail_epoch_id,fresh_tail_request_id,fresh_tail_monitoring_armed_at",
+          )
+          .eq("id", intent.entryClaimId)
+          .eq("user_id", cfg.user_id)
+          .maybeSingle(),
+      ]);
+    if (rootError || entryError) {
+      throw new Error(
+        `fresh-tail exit binding lookup failed: ${safeDiagnostic(rootError ?? entryError)}`,
+      );
+    }
+    const sourceIsEpochRoot = Boolean(epochRoot);
+    if (
+      !entryClaim ||
+      entryClaim.entry_strategy !== "supply_accumulation" ||
+      entryClaim.planned_position_id !== intent.positionId ||
+      entryClaim.token_mint !== intent.tokenMint ||
+      entryClaim.fresh_tail_epoch_id !== intent.epochId ||
+      entryClaim.fresh_tail_request_id !== intent.requestId ||
+      !entryClaim.fresh_tail_monitoring_armed_at ||
+      !Number.isSafeInteger(Number(entryClaim.source_slot)) ||
+      Number(entryClaim.source_slot) > intent.slot ||
+      (intent.triggerKind === "direct_target_sell" && !sourceIsEpochRoot)
+    ) {
+      throw new Error("fresh-tail exit does not match its exact armed entry identity");
+    }
+    if (entryClaim.status === "failed_pre_submit") {
+      await freshTailExitStore.resolve(
+        intent,
+        "claimed",
+        "entry_failed",
+        null,
+        "fresh-tail entry was definitively failed before submission",
+      );
+      return;
+    }
+    if (entryClaim.status !== "persisted") {
+      await freshTailExitStore.resolve(
+        intent,
+        "claimed",
+        "position_not_live",
+        null,
+        "fresh-tail entry is not yet an exact persisted live identity",
+      );
+      return;
+    }
+
+    const plan = planFreshTailExit(
+      intent,
+      {
+        directTargetSellMode: cfg.direct_target_sell_exit_mode,
+        directTargetSellPct: Number(cfg.direct_target_sell_exit_pct),
+        mirrorCustodySellEnabled: cfg.mirror_custody_sell_exit_enabled === true,
+        mirrorCustodySellPct: Number(cfg.mirror_custody_sell_exit_pct),
+        terminalOutflowEnabled: cfg.terminal_outflow_exit_enabled === true,
+        terminalOutflowPct: Number(cfg.terminal_outflow_exit_pct),
+        targetTerminalOutflowEnabled: cfg.target_terminal_outflow_exit_enabled === true,
+        targetTerminalOutflowPct: Number(cfg.target_terminal_outflow_exit_pct),
+      },
+      sourceIsEpochRoot,
+    );
+    if (plan.action !== "execute") {
+      await freshTailExitStore.resolve(
+        intent,
+        "claimed",
+        plan.action === "disabled" ? "disabled_by_policy" : "retry",
+        null,
+        plan.reason,
+      );
+      return;
+    }
+
+    const existingClaim = await loadFreshTailSellClaim(
+      intent,
+      intent.txSig,
+      intent.sourceWallet,
+      plan.sellTriggerKind,
+    );
+    if (existingClaim?.status === "landed" && existingClaim.botTxSig) {
+      await resolveFreshTailLandedIntent(intent, {
+        sellClaimId: existingClaim.id,
+        botTxSig: existingClaim.botTxSig,
+      });
+      return;
+    }
+    if (
+      existingClaim?.botTxSig &&
+      (existingClaim.status === "submitted" || existingClaim.status === "uncertain")
+    ) {
+      await freshTailExitStore.resolve(
+        intent,
+        "claimed",
+        "uncertain",
+        { sellClaimId: existingClaim.id, botTxSig: existingClaim.botTxSig },
+        `exact sell claim is ${existingClaim.status}`,
+      );
+      return;
+    }
+    if (existingClaim && existingClaim.status !== "failed_pre_submit") {
+      await freshTailExitStore.resolve(
+        intent,
+        "claimed",
+        "duplicate_sell_claim",
+        null,
+        `exact sell claim is ${existingClaim.status} without resolved evidence`,
+      );
+      return;
+    }
+
+    const { data: position, error: positionError } = await db
+      .from("positions")
+      .select("id,token_mint,amount_remaining,amount_remaining_raw,decimals,entry_slot,closed_at")
+      .eq("id", intent.positionId)
+      .eq("user_id", cfg.user_id)
+      .maybeSingle();
+    if (positionError) {
+      throw new Error(`fresh-tail exit position lookup failed: ${safeDiagnostic(positionError)}`);
+    }
+    const positionRaw = String(position?.amount_remaining_raw ?? "");
+    if (position && (position.closed_at || positionRaw === "0")) {
+      await freshTailExitStore.resolve(
+        intent,
+        "claimed",
+        "position_closed",
+        null,
+        "exact fresh-tail position is already closed",
+      );
+      return;
+    }
+    if (
+      !position ||
+      position.token_mint !== intent.tokenMint ||
+      Number(position.decimals) !== intent.decimals ||
+      !/^[1-9][0-9]*$/.test(positionRaw) ||
+      (Number(position.entry_slot ?? 0) > 0 && intent.slot < Number(position.entry_slot))
+    ) {
+      await freshTailExitStore.resolve(
+        intent,
+        "claimed",
+        "position_not_live",
+        null,
+        "exact fresh-tail position is not live",
+      );
+      return;
+    }
+
+    const executionEvidence: {
+      identified: FreshTailSellClaimIdentity | null;
+      prepared: FreshTailExitEvidence | null;
+    } = { identified: null, prepared: null };
+    try {
+      const result = await executeClaimedPercentageExit(
+        position.id,
+        position.token_mint,
+        Number(position.amount_remaining),
+        Number(position.decimals),
+        plan.sellPct,
+        plan.sellTriggerKind,
+        undefined,
+        plan.reason,
+        {
+          sourceTxSig: intent.txSig,
+          sourceWallet: intent.sourceWallet,
+          onClaimIdentified: (claim) => {
+            executionEvidence.identified = claim;
+          },
+          onClaimPrepared: (claim) => {
+            executionEvidence.prepared = {
+              sellClaimId: claim.id,
+              botTxSig: claim.botTxSig,
+            };
+          },
+        },
+      );
+      const identified = executionEvidence.identified;
+      if (result && identified) {
+        await resolveFreshTailLandedIntent(intent, {
+          sellClaimId: identified.id,
+          botTxSig: result.txSig,
+        });
+        return;
+      }
+      if (identified?.status === "landed" && identified.botTxSig) {
+        await resolveFreshTailLandedIntent(intent, {
+          sellClaimId: identified.id,
+          botTxSig: identified.botTxSig,
+        });
+        return;
+      }
+      if (
+        identified?.botTxSig &&
+        (identified.status === "submitted" || identified.status === "uncertain")
+      ) {
+        await freshTailExitStore.resolve(
+          intent,
+          "claimed",
+          "uncertain",
+          { sellClaimId: identified.id, botTxSig: identified.botTxSig },
+          `exact sell claim is ${identified.status}`,
+        );
+        return;
+      }
+      await freshTailExitStore.resolve(
+        intent,
+        "claimed",
+        "retry",
+        null,
+        "fresh-tail sell ended before an exact landed result",
+      );
+    } catch (error) {
+      const prepared = executionEvidence.prepared;
+      if (prepared) {
+        await freshTailExitStore.resolve(
+          intent,
+          "claimed",
+          "uncertain",
+          prepared,
+          safeDiagnostic(error),
+        );
+        return;
+      }
+      await freshTailExitStore.resolve(intent, "claimed", "retry", null, safeDiagnostic(error));
+    }
+  }
+
+  async function processFreshTailUncertainIntent(intent: FreshTailExitIntent): Promise<void> {
+    if (!intent.priorSellClaimId || !intent.priorBotTxSig) {
+      throw new Error("fresh-tail uncertain exit is missing prepared evidence");
+    }
+    const { data: claim, error } = await db
+      .from("sell_signal_claims")
+      .select("id,position_id,status,bot_tx_sig")
+      .eq("id", intent.priorSellClaimId)
+      .eq("user_id", cfg.user_id)
+      .maybeSingle();
+    if (error) {
+      throw new Error(`fresh-tail uncertain sell lookup failed: ${safeDiagnostic(error)}`);
+    }
+    if (
+      !claim ||
+      claim.position_id !== intent.positionId ||
+      claim.bot_tx_sig !== intent.priorBotTxSig
+    ) {
+      throw new Error("fresh-tail uncertain sell evidence no longer matches its durable claim");
+    }
+    const evidence = {
+      sellClaimId: intent.priorSellClaimId,
+      botTxSig: intent.priorBotTxSig,
+    };
+    if (claim.status === "landed") {
+      await freshTailExitStore.resolve(intent, "uncertain", "resolved", evidence, null);
+    } else if (claim.status === "failed_pre_submit") {
+      await freshTailExitStore.resolve(
+        intent,
+        "uncertain",
+        "retry",
+        evidence,
+        "prepared sell was proven not to have landed",
+      );
+    }
+  }
+
+  async function drainFreshTailExitIntents(): Promise<void> {
+    if (freshTailExitRuntime.running) return;
+    freshTailExitRuntime.running = true;
+    try {
+      const intents = await freshTailExitStore.claim(10, 180);
+      const results = await Promise.allSettled(intents.map(processFreshTailExitIntent));
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+
+      const uncertain = await freshTailExitStore.claimUncertain(10, 180);
+      const uncertainResults = await Promise.allSettled(
+        uncertain.map(processFreshTailUncertainIntent),
+      );
+      const uncertainFailure = uncertainResults.find((result) => result.status === "rejected");
+      if (uncertainFailure?.status === "rejected") throw uncertainFailure.reason;
+
+      const { count: unresolvedUncertainCount, error: uncertainCountError } = await db
+        .from("custody_fresh_tail_exit_intents")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", cfg.user_id)
+        .eq("status", "uncertain");
+      if (uncertainCountError || unresolvedUncertainCount === null) {
+        throw new Error(
+          `fresh-tail uncertain exit count failed: ${safeDiagnostic(uncertainCountError ?? "missing exact count")}`,
+        );
+      }
+
+      freshTailExitRuntime.unresolvedUncertainCount = unresolvedUncertainCount;
+      freshTailExitRuntime.lastSuccessAt = Date.now();
+      freshTailExitRuntime.lastError = null;
+    } catch (error) {
+      freshTailExitRuntime.lastError = safeDiagnostic(error);
+      throw error;
+    } finally {
+      freshTailExitRuntime.running = false;
+    }
   }
 
   const supplyBuyBackground = new BoundedBackgroundQueue(16, 512);
@@ -4083,7 +4578,7 @@ async function main() {
       !cfg.enabled ||
       entryConfigTransitioning ||
       automaticEntryStrategy(cfg) !== "supply_accumulation" ||
-      currentEntryMonitoringGate().blocked ||
+      currentFreshTailEntryMonitoringGate().blocked ||
       !Number.isSafeInteger(amountLamports) ||
       amountLamports <= 0 ||
       !freshTailCandidateIsUsable(candidate) ||
@@ -4141,7 +4636,7 @@ async function main() {
       !cfg.enabled ||
       entryConfigTransitioning ||
       automaticEntryStrategy(cfg) !== "supply_accumulation" ||
-      currentEntryMonitoringGate().blocked
+      currentFreshTailEntryMonitoringGate().blocked
     ) {
       return null;
     }
@@ -6456,6 +6951,8 @@ async function main() {
     options: CopyBuyOptions,
   ): Promise<string | null> {
     const expectedStrategy = copyBuyEntryStrategy(options);
+    const freshTailEntry =
+      expectedStrategy === "supply_accumulation" && options.freshTailCandidate !== undefined;
     if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy) {
       recordStrategyDecision(
         event,
@@ -6468,7 +6965,7 @@ async function main() {
       recordStrategyDecision(event, "skipped", "new entries disabled");
       return null;
     }
-    const monitoringGate = currentEntryMonitoringGate();
+    const monitoringGate = currentCopyBuyMonitoringGate(freshTailEntry);
     if (monitoringGate.blocked) {
       log.warn(
         { reasons: monitoringGate.reasons, mint: event.tokenMint },
@@ -6490,6 +6987,8 @@ async function main() {
     options: CopyBuyOptions,
   ): Promise<string | null> {
     const expectedStrategy = copyBuyEntryStrategy(options);
+    const freshTailEntry =
+      expectedStrategy === "supply_accumulation" && options.freshTailCandidate !== undefined;
     if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy) {
       log.info(
         { mint: event.tokenMint, expectedStrategy },
@@ -6506,7 +7005,7 @@ async function main() {
       recordStrategyDecision(event, "skipped", "Entries turned off while entry was queued");
       return null;
     }
-    const queuedMonitoringGate = currentEntryMonitoringGate();
+    const queuedMonitoringGate = currentCopyBuyMonitoringGate(freshTailEntry);
     if (queuedMonitoringGate.blocked) {
       log.warn(
         { reasons: queuedMonitoringGate.reasons, mint: event.tokenMint },
@@ -6575,7 +7074,6 @@ async function main() {
     }
 
     const supplyEntry = expectedStrategy === "supply_accumulation";
-    const freshTailEntry = supplyEntry && options.freshTailCandidate !== undefined;
     const meta: TokenMeta = supplyEntry
       ? {
           marketCapUsd:
@@ -6810,7 +7308,7 @@ async function main() {
         );
         return null;
       }
-      const submissionMonitoringGate = currentEntryMonitoringGate();
+      const submissionMonitoringGate = currentCopyBuyMonitoringGate(freshTailEntry);
       if (submissionMonitoringGate.blocked) {
         log.warn(
           { reasons: submissionMonitoringGate.reasons, mint: event.tokenMint },
@@ -6886,7 +7384,7 @@ async function main() {
       // The durable claim/update calls above yield to the event loop. Config or
       // monitoring health may have changed during those awaits, so re-check at
       // the final boundary with no intervening await before executeSwap starts.
-      const finalSubmissionGate = currentEntryMonitoringGate();
+      const finalSubmissionGate = currentCopyBuyMonitoringGate(freshTailEntry);
       const strategyChangedAfterClaim =
         entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy;
       if (!cfg.enabled || finalSubmissionGate.blocked || strategyChangedAfterClaim) {
@@ -6965,11 +7463,12 @@ async function main() {
               }
             : undefined,
           beforeSubmit: async () => {
+            const currentMonitoringGate = () => currentCopyBuyMonitoringGate(freshTailEntry);
             const genericGate =
               cfg.enabled === true &&
               !entryConfigTransitioning &&
               automaticEntryStrategy(cfg) === expectedStrategy &&
-              !currentEntryMonitoringGate().blocked;
+              !currentMonitoringGate().blocked;
             if (!genericGate) return false;
             if (!supplyEntry) return true;
             if (options.freshTailCandidate) {
@@ -6996,7 +7495,7 @@ async function main() {
               cfg.enabled === true &&
               !entryConfigTransitioning &&
               automaticEntryStrategy(cfg) === expectedStrategy &&
-              !currentEntryMonitoringGate().blocked
+              !currentMonitoringGate().blocked
             );
           },
         });

@@ -25,6 +25,7 @@ test("fresh-tail polling is entry-enabled, non-overlapping, and serialized by mi
     "const runFollowerBalanceReconciliation",
   );
   assert.match(startup, /!cfg\.enabled/);
+  assert.match(startup, /!freshTailExitRuntimeReady\(\)/);
   assert.match(startup, /automaticEntryStrategy\(cfg\) !== "supply_accumulation"/);
   assert.match(startup, /freshTailEntryStore\.loadCandidates\(25\)/);
   assert.match(startup, /setInterval\(\(\) => void pollFreshTailEntries\(\), 250\)/);
@@ -45,6 +46,63 @@ test("fresh-tail polling is entry-enabled, non-overlapping, and serialized by mi
   assert.match(candidate, /await tryCopyBuyLocked\(/);
   assert.match(candidate, /freshTailCandidate: candidate/);
   assert.doesNotMatch(candidate, /executeSupplyScaleInLocked|supplyAccumulationScaleStore/);
+});
+
+test("exact exit reconciliation and the fenced outbox start before candidate polling", () => {
+  const recoveryAt = workerSource.indexOf("await runSellClaimReconciliation().catch");
+  const firstDrainAt = workerSource.indexOf("await drainFreshTailExitIntents().catch");
+  const drainTimerAt = workerSource.indexOf(
+    "drainFreshTailExitIntents().catch",
+    firstDrainAt + "await drainFreshTailExitIntents().catch".length,
+  );
+  const recoveryTimerAt = workerSource.indexOf(
+    "runSellClaimReconciliation().catch",
+    recoveryAt + "await runSellClaimReconciliation().catch".length,
+  );
+  const pollAt = workerSource.indexOf("let freshTailEntryPollRunning");
+  assert.ok(
+    recoveryAt >= 0 &&
+      firstDrainAt > recoveryAt &&
+      drainTimerAt > firstDrainAt &&
+      recoveryTimerAt > drainTimerAt,
+  );
+  assert.ok(
+    pollAt > recoveryTimerAt,
+    "fresh candidate polling must start after the exit startup pass",
+  );
+  assert.match(workerSource.slice(firstDrainAt, pollAt), /\}, 500\);/);
+  assert.match(workerSource.slice(firstDrainAt, pollAt), /\}, 5_000\);/);
+
+  const recovery = section(
+    "async function runSellClaimReconciliation",
+    "async function updateEntryClaim",
+  );
+  assert.match(recovery, /await reconcileUnresolvedSellClaims\(\)/);
+  assert.match(recovery, /sellRecoveryRuntime\.lastSuccessAt = Date\.now\(\)/);
+  assert.match(recovery, /sellRecoveryRuntime\.lastError = safeDiagnostic\(error\)/);
+
+  const drainer = section(
+    "async function resolveFreshTailLandedIntent",
+    "const supplyBuyBackground",
+  );
+  assert.match(drainer, /freshTailExitStore\.claim\(10, 180\)/);
+  assert.match(drainer, /freshTailExitStore\.claimUncertain\(10, 180\)/);
+  assert.match(drainer, /\.from\("custody_fresh_tail_roots"\)/);
+  assert.match(drainer, /entryClaim\.status === "failed_pre_submit"[\s\S]*"entry_failed"/);
+  assert.match(drainer, /entryClaim\.status !== "persisted"/);
+  assert.match(drainer, /entryClaim\.fresh_tail_epoch_id !== intent\.epochId/);
+  assert.match(drainer, /entryClaim\.fresh_tail_request_id !== intent\.requestId/);
+  assert.match(drainer, /position\?\.amount_remaining_raw/);
+  assert.match(drainer, /position\.closed_at \|\| positionRaw === "0"[\s\S]*"position_closed"/);
+  assert.match(drainer, /executeClaimedPercentageExit\(/);
+  assert.match(
+    drainer,
+    /\.from\("custody_fresh_tail_exit_intents"\)[\s\S]*\.eq\("status", "uncertain"\)[\s\S]*unresolvedUncertainCount/,
+  );
+  assert.match(
+    drainer,
+    /freshTailExitStore\.resolve\(intent, "claimed", "uncertain", evidence, null\)[\s\S]*"uncertain",[\s\S]*"resolved"/,
+  );
 });
 
 test("both preclaim and prepared-claim gates require a fresh certificate and dual active curves", () => {
@@ -77,6 +135,8 @@ test("both preclaim and prepared-claim gates require a fresh certificate and dua
   assert.match(validation, /const configuredCap = Math\.min\(20_000,/);
   assert.match(validation, /strictestPumpFunMarketCaps\(/);
   assert.match(validation, /!caps\?\.belowCap/);
+  assert.match(validation, /currentFreshTailEntryMonitoringGate\(\)\.blocked/);
+  assert.doesNotMatch(validation, /currentEntryMonitoringGate\(\)\.blocked/);
 
   const curveViews = section(
     "async function loadFreshTailCurveViews",
@@ -92,6 +152,42 @@ test("both preclaim and prepared-claim gates require a fresh certificate and dua
   );
   assert.match(curveViews, /freshTailCurveMatchesCandidate\(confirmedCurve, candidate\)/);
   assert.match(curveViews, /freshTailCurveMatchesCandidate\(processedCurve, candidate\)/);
+});
+
+test("fresh-tail selects its narrow monitoring gate at every copy submission boundary", () => {
+  const copy = section("async function tryCopyBuyLocked", 'process.on("unhandledRejection"');
+  assert.match(copy, /const freshTailEntry =[\s\S]*options\.freshTailCandidate !== undefined/);
+  assert.match(copy, /currentCopyBuyMonitoringGate\(freshTailEntry\)/);
+  assert.match(
+    copy,
+    /const currentMonitoringGate = \(\) =>[\s\S]*currentCopyBuyMonitoringGate\(freshTailEntry\)/,
+  );
+  assert.match(copy, /!currentMonitoringGate\(\)\.blocked/);
+
+  const monitoringSetup = section("const currentEntryMonitoringGate", "const coordinatedBuys");
+  const readinessSetup = section("const freshTailExitRuntime", "const currentEntryMonitoringGate");
+  assert.match(
+    readinessSetup,
+    /exactSellRecoveryRuntimeReady\(nowMs\) && exactFreshTailExitRuntimeReady\(nowMs\)/,
+  );
+  assert.match(monitoringSetup, /evaluateFreshTailEntryMonitoringGate\(/);
+  assert.match(monitoringSetup, /exactSellRecoveryRuntimeReady\(\)/);
+  assert.match(monitoringSetup, /exactFreshTailExitRuntimeReady\(\)/);
+  assert.match(monitoringSetup, /exact sell-claim reconciliation is not healthy/);
+  assert.match(monitoringSetup, /fresh-tail exact exit drainer is not healthy/);
+  assert.match(
+    monitoringSetup,
+    /freshTailEntry \? currentFreshTailEntryMonitoringGate\(\) : currentEntryMonitoringGate\(\)/,
+  );
+});
+
+test("any durably prepared sell error is quarantined for finalized reconciliation", () => {
+  const claimedExit = section(
+    "async function executeClaimedPercentageExit",
+    "type FreshTailSellClaimIdentity",
+  );
+  assert.match(claimedExit, /if \(preparedBotTxSig\)[\s\S]*markUncertain\(/);
+  assert.doesNotMatch(claimedExit, /if \(isPostSubmissionError\(err\) && preparedBotTxSig\)/);
 });
 
 test("fresh claim is armed before submission and final authorization owns the submitted claim", () => {
