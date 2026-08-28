@@ -523,6 +523,7 @@ async function checkCustodyJourneySchema(cfg: BotConfigRow): Promise<boolean> {
       "/rpc/record_custody_unresolved_outflow",
       "/rpc/replay_custody_pending_events",
       "/rpc/custody_pending_queue_health",
+      "/rpc/custody_pending_queue_capabilities",
     ].filter((path) => !paths[path]);
     if (!response.ok || missingRpc.length > 0) {
       fail("Custody Journey RPCs", {
@@ -532,19 +533,25 @@ async function checkCustodyJourneySchema(cfg: BotConfigRow): Promise<boolean> {
       return false;
     }
 
-    const { data: queueHealth, error: queueHealthError } = await db.rpc(
-      "custody_pending_queue_health",
+    const { data: queueCapabilities, error: queueCapabilitiesError } = await db.rpc(
+      "custody_pending_queue_capabilities",
       { p_user_id: env.HELIX_USER_ID },
     );
-    const health =
-      queueHealth && typeof queueHealth === "object" && !Array.isArray(queueHealth)
-        ? (queueHealth as Record<string, unknown>)
+    const capabilities =
+      queueCapabilities &&
+      typeof queueCapabilities === "object" &&
+      !Array.isArray(queueCapabilities)
+        ? (queueCapabilities as Record<string, unknown>)
         : null;
-    if (queueHealthError || Number(health?.schemaVersion) !== 2 || health?.indexesReady !== true) {
+    if (
+      queueCapabilitiesError ||
+      Number(capabilities?.schemaVersion) !== 2 ||
+      capabilities?.indexesReady !== true
+    ) {
       fail("Custody Journey backlog scheduler", {
-        schemaVersion: health ? Number(health.schemaVersion ?? 0) : 0,
-        indexesReady: health?.indexesReady === true,
-        hasError: Boolean(queueHealthError),
+        schemaVersion: capabilities ? Number(capabilities.schemaVersion ?? 0) : 0,
+        indexesReady: capabilities?.indexesReady === true,
+        errorCode: queueCapabilitiesError?.code ?? null,
       });
       return false;
     }

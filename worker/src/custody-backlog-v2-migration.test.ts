@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 const root = (path: string) => fileURLToPath(new URL(`../../${path}`, import.meta.url));
 const sql = readFileSync(root("supabase/custody-backlog-v2-migration.sql"), "utf8");
 const custodySql = readFileSync(root("supabase/custody-journey-migration.sql"), "utf8");
+const capabilitiesSql = readFileSync(
+  root("supabase/custody-pending-queue-capabilities-migration.sql"),
+  "utf8",
+);
 const schema = readFileSync(root("supabase/schema.sql"), "utf8");
 const doctor = readFileSync(root("worker/src/doctor.ts"), "utf8");
 
@@ -155,11 +159,52 @@ test("Doctor requires only custody RPCs that are reproducible from checked-in SQ
   assert.ok(requiredRpcNames.length > 0, "Doctor must probe the custody RPC contract");
   for (const rpcName of requiredRpcNames) {
     assert.match(
-      `${custodySql}\n${sql}`,
+      `${custodySql}\n${sql}\n${capabilitiesSql}`,
       new RegExp(`create\\s+or\\s+replace\\s+function\\s+public\\.${rpcName}\\s*\\(`, "i"),
       `Doctor requires ${rpcName}, but no checked-in custody migration defines it`,
     );
   }
+});
+
+test("Doctor uses a constant-time service-only Custody capability proof", () => {
+  assert.match(
+    capabilitiesSql,
+    /create or replace function public\.custody_pending_queue_capabilities\(p_user_id uuid\)/i,
+  );
+  assert.match(capabilitiesSql, /set search_path = pg_catalog, public, pg_temp/i);
+  assert.match(capabilitiesSql, /coalesce\(auth\.role\(\), ''\) <> 'service_role'/i);
+  for (const index of [
+    "custody_pending_events_due_v2_idx",
+    "custody_pending_events_wake_v2_idx",
+    "custody_pending_events_expiry_v2_idx",
+  ]) {
+    assert.match(capabilitiesSql, new RegExp(`to_regclass\\('public\\.${index}'\\)`, "i"));
+  }
+  assert.doesNotMatch(capabilitiesSql, /from\s+public\.custody_pending_events/i);
+  assert.match(
+    capabilitiesSql,
+    /revoke all on function public\.custody_pending_queue_capabilities\(uuid\)[\s\S]*from public, anon, authenticated/i,
+  );
+  assert.match(
+    capabilitiesSql,
+    /grant execute on function public\.custody_pending_queue_capabilities\(uuid\)[\s\S]*to service_role/i,
+  );
+
+  const custodyCheck = doctor.slice(
+    doctor.indexOf("async function checkCustodyJourneySchema"),
+    doctor.indexOf("async function checkRevivalTrackerSchema"),
+  );
+  assert.match(custodyCheck, /db\.rpc\(\s*"custody_pending_queue_capabilities"/i);
+  assert.doesNotMatch(custodyCheck, /db\.rpc\(\s*"custody_pending_queue_health"/i);
+});
+
+test("canonical schema contains the exact Custody capability migration", () => {
+  const startMarker = "-- CUSTODY_PENDING_QUEUE_CAPABILITIES_CANONICAL_MIRROR_BEGIN\n";
+  const endMarker = "-- CUSTODY_PENDING_QUEUE_CAPABILITIES_CANONICAL_MIRROR_END";
+  const start = schema.indexOf(startMarker);
+  const end = schema.indexOf(endMarker, start + startMarker.length);
+  assert.ok(start >= 0 && end > start, "Custody capability schema markers are missing");
+  assert.equal(schema.slice(start + startMarker.length, end), capabilitiesSql);
 });
 
 test("canonical schema contains the exact custody backlog v2 migration", () => {
