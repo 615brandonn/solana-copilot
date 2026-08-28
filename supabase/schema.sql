@@ -13344,7 +13344,8 @@ begin
      or v_epoch.lease_generation <> p_expected_lease_generation then
     return jsonb_build_object('ok', false, 'reason', 'epoch_state_changed');
   end if;
-  if v_epoch.lease_expires_at is null
+  if v_epoch.lease_owner is null or v_epoch.lease_token is null
+     or v_epoch.lease_expires_at is null
      or v_epoch.lease_expires_at > clock_timestamp() then
     return jsonb_build_object('ok', false, 'reason', 'observer_lease_still_live');
   end if;
@@ -13373,6 +13374,7 @@ begin
      or v_heartbeat.lease_generation <> p_expected_lease_generation
      or v_heartbeat.lease_token is distinct from v_epoch.lease_token
      or v_heartbeat.worker_id is distinct from v_epoch.lease_owner
+     or v_heartbeat.lease_expires_at is null
      or v_heartbeat.lease_expires_at > clock_timestamp()
      or v_heartbeat.last_success_at is not null
      or v_heartbeat.root_required_count <> 3
@@ -13504,15 +13506,32 @@ begin
     and m.status = 'active' and m.poisoned
     and m.poison_reason = 'supply_payload_conflict';
   if v_poisoned_mint_count = 0
-     or not exists (
+     or exists (
+       select 1
+       from public.custody_fresh_tail_mints m
+       where m.epoch_id = p_epoch_id and m.user_id = p_user_id
+         and m.poisoned and (
+           m.status <> 'active'
+           or m.poison_reason <> 'supply_payload_conflict'
+           or not exists (
+             select 1 from public.custody_fresh_tail_supply_events e
+             where e.epoch_id = m.epoch_id and e.token_mint = m.token_mint
+               and e.quarantined and e.conflict_count > 0
+               and e.first_conflict_at is not null
+           )
+         )
+     )
+     or exists (
        select 1
        from public.custody_fresh_tail_supply_events e
-       join public.custody_fresh_tail_mints m
+       left join public.custody_fresh_tail_mints m
          on m.epoch_id = e.epoch_id and m.token_mint = e.token_mint
        where e.epoch_id = p_epoch_id and e.user_id = p_user_id
-         and e.quarantined and e.conflict_count > 0
-         and e.first_conflict_at is not null
-         and m.poisoned and m.poison_reason = 'supply_payload_conflict'
+         and e.quarantined and (
+           e.conflict_count <= 0 or e.first_conflict_at is null
+           or m.token_mint is null or not m.poisoned
+           or m.poison_reason <> 'supply_payload_conflict'
+         )
      ) then
     return jsonb_build_object('ok', false, 'reason', 'valuation_replay_conflict_not_proven');
   end if;
