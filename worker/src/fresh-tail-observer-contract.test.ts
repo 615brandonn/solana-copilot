@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import type { ConfirmedSignatureInfo, ParsedTransactionWithMeta } from "@solana/web3.js";
 import {
+  FreshTailObserver,
+  freshTailDiscoveryExpired,
+  freshTailRejectionFingerprint,
   freshTailTradeMarketCapUsd,
   freshTailTransactionLookupKeys,
+  mapWithConcurrency,
 } from "./fresh-tail-observer.js";
 
 const indexSource = readFileSync(new URL("../src/fresh-tail-index.ts", import.meta.url), "utf8");
@@ -93,6 +98,139 @@ test("market-cap evidence rejects stale prices and uses the exact reserve ratio"
     ),
     null,
   );
+});
+
+test("expired first discoveries become stable tombstones before creation proof RPC", () => {
+  const trigger = 1_000_000;
+  assert.equal(freshTailDiscoveryExpired(trigger, trigger + 50_999), false);
+  assert.equal(freshTailDiscoveryExpired(trigger, trigger + 51_000), true);
+  assert.equal(freshTailDiscoveryExpired(trigger, trigger - 10_000), false);
+
+  const identity = {
+    mint: "So11111111111111111111111111111111111111112",
+    signature: "root-buy-signature",
+    slot: 123,
+    code: "trigger_expired_before_enrollment",
+  };
+  assert.equal(freshTailRejectionFingerprint(identity), freshTailRejectionFingerprint(identity));
+  assert.notEqual(
+    freshTailRejectionFingerprint(identity),
+    freshTailRejectionFingerprint({ ...identity, code: "created_before_epoch" }),
+  );
+
+  const enrollment = observerSource.slice(
+    observerSource.indexOf("private async enrollDiscovery"),
+    observerSource.indexOf("private async valuationFor"),
+  );
+  assert.ok(
+    enrollment.indexOf("freshTailDiscoveryExpired") <
+      enrollment.indexOf("attestFreshPumpFunCreate"),
+  );
+  assert.match(enrollment, /trigger_expired_before_enrollment/);
+  const rejection = observerSource.slice(
+    observerSource.indexOf("private async rejectDiscovery"),
+    observerSource.indexOf("private async enrollDiscovery"),
+  );
+  assert.doesNotMatch(rejection, /headSlot|headBlockhash|detail/);
+});
+
+test("expired enrollment rejects durably without invoking creation-proof RPC", async () => {
+  const nowMs = 1_000_000;
+  const root = "11111111111111111111111111111111";
+  const mint = "So11111111111111111111111111111111111111112";
+  const rejections: Record<string, unknown>[] = [];
+  const observer = new FreshTailObserver({
+    rpc: new Proxy(
+      {},
+      {
+        get() {
+          throw new Error("creation-proof RPC must not run for an expired trigger");
+        },
+      },
+    ) as never,
+    store: {
+      rejectMint: async (_epochId: string, _lease: unknown, input: Record<string, unknown>) => {
+        rejections.push(input);
+        return { ok: true, reason: "rejected" };
+      },
+    } as never,
+    workerId: "expiry-test",
+    nowMs: () => nowMs,
+    getSolPriceUsd: async () => ({ usd: 100, observedAtMs: nowMs }),
+  });
+  Object.assign(observer as unknown as Record<string, unknown>, {
+    epoch: {
+      epochId: "00000000-0000-4000-8000-000000000001",
+      activationSlot: 1,
+      activationBlockhash: "activation",
+    },
+    lease: {
+      epochId: "00000000-0000-4000-8000-000000000001",
+      leaseToken: "00000000-0000-4000-8000-000000000002",
+      leaseGeneration: 1,
+      leaseExpiresAt: new Date(nowMs + 60_000).toISOString(),
+    },
+  });
+  const enroll = (
+    observer as unknown as {
+      enrollDiscovery(...args: unknown[]): Promise<unknown>;
+    }
+  ).enrollDiscovery.bind(observer);
+  const row = {
+    signature: "expired-root-buy",
+    slot: 10,
+    blockTime: (nowMs - 51_000) / 1_000,
+    confirmationStatus: "finalized",
+    err: null,
+    memo: null,
+  } as ConfirmedSignatureInfo;
+  const result = await enroll(
+    { blockTime: row.blockTime } as ParsedTransactionWithMeta,
+    row,
+    root,
+    { mint },
+    {
+      supplyEvents: [
+        {
+          side: "BUY",
+          targetWallet: root,
+          tokenMint: mint,
+          blockTimeMs: nowMs - 51_000,
+        },
+      ],
+      rootBuyEvidence: {},
+    },
+    { slot: 20, blockhash: "head", blockTimeMs: nowMs, sampledAtMs: nowMs },
+    nowMs + 45_000,
+  );
+  assert.equal(result, null);
+  assert.equal(rejections[0]?.rejectionCode, "trigger_expired_before_enrollment");
+});
+
+test("bounded root reads settle in-flight work before propagating the first failure", async () => {
+  const failure = new Error("read failed");
+  const started: number[] = [];
+  let releaseFirst!: () => void;
+  const firstFinished = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let returned = false;
+  const mapped = mapWithConcurrency([1, 2, 3], 2, async (value) => {
+    started.push(value);
+    if (value === 1) await firstFinished;
+    if (value === 2) throw failure;
+    return value;
+  }).finally(() => {
+    returned = true;
+  });
+
+  for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+  assert.deepEqual(started, [1, 2], "failure must stop dispatching queued RPC work");
+  assert.equal(returned, false, "helper returned while another RPC worker was still in flight");
+
+  releaseFirst();
+  await assert.rejects(mapped, (error: unknown) => error === failure);
+  assert.equal(returned, true);
 });
 
 test("root decoding indexes contracts by transaction mint/account evidence", () => {
