@@ -163,6 +163,8 @@ create table if not exists public.custody_fresh_tail_mint_rejections (
   )),
   parser_abi_fingerprint text not null,
   proof_fingerprint text not null check (char_length(proof_fingerprint) = 64),
+  evidence_fingerprint text not null
+    check (evidence_fingerprint ~ '^[0-9a-f]{64}$'),
   finalized_head_slot bigint not null check (finalized_head_slot >= source_slot),
   finalized_head_blockhash text not null,
   quarantined boolean not null default false,
@@ -200,6 +202,8 @@ create table if not exists public.custody_fresh_tail_supply_events (
   user_id uuid not null,
   event_key text not null check (char_length(btrim(event_key)) > 0),
   payload_fingerprint text not null check (char_length(payload_fingerprint) = 64),
+  evidence_fingerprint text not null
+    check (evidence_fingerprint ~ '^[0-9a-f]{64}$'),
   tx_sig text not null check (char_length(btrim(tx_sig)) > 0),
   slot bigint not null check (slot >= 0),
   block_time timestamptz not null,
@@ -231,6 +235,92 @@ create table if not exists public.custody_fresh_tail_supply_events (
 create index if not exists custody_fresh_tail_supply_window_idx
   on public.custody_fresh_tail_supply_events
     (epoch_id, token_mint, block_time, slot, target_wallet);
+
+-- Upgrade rows written by the first fresh-tail release without changing their
+-- original payload fingerprints or valuation observations.  These table locks
+-- make the backfill and function replacement one atomic replay-contract change.
+lock table public.custody_fresh_tail_mint_rejections in share row exclusive mode;
+lock table public.custody_fresh_tail_supply_events in share row exclusive mode;
+
+alter table public.custody_fresh_tail_mint_rejections
+  add column if not exists evidence_fingerprint text;
+alter table public.custody_fresh_tail_supply_events
+  add column if not exists evidence_fingerprint text;
+
+do $$
+begin
+  if exists (
+    select 1
+    from public.custody_fresh_tail_supply_events e
+    where e.payload_fingerprint <> encode(extensions.digest(jsonb_build_object(
+      'eventKey', e.event_key, 'txSig', e.tx_sig, 'slot', e.slot,
+      'blockTime', e.block_time, 'targetWallet', e.target_wallet,
+      'tokenMint', e.token_mint, 'side', e.side,
+      'amountRaw', e.amount_raw::text, 'totalSupplyRaw', e.total_supply_raw::text,
+      'decimals', e.decimals, 'marketCapUsd', e.market_cap_usd::text,
+      'valuationSlot', e.valuation_slot, 'marketDataReliable', e.market_data_reliable,
+      'pumpFunVerified', e.pump_fun_verified,
+      'classificationReliable', e.classification_reliable,
+      'parserDomain', e.parser_domain,
+      'parserAbiFingerprint', e.parser_abi_fingerprint
+    )::text, 'sha256'), 'hex')
+  ) then
+    raise exception using
+      errcode = '55000',
+      message = 'fresh-tail supply payload audit failed before replay-identity upgrade';
+  end if;
+end $$;
+
+update public.custody_fresh_tail_mint_rejections r set
+  evidence_fingerprint = encode(extensions.digest(jsonb_build_object(
+    'tokenMint', btrim(r.token_mint),
+    'sourceTxSig', btrim(r.source_tx_sig),
+    'sourceSlot', r.source_slot,
+    'rejectionCode', r.rejection_code,
+    'parserAbiFingerprint', btrim(r.parser_abi_fingerprint)
+  )::text, 'sha256'), 'hex')
+where r.evidence_fingerprint is null;
+
+update public.custody_fresh_tail_supply_events e set
+  evidence_fingerprint = encode(extensions.digest(jsonb_build_object(
+    'eventKey', btrim(e.event_key), 'txSig', btrim(e.tx_sig), 'slot', e.slot,
+    'blockTime', e.block_time, 'targetWallet', btrim(e.target_wallet),
+    'tokenMint', btrim(e.token_mint), 'side', lower(btrim(e.side)),
+    'amountRaw', e.amount_raw::text, 'totalSupplyRaw', e.total_supply_raw::text,
+    'decimals', e.decimals,
+    'pumpFunVerified', e.pump_fun_verified,
+    'classificationReliable', e.classification_reliable,
+    'parserDomain', lower(btrim(e.parser_domain)),
+    'parserAbiFingerprint', btrim(e.parser_abi_fingerprint)
+  )::text, 'sha256'), 'hex')
+where e.evidence_fingerprint is null;
+
+alter table public.custody_fresh_tail_mint_rejections
+  alter column evidence_fingerprint set not null;
+alter table public.custody_fresh_tail_supply_events
+  alter column evidence_fingerprint set not null;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.custody_fresh_tail_mint_rejections'::regclass
+      and conname = 'custody_fresh_tail_mint_rejections_evidence_fingerprint_check'
+  ) then
+    alter table public.custody_fresh_tail_mint_rejections
+      add constraint custody_fresh_tail_mint_rejections_evidence_fingerprint_check
+      check (evidence_fingerprint ~ '^[0-9a-f]{64}$');
+  end if;
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.custody_fresh_tail_supply_events'::regclass
+      and conname = 'custody_fresh_tail_supply_events_evidence_fingerprint_check'
+  ) then
+    alter table public.custody_fresh_tail_supply_events
+      add constraint custody_fresh_tail_supply_events_evidence_fingerprint_check
+      check (evidence_fingerprint ~ '^[0-9a-f]{64}$');
+  end if;
+end $$;
 
 -- A transfer is one conserving, canonical recipient batch.  Partial recipient
 -- writes are impossible: the whole JSON batch and its fingerprint are stored
@@ -1010,11 +1100,13 @@ as $$
 declare
   v_epoch public.custody_fresh_tail_epochs%rowtype;
   v_existing public.custody_fresh_tail_mint_rejections%rowtype;
+  v_existing_mint public.custody_fresh_tail_mints%rowtype;
   v_mint text := btrim(coalesce(p_token_mint, ''));
   v_sig text := btrim(coalesce(p_source_tx_sig, ''));
   v_abi text := btrim(coalesce(p_parser_abi_fingerprint, ''));
   v_hash text := btrim(coalesce(p_finalized_head_blockhash, ''));
   v_fingerprint text := lower(btrim(coalesce(p_proof_fingerprint, '')));
+  v_evidence_fingerprint text;
 begin
   v_epoch := public.assert_custody_fresh_tail_lease(
     p_user_id, p_epoch_id, p_lease_token, p_lease_generation
@@ -1040,11 +1132,25 @@ begin
     return jsonb_build_object('ok', false, 'reason', 'finalized_head_not_attested');
   end if;
 
+  -- The caller fingerprint is retained as write-once audit evidence.  Replay
+  -- identity is derived server-side from immutable finalized evidence so an
+  -- older caller that included head/detail fields cannot poison a tombstone.
+  v_evidence_fingerprint := encode(extensions.digest(jsonb_build_object(
+    'tokenMint', v_mint, 'sourceTxSig', v_sig, 'sourceSlot', p_source_slot,
+    'rejectionCode', p_rejection_code, 'parserAbiFingerprint', v_abi
+  )::text, 'sha256'), 'hex');
+
   perform pg_advisory_xact_lock(hashtext(p_user_id::text), hashtext(v_mint));
-  if exists (
-    select 1 from public.custody_fresh_tail_mints
-    where epoch_id = p_epoch_id and token_mint = v_mint
-  ) then
+  select * into v_existing_mint
+  from public.custody_fresh_tail_mints
+  where epoch_id = p_epoch_id and token_mint = v_mint
+  for update;
+  if found and v_existing_mint.status = 'retired' then
+    return jsonb_build_object(
+      'ok', true, 'reason', 'mint_retired', 'epochId', p_epoch_id,
+      'tokenMint', v_mint, 'retireReason', v_existing_mint.retire_reason
+    );
+  elsif found then
     update public.custody_fresh_tail_mints set
       poisoned = true,
       poison_reason = 'conflicting_mint_rejection',
@@ -1058,11 +1164,7 @@ begin
   where epoch_id = p_epoch_id and token_mint = v_mint
   for update;
   if found then
-    if v_existing.source_tx_sig = v_sig
-       and v_existing.source_slot = p_source_slot
-       and v_existing.rejection_code = p_rejection_code
-       and v_existing.parser_abi_fingerprint = v_abi
-       and v_existing.proof_fingerprint = v_fingerprint then
+    if v_existing.evidence_fingerprint = v_evidence_fingerprint then
       return jsonb_build_object(
         'ok', true, 'reason', 'already_rejected', 'epochId', p_epoch_id,
         'tokenMint', v_mint, 'rejectionCode', v_existing.rejection_code,
@@ -1081,10 +1183,11 @@ begin
   insert into public.custody_fresh_tail_mint_rejections (
     epoch_id, user_id, token_mint, source_tx_sig, source_slot,
     rejection_code, parser_abi_fingerprint, proof_fingerprint,
+    evidence_fingerprint,
     finalized_head_slot, finalized_head_blockhash
   ) values (
     p_epoch_id, p_user_id, v_mint, v_sig, p_source_slot,
-    p_rejection_code, v_abi, v_fingerprint,
+    p_rejection_code, v_abi, v_fingerprint, v_evidence_fingerprint,
     p_finalized_head_slot, v_hash
   );
   return jsonb_build_object(
@@ -1473,6 +1576,257 @@ begin
     'leaseGeneration', v_epoch.lease_generation,
     'leaseExpiresAt', v_epoch.lease_expires_at,
     'status', v_epoch.status
+  );
+end;
+$$;
+
+create or replace function public.invalidate_failed_custody_fresh_tail_shadow_epoch(
+  p_user_id uuid,
+  p_epoch_id uuid,
+  p_expected_lease_generation bigint,
+  p_expected_latest_head_slot bigint,
+  p_expected_latest_head_blockhash text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public, pg_temp
+as $$
+declare
+  v_config public.bot_config%rowtype;
+  v_epoch public.custody_fresh_tail_epochs%rowtype;
+  v_heartbeat public.custody_fresh_tail_worker_heartbeat%rowtype;
+  v_expected_hash text := btrim(coalesce(p_expected_latest_head_blockhash, ''));
+  v_root_count integer;
+  v_root_cursor_count integer;
+  v_clean_root_cursor_count integer;
+  v_poisoned_mint_count integer;
+begin
+  if coalesce(auth.role(), '') <> 'service_role' then
+    raise exception using errcode = '42501', message = 'service_role is required';
+  end if;
+  if p_user_id is null or p_epoch_id is null
+     or p_expected_lease_generation is null or p_expected_lease_generation <= 0
+     or p_expected_latest_head_slot is null or p_expected_latest_head_slot < 0
+     or v_expected_hash = '' then
+    return jsonb_build_object('ok', false, 'reason', 'invalid_shadow_invalidation');
+  end if;
+
+  -- Serialize against activation, and hold the epoch row so a stopped worker
+  -- cannot reacquire its expired lease while the evidence is being checked.
+  perform pg_advisory_xact_lock(
+    hashtext(p_user_id::text), hashtext('fresh-tail-epoch')
+  );
+  select * into v_epoch
+  from public.custody_fresh_tail_epochs
+  where id = p_epoch_id and user_id = p_user_id
+  for update;
+  if not found then
+    return jsonb_build_object('ok', false, 'reason', 'epoch_not_found');
+  end if;
+  if v_epoch.status = 'invalidated'
+     and v_epoch.invalid_reason = 'failed_shadow_epoch_no_root_progress' then
+    return jsonb_build_object(
+      'ok', true, 'reason', 'already_invalidated', 'epochId', v_epoch.id,
+      'invalidReason', v_epoch.invalid_reason
+    );
+  end if;
+  if v_epoch.status <> 'active'
+     or v_epoch.lease_generation <> p_expected_lease_generation then
+    return jsonb_build_object('ok', false, 'reason', 'epoch_state_changed');
+  end if;
+  if v_epoch.lease_expires_at is null
+     or v_epoch.lease_expires_at > clock_timestamp() then
+    return jsonb_build_object('ok', false, 'reason', 'observer_lease_still_live');
+  end if;
+
+  select * into v_config
+  from public.bot_config
+  where user_id = p_user_id
+  for update;
+  if not found
+     or v_config.enabled is not false
+     or v_config.supply_accumulation_mode_enabled is not true
+     or v_config.custody_journey_enabled is not true
+     or v_config.coordinated_mode_enabled is not false
+     or v_config.conviction_mode_enabled is not false
+     or v_config.direct_target_sell_exit_mode = 'proportional' then
+    return jsonb_build_object('ok', false, 'reason', 'shadow_recovery_config_changed');
+  end if;
+
+  select * into v_heartbeat
+  from public.custody_fresh_tail_worker_heartbeat
+  where user_id = p_user_id and epoch_id = p_epoch_id
+  for update;
+  if not found
+     or v_heartbeat.enabled is not true
+     or v_heartbeat.shadow is not true
+     or v_heartbeat.lease_generation <> p_expected_lease_generation
+     or v_heartbeat.lease_token is distinct from v_epoch.lease_token
+     or v_heartbeat.worker_id is distinct from v_epoch.lease_owner
+     or v_heartbeat.lease_expires_at > clock_timestamp()
+     or v_heartbeat.last_success_at is not null
+     or v_heartbeat.root_required_count <> 3
+     or v_heartbeat.root_covered_count <> 0
+     or v_heartbeat.root_backlog_count <> 3
+     or v_heartbeat.latest_head_slot <> p_expected_latest_head_slot
+     or v_heartbeat.latest_head_blockhash <> v_expected_hash
+     or coalesce(v_heartbeat.last_error, '') not like
+       'fresh Pump creation proof exhausted its absolute wall-clock budget before finalized creation transaction load%' then
+    return jsonb_build_object('ok', false, 'reason', 'failed_shadow_heartbeat_mismatch');
+  end if;
+  if not exists (
+    select 1 from public.custody_fresh_tail_finalized_heads h
+    where h.epoch_id = p_epoch_id and h.user_id = p_user_id
+      and h.slot = p_expected_latest_head_slot
+      and h.blockhash = v_expected_hash
+      and h.block_time = v_heartbeat.latest_head_block_time
+  ) then
+    return jsonb_build_object('ok', false, 'reason', 'failed_shadow_head_not_attested');
+  end if;
+
+  select count(*)::integer into v_root_count
+  from public.custody_fresh_tail_roots r
+  where r.epoch_id = p_epoch_id and r.user_id = p_user_id;
+  select
+    count(*)::integer,
+    count(*) filter (
+      where c.scope_mint = '*'
+        and c.cursor_role = 'root'
+        and c.floor_slot = v_epoch.activation_slot
+        and c.initial_boundary_kind = 'exclusive_slot'
+        and c.current_boundary_kind = 'exclusive_slot'
+        and c.last_processed_signature is null
+        and c.last_processed_slot is null
+        and c.last_block_time is null
+        and c.first_available_block is null
+        and c.history_floor_proven is false
+        and c.covered_through_slot is null
+        and c.covered_through_blockhash is null
+        and c.coverage_revision = 0
+        and c.last_success_at is null
+    )::integer
+  into v_root_cursor_count, v_clean_root_cursor_count
+  from public.custody_fresh_tail_cursors c
+  where c.epoch_id = p_epoch_id and c.scope_mint = '*'
+    and c.cursor_role = 'root';
+  if v_root_count <> 3 or v_root_cursor_count <> 3
+     or v_clean_root_cursor_count <> 3
+     or exists (
+       select 1
+       from public.custody_fresh_tail_roots r
+       left join public.custody_fresh_tail_cursors c
+         on c.epoch_id = r.epoch_id and c.scope_mint = '*' and c.wallet = r.wallet
+       where r.epoch_id = p_epoch_id and (
+         c.wallet is null or c.user_id <> r.user_id or c.floor_slot <> r.floor_slot
+       )
+     )
+     or exists (
+       select 1 from public.custody_fresh_tail_cursors c
+       where c.epoch_id = p_epoch_id and (
+         c.last_processed_signature is not null
+         or c.last_processed_slot is not null
+         or c.last_block_time is not null
+         or c.first_available_block is not null
+         or c.history_floor_proven
+         or c.covered_through_slot is not null
+         or c.covered_through_blockhash is not null
+         or c.last_success_at is not null
+       )
+     )
+     or exists (
+       select 1 from public.custody_fresh_tail_backscan_ranges r
+       where r.epoch_id = p_epoch_id and (
+         r.last_processed_signature is not null
+         or r.last_processed_slot is not null
+         or r.last_block_time is not null
+         or r.first_available_block is not null
+         or r.history_floor_proven
+         or r.covered_through_slot is not null
+         or r.covered_through_blockhash is not null
+         or r.last_success_at is not null
+         or r.completed_at is not null
+       )
+     )
+     or exists (
+       select 1 from public.custody_fresh_tail_coverage_attestations a
+       where a.epoch_id = p_epoch_id
+     ) then
+    return jsonb_build_object('ok', false, 'reason', 'cursor_progress_detected');
+  end if;
+
+  if exists (
+    select 1 from public.custody_fresh_tail_requests q
+    where q.epoch_id = p_epoch_id
+  ) or exists (
+    select 1 from public.entry_signal_claims c
+    where c.user_id = p_user_id and c.fresh_tail_epoch_id = p_epoch_id
+  ) then
+    return jsonb_build_object('ok', false, 'reason', 'fresh_entry_work_exists');
+  end if;
+  if exists (
+    select 1
+    from public.positions p
+    where p.user_id = p_user_id
+      and exists (
+        select 1 from public.custody_fresh_tail_mints m
+        where m.epoch_id = p_epoch_id and m.user_id = p_user_id
+          and m.token_mint = p.token_mint
+      )
+  ) then
+    return jsonb_build_object('ok', false, 'reason', 'position_exists_for_enrolled_mint');
+  end if;
+  if exists (
+    select 1 from public.custody_fresh_tail_exit_intents i
+    where i.user_id = p_user_id and i.epoch_id = p_epoch_id
+  ) then
+    return jsonb_build_object('ok', false, 'reason', 'fresh_exit_work_exists');
+  end if;
+  if exists (
+    select 1 from public.custody_fresh_tail_mint_rejections r
+    where r.epoch_id = p_epoch_id and r.quarantined
+  ) then
+    return jsonb_build_object('ok', false, 'reason', 'rejection_conflict_present');
+  end if;
+
+  select count(*)::integer into v_poisoned_mint_count
+  from public.custody_fresh_tail_mints m
+  where m.epoch_id = p_epoch_id and m.user_id = p_user_id
+    and m.status = 'active' and m.poisoned
+    and m.poison_reason = 'supply_payload_conflict';
+  if v_poisoned_mint_count = 0
+     or not exists (
+       select 1
+       from public.custody_fresh_tail_supply_events e
+       join public.custody_fresh_tail_mints m
+         on m.epoch_id = e.epoch_id and m.token_mint = e.token_mint
+       where e.epoch_id = p_epoch_id and e.user_id = p_user_id
+         and e.quarantined and e.conflict_count > 0
+         and e.first_conflict_at is not null
+         and m.poisoned and m.poison_reason = 'supply_payload_conflict'
+     ) then
+    return jsonb_build_object('ok', false, 'reason', 'valuation_replay_conflict_not_proven');
+  end if;
+
+  update public.custody_fresh_tail_epochs set
+    status = 'invalidated',
+    invalid_reason = 'failed_shadow_epoch_no_root_progress',
+    updated_at = clock_timestamp()
+  where id = p_epoch_id and user_id = p_user_id
+    and status = 'active'
+    and lease_generation = p_expected_lease_generation;
+  if not found then
+    raise exception using
+      errcode = '40001',
+      message = 'fresh-tail epoch changed during failed-shadow invalidation';
+  end if;
+
+  return jsonb_build_object(
+    'ok', true, 'reason', 'invalidated', 'epochId', p_epoch_id,
+    'invalidReason', 'failed_shadow_epoch_no_root_progress',
+    'preservedPoisonedMintCount', v_poisoned_mint_count,
+    'latestHeadSlot', p_expected_latest_head_slot,
+    'leaseGeneration', p_expected_lease_generation
   );
 end;
 $$;
@@ -2199,6 +2553,7 @@ declare
   v_abi text := btrim(coalesce(p_parser_abi_fingerprint, ''));
   v_head_hash text := btrim(coalesce(p_finalized_head_blockhash, ''));
   v_fingerprint text;
+  v_evidence_fingerprint text;
 begin
   v_epoch := public.assert_custody_fresh_tail_lease(
     p_user_id, p_epoch_id, p_lease_token, p_lease_generation
@@ -2278,12 +2633,32 @@ begin
     return jsonb_build_object('ok', false, 'reason', 'enrollment_event_mismatch');
   end if;
 
+  -- Preserve the complete first observation (including its external SOL/USD
+  -- valuation) as write-once audit data.
   v_fingerprint := encode(extensions.digest(jsonb_build_object(
     'eventKey', v_event_key, 'txSig', v_sig, 'slot', p_slot,
     'blockTime', p_block_time, 'targetWallet', v_target,
     'tokenMint', v_token_mint, 'side', v_side,
     'amountRaw', p_amount_raw::text, 'totalSupplyRaw', p_total_supply_raw::text,
-    'decimals', p_decimals, 'pumpFunVerified', p_pump_fun_verified,
+    'decimals', p_decimals, 'marketCapUsd', p_market_cap_usd::text,
+    'valuationSlot', p_valuation_slot, 'marketDataReliable', p_market_data_reliable,
+    'pumpFunVerified', p_pump_fun_verified,
+    'classificationReliable', p_classification_reliable,
+    'parserDomain', v_parser_domain,
+    'parserAbiFingerprint', v_abi
+  )::text, 'sha256'), 'hex');
+
+  -- Conflict identity must be replay-stable.  The reserve-derived market cap
+  -- uses a short-lived external SOL/USD quote, so it cannot participate in an
+  -- immutable on-chain evidence hash.  Duplicate writes preserve the first
+  -- valuation and compare only finalized transaction evidence.
+  v_evidence_fingerprint := encode(extensions.digest(jsonb_build_object(
+    'eventKey', v_event_key, 'txSig', v_sig, 'slot', p_slot,
+    'blockTime', p_block_time, 'targetWallet', v_target,
+    'tokenMint', v_token_mint, 'side', v_side,
+    'amountRaw', p_amount_raw::text, 'totalSupplyRaw', p_total_supply_raw::text,
+    'decimals', p_decimals,
+    'pumpFunVerified', p_pump_fun_verified,
     'classificationReliable', p_classification_reliable,
     'parserDomain', v_parser_domain,
     'parserAbiFingerprint', v_abi
@@ -2294,22 +2669,7 @@ begin
   where epoch_id = p_epoch_id and event_key = v_event_key
   for update;
   if found then
-    -- SOL/USD is an off-chain observation and can legitimately differ when an
-    -- uncheckpointed finalized event is replayed. Compare only canonical event
-    -- identity here; retain the first accepted valuation for audit stability.
-    if v_existing.tx_sig <> v_sig
-       or v_existing.slot <> p_slot
-       or v_existing.block_time <> p_block_time
-       or v_existing.target_wallet <> v_target
-       or v_existing.token_mint <> v_token_mint
-       or v_existing.side <> v_side
-       or v_existing.amount_raw <> p_amount_raw
-       or v_existing.total_supply_raw <> p_total_supply_raw
-       or v_existing.decimals <> p_decimals
-       or v_existing.pump_fun_verified is distinct from p_pump_fun_verified
-       or v_existing.classification_reliable is distinct from p_classification_reliable
-       or v_existing.parser_domain <> v_parser_domain
-       or v_existing.parser_abi_fingerprint <> v_abi
+    if v_existing.evidence_fingerprint <> v_evidence_fingerprint
        or (v_existing.finalized_head_slot = p_finalized_head_slot
          and v_existing.finalized_head_blockhash <> v_head_hash) then
       update public.custody_fresh_tail_supply_events set
@@ -2367,14 +2727,14 @@ begin
   end if;
 
   insert into public.custody_fresh_tail_supply_events (
-    epoch_id, user_id, event_key, payload_fingerprint, tx_sig, slot,
+    epoch_id, user_id, event_key, payload_fingerprint, evidence_fingerprint, tx_sig, slot,
     block_time, target_wallet, token_mint, side, amount_raw,
     total_supply_raw, decimals, market_cap_usd, valuation_slot,
     market_data_reliable, pump_fun_verified, classification_reliable,
     parser_domain, parser_abi_fingerprint,
     finalized_head_slot, finalized_head_blockhash
   ) values (
-    p_epoch_id, p_user_id, v_event_key, v_fingerprint, v_sig, p_slot,
+    p_epoch_id, p_user_id, v_event_key, v_fingerprint, v_evidence_fingerprint, v_sig, p_slot,
     p_block_time, v_target, v_token_mint, v_side, p_amount_raw,
     p_total_supply_raw, p_decimals, p_market_cap_usd, p_valuation_slot,
     p_market_data_reliable, p_pump_fun_verified, p_classification_reliable,
@@ -5278,6 +5638,7 @@ begin
         'is_custody_fresh_tail_parser_reviewed',
         'activate_custody_fresh_tail_epoch',
         'get_custody_fresh_tail_active_epoch',
+        'invalidate_failed_custody_fresh_tail_shadow_epoch',
         'acquire_custody_fresh_tail_lease',
         'record_custody_fresh_tail_heartbeat',
         'get_custody_fresh_tail_work',
@@ -5343,6 +5704,7 @@ begin
     'is_custody_fresh_tail_parser_reviewed',
     'activate_custody_fresh_tail_epoch',
     'get_custody_fresh_tail_active_epoch',
+    'invalidate_failed_custody_fresh_tail_shadow_epoch',
     'acquire_custody_fresh_tail_lease',
     'record_custody_fresh_tail_heartbeat',
     'get_custody_fresh_tail_work',

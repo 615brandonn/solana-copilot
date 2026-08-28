@@ -8,6 +8,10 @@ const migration = readFileSync(
   root("supabase/supply-accumulation-fresh-tail-migration.sql"),
   "utf8",
 );
+const replayHotfix = readFileSync(
+  root("supabase/supply-accumulation-fresh-tail-replay-hotfix-migration.sql"),
+  "utf8",
+);
 const schema = readFileSync(root("supabase/schema.sql"), "utf8");
 const doctor = readFileSync(root("worker/src/doctor.ts"), "utf8");
 const types = readFileSync(root("src/lib/supabase-types.ts"), "utf8");
@@ -35,6 +39,7 @@ const rpcs = [
   "is_custody_fresh_tail_parser_reviewed",
   "activate_custody_fresh_tail_epoch",
   "get_custody_fresh_tail_active_epoch",
+  "invalidate_failed_custody_fresh_tail_shadow_epoch",
   "acquire_custody_fresh_tail_lease",
   "record_custody_fresh_tail_heartbeat",
   "attest_custody_fresh_tail_finalized_head",
@@ -241,13 +246,12 @@ test("supply replay treats live SOL\/USD valuation as metadata, not canonical id
     migration.indexOf("create or replace function public.record_custody_fresh_tail_custody_event("),
   );
   const fingerprint = supply.slice(
-    supply.indexOf("v_fingerprint :="),
+    supply.indexOf("v_evidence_fingerprint :="),
     supply.indexOf("select * into v_existing"),
   );
   assert.doesNotMatch(fingerprint, /marketCapUsd|valuationSlot|marketDataReliable/);
-  assert.match(supply, /retain the first accepted valuation for audit stability/i);
-  assert.match(supply, /v_existing\.amount_raw <> p_amount_raw/i);
-  assert.match(supply, /v_existing\.parser_abi_fingerprint <> v_abi/i);
+  assert.match(supply, /preserve the complete first observation/i);
+  assert.match(supply, /v_existing\.evidence_fingerprint <> v_evidence_fingerprint/i);
   assert.doesNotMatch(supply, /v_existing\.payload_fingerprint <> v_fingerprint/i);
 });
 
@@ -263,6 +267,103 @@ test("fresh supply authorization never depends on legacy aggregate rows", () => 
   assert.match(migration, /p_parser_domain text/i);
   assert.match(migration, /b8b6dbdcce44a2b61c55ba2fd74cd385fae489a95be291504eb8e7b15f88262d/i);
   assert.match(migration, /'parser_not_reviewed'/i);
+});
+
+test("fresh supply replay identity excludes write-once external valuation", () => {
+  const recordSupply = migration.slice(
+    migration.indexOf("create or replace function public.record_custody_fresh_tail_supply_event("),
+    migration.indexOf(
+      "create or replace function public.record_custody_fresh_tail_custody_event(",
+    ),
+  );
+  const evidenceHash = recordSupply.slice(
+    recordSupply.indexOf("v_evidence_fingerprint :="),
+    recordSupply.indexOf("select * into v_existing"),
+  );
+  assert.match(migration, /evidence_fingerprint text not null/i);
+  assert.match(recordSupply, /v_existing\.evidence_fingerprint\s*<>\s*v_evidence_fingerprint/i);
+  assert.match(evidenceHash, /eventKey[\s\S]*txSig[\s\S]*amountRaw[\s\S]*parserAbiFingerprint/i);
+  assert.doesNotMatch(evidenceHash, /marketCapUsd|valuationSlot|marketDataReliable/i);
+  assert.match(recordSupply, /payload_fingerprint, evidence_fingerprint/i);
+});
+
+test("stale pre-enrollment tombstones replay without poisoning retired mints", () => {
+  const rejection = migration.slice(
+    migration.indexOf("create or replace function public.reject_custody_fresh_tail_mint("),
+    migration.indexOf(
+      "create or replace function public.attest_custody_fresh_tail_mint_creation(",
+    ),
+  );
+  assert.match(migration, /trigger_expired_before_enrollment/i);
+  assert.match(migration, /evidence_fingerprint text not null/i);
+  assert.match(rejection, /v_existing\.evidence_fingerprint\s*=\s*v_evidence_fingerprint/i);
+  const rejectionEvidence = rejection.slice(
+    rejection.indexOf("v_evidence_fingerprint :="),
+    rejection.indexOf("perform pg_advisory_xact_lock"),
+  );
+  assert.match(rejectionEvidence, /tokenMint[\s\S]*sourceTxSig[\s\S]*sourceSlot[\s\S]*rejectionCode/i);
+  assert.doesNotMatch(rejectionEvidence, /finalizedHead|detail/i);
+  assert.match(rejection, /v_existing_mint\.status = 'retired'/i);
+  assert.match(rejection, /'ok', true, 'reason', 'mint_retired'/i);
+  assert.ok(
+    rejection.indexOf("v_existing_mint.status = 'retired'") <
+      rejection.indexOf("poison_reason = 'conflicting_mint_rejection'"),
+  );
+});
+
+test("focused replay hotfix mirrors canonical replay and invalidation RPCs", () => {
+  const functionBody = (source: string, name: string): string => {
+    const start = source.indexOf(`create or replace function public.${name}(`);
+    assert.ok(start >= 0, `${name} is missing`);
+    const end = source.indexOf("\n$$;", start);
+    assert.ok(end > start, `${name} terminator is missing`);
+    return source.slice(start, end + 4).trim();
+  };
+  assert.match(replayHotfix, /^begin;/im);
+  assert.match(replayHotfix, /^commit;\s*$/im);
+  assert.match(replayHotfix, /add column if not exists evidence_fingerprint text/i);
+  assert.match(replayHotfix, /alter column evidence_fingerprint set not null/i);
+  assert.match(replayHotfix, /fresh-tail supply payload audit failed/i);
+  assert.doesNotMatch(replayHotfix, /quarantined\s*=\s*false|poisoned\s*=\s*false/i);
+  for (const name of [
+    "reject_custody_fresh_tail_mint",
+    "record_custody_fresh_tail_supply_event",
+    "invalidate_failed_custody_fresh_tail_shadow_epoch",
+  ]) {
+    assert.equal(functionBody(replayHotfix, name), functionBody(migration, name));
+    assert.equal(functionBody(replayHotfix, name), functionBody(schema, name));
+  }
+});
+
+test("failed-shadow invalidation preserves evidence and requires zero durable progress or trading work", () => {
+  const start = migration.indexOf(
+    "create or replace function public.invalidate_failed_custody_fresh_tail_shadow_epoch(",
+  );
+  const next = migration.indexOf("create or replace function public.", start + 1);
+  const invalidate = migration.slice(start, next);
+  assert.match(invalidate, /v_epoch\.lease_expires_at[\s\S]*observer_lease_still_live/i);
+  assert.match(invalidate, /from public\.bot_config[\s\S]*for update/i);
+  assert.match(invalidate, /v_config\.enabled is not false/i);
+  assert.match(invalidate, /v_heartbeat\.shadow is not true/i);
+  assert.match(invalidate, /v_heartbeat\.lease_generation <> p_expected_lease_generation/i);
+  assert.match(invalidate, /v_heartbeat\.lease_token is distinct from v_epoch\.lease_token/i);
+  assert.match(invalidate, /v_heartbeat\.worker_id is distinct from v_epoch\.lease_owner/i);
+  assert.match(invalidate, /v_heartbeat\.last_success_at is not null/i);
+  assert.match(invalidate, /root_covered_count <> 0[\s\S]*root_backlog_count <> 3/i);
+  assert.match(invalidate, /last_processed_signature is not null/i);
+  assert.match(invalidate, /from public\.custody_fresh_tail_backscan_ranges/i);
+  assert.match(invalidate, /from public\.custody_fresh_tail_coverage_attestations/i);
+  assert.match(invalidate, /from public\.custody_fresh_tail_requests/i);
+  assert.match(invalidate, /from public\.entry_signal_claims/i);
+  assert.match(invalidate, /from public\.positions/i);
+  assert.match(invalidate, /from public\.custody_fresh_tail_exit_intents/i);
+  assert.match(invalidate, /status = 'invalidated'/i);
+  assert.match(invalidate, /failed_shadow_epoch_no_root_progress/i);
+  assert.doesNotMatch(
+    invalidate,
+    /update public\.custody_fresh_tail_(?:mints|supply_events|mint_rejections|cursors|backscan_ranges|coverage_attestations|requests|exit_intents)/i,
+  );
+  assert.doesNotMatch(invalidate, /delete\s+from|quarantined\s*=\s*false|poisoned\s*=\s*false/i);
 });
 
 test("parser-domain CASE comparisons use PostgreSQL-safe parentheses", () => {
@@ -483,8 +584,8 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
   assert.match(migration, /when v_status = 'uncertain' then claim_token/i);
   assert.equal(
     migration.match(/direct_target_sell_exit_mode = 'proportional'/gi)?.length,
-    3,
-    "proportional exits must block activation, coverage, and final candidates",
+    4,
+    "proportional exits must block activation, failed-shadow recovery, coverage, and final candidates",
   );
   assert.match(migration, /'proportional_exit_proof_unavailable'/i);
   const supplyWriter = migration.slice(
@@ -497,7 +598,7 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
   );
   assert.match(
     supplyWriter,
-    /v_existing\.amount_raw <> p_amount_raw[\s\S]*insert into public\.custody_fresh_tail_exit_intents[\s\S]*'supply', v_existing\.id, 'terminal_outflow'[\s\S]*'payload_conflict'/i,
+    /v_existing\.evidence_fingerprint <> v_evidence_fingerprint[\s\S]*insert into public\.custody_fresh_tail_exit_intents[\s\S]*'supply', v_existing\.id, 'terminal_outflow'[\s\S]*'payload_conflict'/i,
   );
   assert.match(
     supplyWriter,

@@ -126,6 +126,7 @@ test("expired first discoveries become stable tombstones before creation proof R
     enrollment.indexOf("freshTailDiscoveryExpired") <
       enrollment.indexOf("attestFreshPumpFunCreate"),
   );
+  assert.match(enrollment, /trigger_expired_before_enrollment/);
   const rejection = observerSource.slice(
     observerSource.indexOf("private async rejectDiscovery"),
     observerSource.indexOf("private async enrollDiscovery"),
