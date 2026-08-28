@@ -256,6 +256,11 @@ function parseActiveEpoch(value: FreshTailMutationResult): FreshTailActiveEpoch 
       throw new Error("active fresh-tail epoch contains an invalid root wallet");
     }
   }
+  // The service-only RPC verifies this array and its fingerprint under
+  // PostgreSQL's configured collation. Normalize the already-verified set at
+  // the client boundary because that collation is not guaranteed to match
+  // JavaScript's default string sort used by observer configuration.
+  normalizedRoots.sort();
   const scopeRevision = Number(value.scopeRevision);
   const leaseGeneration = Number(value.leaseGeneration);
   const leaseOwner = value.leaseOwner === null ? null : String(value.leaseOwner ?? "").trim();
@@ -268,7 +273,6 @@ function parseActiveEpoch(value: FreshTailMutationResult): FreshTailActiveEpoch 
     !validIso(value.activationBlockTime) ||
     normalizedRoots.length !== 3 ||
     new Set(normalizedRoots).size !== 3 ||
-    normalizedRoots.some((root, index) => root !== [...normalizedRoots].sort()[index]) ||
     typeof value.rootFingerprint !== "string" ||
     !/^[0-9a-f]{64}$/.test(value.rootFingerprint) ||
     !Number.isSafeInteger(scopeRevision) ||

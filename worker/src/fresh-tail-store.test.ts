@@ -61,6 +61,68 @@ test("active epoch lookup strictly restores restart identity before activation",
   ]);
 });
 
+test("active epoch lookup accepts the database's authoritative collation order", async () => {
+  const databaseOrderedRoots = [
+    "7iVCXQn4u6tiTEfNVqbWSEsRdEi69E9oYsSMiepuECwi",
+    "7JCe3GHwkEr3feHgtLXnmuJ1yB3A7coSeyynxTBgdG8k",
+    "Em8J3gBWapfVBGVhVipwQnLrqCvnWBnLajw6XFsFECPF",
+  ] as const;
+  assert.notDeepEqual(databaseOrderedRoots, [...databaseOrderedRoots].sort());
+  const permutations = [
+    databaseOrderedRoots,
+    [databaseOrderedRoots[0], databaseOrderedRoots[2], databaseOrderedRoots[1]],
+    [databaseOrderedRoots[1], databaseOrderedRoots[0], databaseOrderedRoots[2]],
+    [databaseOrderedRoots[1], databaseOrderedRoots[2], databaseOrderedRoots[0]],
+    [databaseOrderedRoots[2], databaseOrderedRoots[0], databaseOrderedRoots[1]],
+    [databaseOrderedRoots[2], databaseOrderedRoots[1], databaseOrderedRoots[0]],
+  ];
+  for (const rootWallets of permutations) {
+    const store = createSupabaseFreshTailStore(
+      client([], {
+        ok: true,
+        reason: "active_epoch_found",
+        epochId: lease.epochId,
+        activationSlot: 123,
+        activationBlockhash: "activation-hash",
+        activationBlockTime: "2026-08-26T06:00:00.000Z",
+        rootWallets,
+        rootFingerprint: "a".repeat(64),
+        scopeRevision: 0,
+        leaseOwner: null,
+        leaseGeneration: 0,
+        leaseExpiresAt: null,
+        status: "active",
+      }),
+      "00000000-0000-4000-8000-000000000003",
+    );
+
+    const epoch = await store.loadActiveEpoch();
+    assert.deepEqual(epoch?.rootWallets, [...databaseOrderedRoots].sort());
+  }
+});
+
+test("active epoch lookup still rejects a duplicate root set", async () => {
+  const store = createSupabaseFreshTailStore(
+    client([], {
+      ok: true,
+      reason: "active_epoch_found",
+      epochId: lease.epochId,
+      activationSlot: 123,
+      activationBlockhash: "activation-hash",
+      activationBlockTime: "2026-08-26T06:00:00.000Z",
+      rootWallets: [roots[0], roots[0], roots[2]],
+      rootFingerprint: "a".repeat(64),
+      scopeRevision: 0,
+      leaseOwner: null,
+      leaseGeneration: 0,
+      leaseExpiresAt: null,
+      status: "active",
+    }),
+    "00000000-0000-4000-8000-000000000003",
+  );
+  await assert.rejects(store.loadActiveEpoch(), /active fresh-tail epoch response is malformed/);
+});
+
 test("active epoch lookup returns null only for the exact absence result", async () => {
   const store = createSupabaseFreshTailStore(
     client([], { ok: false, reason: "no_active_epoch" }),
