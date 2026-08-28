@@ -11867,7 +11867,8 @@ create table if not exists public.custody_fresh_tail_mint_rejections (
   rejection_code text not null check (rejection_code in (
     'not_pump_fun', 'created_before_epoch', 'already_graduated',
     'unsupported_create', 'reviewed_abi_mismatch', 'create_not_found',
-    'permanent_state_conflict', 'proof_unavailable_budget_exhausted'
+    'permanent_state_conflict', 'proof_unavailable_budget_exhausted',
+    'trigger_expired_before_enrollment'
   )),
   parser_abi_fingerprint text not null,
   proof_fingerprint text not null check (char_length(proof_fingerprint) = 64),
@@ -11882,6 +11883,20 @@ create table if not exists public.custody_fresh_tail_mint_rejections (
   foreign key (epoch_id, user_id)
     references public.custody_fresh_tail_epochs(id, user_id)
 );
+
+-- Re-running the additive migration must widen the check on installations
+-- created by an earlier revision; changing CREATE TABLE alone does not do so.
+alter table public.custody_fresh_tail_mint_rejections
+  drop constraint if exists custody_fresh_tail_mint_rejections_rejection_code_check;
+alter table public.custody_fresh_tail_mint_rejections
+  add constraint custody_fresh_tail_mint_rejections_rejection_code_check check (
+    rejection_code in (
+      'not_pump_fun', 'created_before_epoch', 'already_graduated',
+      'unsupported_create', 'reviewed_abi_mismatch', 'create_not_found',
+      'permanent_state_conflict', 'proof_unavailable_budget_exhausted',
+      'trigger_expired_before_enrollment'
+    )
+  );
 
 create index if not exists custody_fresh_tail_rejections_recovery_idx
   on public.custody_fresh_tail_mint_rejections (epoch_id, source_slot);
@@ -12720,7 +12735,8 @@ begin
      or p_rejection_code not in (
        'not_pump_fun', 'created_before_epoch', 'already_graduated',
        'unsupported_create', 'reviewed_abi_mismatch', 'create_not_found',
-       'permanent_state_conflict', 'proof_unavailable_budget_exhausted'
+       'permanent_state_conflict', 'proof_unavailable_budget_exhausted',
+       'trigger_expired_before_enrollment'
      )
      or v_fingerprint !~ '^[0-9a-f]{64}$' then
     return jsonb_build_object('ok', false, 'reason', 'invalid_rejection');
@@ -13976,9 +13992,7 @@ begin
     'blockTime', p_block_time, 'targetWallet', v_target,
     'tokenMint', v_token_mint, 'side', v_side,
     'amountRaw', p_amount_raw::text, 'totalSupplyRaw', p_total_supply_raw::text,
-    'decimals', p_decimals, 'marketCapUsd', p_market_cap_usd::text,
-    'valuationSlot', p_valuation_slot, 'marketDataReliable', p_market_data_reliable,
-    'pumpFunVerified', p_pump_fun_verified,
+    'decimals', p_decimals, 'pumpFunVerified', p_pump_fun_verified,
     'classificationReliable', p_classification_reliable,
     'parserDomain', v_parser_domain,
     'parserAbiFingerprint', v_abi
@@ -13989,7 +14003,22 @@ begin
   where epoch_id = p_epoch_id and event_key = v_event_key
   for update;
   if found then
-    if v_existing.payload_fingerprint <> v_fingerprint
+    -- SOL/USD is an off-chain observation and can legitimately differ when an
+    -- uncheckpointed finalized event is replayed. Compare only canonical event
+    -- identity here; retain the first accepted valuation for audit stability.
+    if v_existing.tx_sig <> v_sig
+       or v_existing.slot <> p_slot
+       or v_existing.block_time <> p_block_time
+       or v_existing.target_wallet <> v_target
+       or v_existing.token_mint <> v_token_mint
+       or v_existing.side <> v_side
+       or v_existing.amount_raw <> p_amount_raw
+       or v_existing.total_supply_raw <> p_total_supply_raw
+       or v_existing.decimals <> p_decimals
+       or v_existing.pump_fun_verified is distinct from p_pump_fun_verified
+       or v_existing.classification_reliable is distinct from p_classification_reliable
+       or v_existing.parser_domain <> v_parser_domain
+       or v_existing.parser_abi_fingerprint <> v_abi
        or (v_existing.finalized_head_slot = p_finalized_head_slot
          and v_existing.finalized_head_blockhash <> v_head_hash) then
       update public.custody_fresh_tail_supply_events set

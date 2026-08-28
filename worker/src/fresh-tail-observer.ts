@@ -60,6 +60,9 @@ const DEFAULT_LEASE_KEEPALIVE_MS = 4_000;
 const DEFAULT_RPC_TIMEOUT_MS = 4_000;
 const REQUEST_RESERVE_MS = 4_000;
 const PRICE_MAX_AGE_MS = 5_000;
+const FRESH_TRIGGER_ENROLLMENT_DEADLINE_MS = 55_000 - REQUEST_RESERVE_MS;
+const MAX_PARALLEL_ROOT_READS = 3;
+const MAX_PARALLEL_CANONICAL_BLOCK_READS = 8;
 const MAX_FIXED_POINT_STEPS = 512;
 const MAX_RETIREMENTS_PER_CYCLE = 25;
 const LAUNCH_CAMPAIGN_RETENTION_SECONDS = 60 * 60;
@@ -312,6 +315,27 @@ function ensureDeadline(deadlineMs: number, nowMs: () => number, operation: stri
   }
 }
 
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  visit: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const output = new Array<R>(values.length);
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) return;
+      output[index] = await visit(values[index]!);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, () => worker()),
+  );
+  return output;
+}
+
 /** Exact post-trade market cap from the reviewed Pump TradeEvent reserve pair. */
 export function freshTailTradeMarketCapUsd(
   evidence: FreshTailPumpTradeEventEvidence,
@@ -375,8 +399,35 @@ function rejectionCode(code: PumpFunCreateProofFailureCode): string | null {
   return "reviewed_abi_mismatch";
 }
 
-function rejectionFingerprint(fields: Record<string, unknown>): string {
-  return createHash("sha256").update(JSON.stringify(fields)).digest("hex");
+export function freshTailDiscoveryExpired(triggerBlockTimeMs: number, nowMs: number): boolean {
+  return (
+    Number.isSafeInteger(triggerBlockTimeMs) &&
+    triggerBlockTimeMs > 0 &&
+    Number.isSafeInteger(nowMs) &&
+    nowMs >= triggerBlockTimeMs + FRESH_TRIGGER_ENROLLMENT_DEADLINE_MS
+  );
+}
+
+export function freshTailRejectionFingerprint(fields: {
+  mint: string;
+  signature: string;
+  slot: number;
+  code: string;
+}): string {
+  // Only the immutable rejection identity belongs in this replay key. The
+  // sampled finalized head and diagnostic wording can legitimately change on
+  // a later attempt and must never quarantine an otherwise identical tombstone.
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        mint: fields.mint,
+        signature: fields.signature,
+        slot: fields.slot,
+        code: fields.code,
+        parserAbiFingerprint: FRESH_TAIL_ROOT_BUY_PARSER_ABI,
+      }),
+    )
+    .digest("hex");
 }
 
 function requestSort(left: FreshTailWorkRequest, right: FreshTailWorkRequest): number {
@@ -740,7 +791,6 @@ export class FreshTailObserver {
     signature: ConfirmedSignatureInfo,
     code: string,
     head: FreshTailFinalizedHead,
-    detail: string,
   ): Promise<void> {
     const result = await this.store.rejectMint(this.epoch!.epochId, this.lease!, {
       tokenMint: mint,
@@ -748,14 +798,11 @@ export class FreshTailObserver {
       sourceSlot: signature.slot,
       rejectionCode: code,
       parserAbiFingerprint: FRESH_TAIL_ROOT_BUY_PARSER_ABI,
-      proofFingerprint: rejectionFingerprint({
+      proofFingerprint: freshTailRejectionFingerprint({
         mint,
         signature: signature.signature,
         slot: signature.slot,
         code,
-        detail,
-        headSlot: head.slot,
-        headBlockhash: head.blockhash,
       }),
       finalizedHead: head,
     });
@@ -780,7 +827,15 @@ export class FreshTailObserver {
         signature,
         "reviewed_abi_mismatch",
         head,
-        "root discovery omitted exact buy evidence",
+      );
+      return null;
+    }
+    if (freshTailDiscoveryExpired(buy.blockTimeMs, Number(this.nowMs()))) {
+      await this.rejectDiscovery(
+        provisional.mint,
+        signature,
+        "trigger_expired_before_enrollment",
+        head,
       );
       return null;
     }
@@ -812,7 +867,6 @@ export class FreshTailObserver {
         signature,
         permanentCode,
         head,
-        `${proofResult.code}:${proofResult.reason}`,
       );
       return null;
     }
@@ -833,7 +887,6 @@ export class FreshTailObserver {
         signature,
         "reviewed_abi_mismatch",
         head,
-        rebound.ok ? "proved contract did not reproduce one root buy" : rebound.reason,
       );
       return null;
     }
@@ -1033,7 +1086,6 @@ export class FreshTailObserver {
           signature,
           "reviewed_abi_mismatch",
           head,
-          candidate.decoded.reason,
         );
         rejectedMints.add(candidate.tokenMint);
         continue;
@@ -1188,50 +1240,59 @@ export class FreshTailObserver {
       rows.push(occurrence);
       bySlot.set(occurrence.signature.slot, rows);
     }
-    for (const [slot, rows] of bySlot) {
+    const collisions = [...bySlot.entries()].filter(([, rows]) => {
       const signatures = new Set(rows.map((row) => row.signature.signature));
-      if (signatures.size <= 1) continue;
-      ensureDeadline(deadlineMs, this.nowMs, "same-slot canonical ordering");
-      let block: Awaited<ReturnType<Connection["getBlockSignatures"]>>;
-      try {
-        block = await Promise.race([
-          this.rpc.getBlockSignatures(slot, "finalized"),
-          new Promise<never>((_resolve, reject) =>
-            setTimeout(
-              () => reject(new Error("block signature RPC timed out")),
-              this.rpcCallTimeoutMs,
-            ),
-          ),
-        ]);
-      } catch (error) {
-        throw new FreshTailObserverError(
-          "same_slot_order_unavailable",
-          true,
-          `cannot resolve canonical transaction order at ${slot}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-      if (!block || typeof block.blockhash !== "string" || !Array.isArray(block.signatures)) {
-        throw new FreshTailObserverError(
-          "same_slot_order_unavailable",
-          true,
-          `finalized block signatures are unavailable at ${slot}`,
-        );
-      }
-      const indexes = new Map(block.signatures.map((signature, index) => [signature, index]));
-      for (const row of rows) {
-        const index = indexes.get(row.signature.signature);
-        if (index === undefined) {
+      return signatures.size > 1;
+    });
+    await mapWithConcurrency(
+      collisions,
+      MAX_PARALLEL_CANONICAL_BLOCK_READS,
+      async ([slot, rows]) => {
+        ensureDeadline(deadlineMs, this.nowMs, "same-slot canonical ordering");
+        let block: Awaited<ReturnType<Connection["getBlockSignatures"]>>;
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          block = await Promise.race([
+            this.rpc.getBlockSignatures(slot, "finalized"),
+            new Promise<never>((_resolve, reject) => {
+              timeout = setTimeout(
+                () => reject(new Error("block signature RPC timed out")),
+                this.rpcCallTimeoutMs,
+              );
+            }),
+          ]);
+        } catch (error) {
           throw new FreshTailObserverError(
-            "same_slot_order_conflict",
-            false,
-            `finalized block ${slot} omitted a scanned transaction signature`,
+            "same_slot_order_unavailable",
+            true,
+            `cannot resolve canonical transaction order at ${slot}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        } finally {
+          if (timeout) clearTimeout(timeout);
+        }
+        if (!block || typeof block.blockhash !== "string" || !Array.isArray(block.signatures)) {
+          throw new FreshTailObserverError(
+            "same_slot_order_unavailable",
+            true,
+            `finalized block signatures are unavailable at ${slot}`,
           );
         }
-        row.blockIndex = index;
-      }
-    }
+        const indexes = new Map(block.signatures.map((signature, index) => [signature, index]));
+        for (const row of rows) {
+          const index = indexes.get(row.signature.signature);
+          if (index === undefined) {
+            throw new FreshTailObserverError(
+              "same_slot_order_conflict",
+              false,
+              `finalized block ${slot} omitted a scanned transaction signature`,
+            );
+          }
+          row.blockIndex = index;
+        }
+      },
+    );
   }
 
   private async processRootLanes(
@@ -1261,34 +1322,41 @@ export class FreshTailObserver {
         "root cursor identities do not match the durable epoch roots",
       );
     }
-    const scans: RootScan[] = [];
-    for (const cursor of rootCursors) {
-      this.assertLease();
-      const boundary = freshTailBoundaryForCursor(cursor);
-      const scan = await scanFreshTailFinalizedSignatures(this.rpc, {
-        wallet: cursor.wallet,
-        boundary,
-        finalizedHeadSlot: head.slot,
-        pageSize: this.pageSize,
-        maxPages: this.maxPages,
-        rpcCallTimeoutMs: this.rpcCallTimeoutMs,
-        deadlineMs,
-        nowMs: this.nowMs,
-      });
-      if (!scan.ok) {
-        throw new FreshTailObserverError(scan.code, scan.retryable, scan.reason);
-      }
-      const loaded = await loadFreshTailFinalizedTransactions(this.rpc, {
-        signatures: scan.signatures,
-        rpcCallTimeoutMs: this.rpcCallTimeoutMs,
-        deadlineMs,
-        nowMs: this.nowMs,
-      });
-      if (!loaded.ok) {
-        throw new FreshTailObserverError(loaded.code, loaded.retryable, loaded.reason);
-      }
-      scans.push({ root: cursor.wallet, cursor, scan, transactions: loaded.transactions });
-    }
+    // All reads are independent and fenced mutations do not begin until every
+    // root has produced one exact, validated range. This cuts startup latency
+    // without changing the canonical mutation order below.
+    const scans = await mapWithConcurrency(
+      rootCursors,
+      MAX_PARALLEL_ROOT_READS,
+      async (cursor): Promise<RootScan> => {
+        this.assertLease();
+        const boundary = freshTailBoundaryForCursor(cursor);
+        const scan = await scanFreshTailFinalizedSignatures(this.rpc, {
+          wallet: cursor.wallet,
+          boundary,
+          finalizedHeadSlot: head.slot,
+          pageSize: this.pageSize,
+          maxPages: this.maxPages,
+          rpcCallTimeoutMs: this.rpcCallTimeoutMs,
+          deadlineMs,
+          nowMs: this.nowMs,
+        });
+        if (!scan.ok) {
+          throw new FreshTailObserverError(scan.code, scan.retryable, scan.reason);
+        }
+        const loaded = await loadFreshTailFinalizedTransactions(this.rpc, {
+          signatures: scan.signatures,
+          rpcCallTimeoutMs: this.rpcCallTimeoutMs,
+          deadlineMs,
+          nowMs: this.nowMs,
+        });
+        if (!loaded.ok) {
+          throw new FreshTailObserverError(loaded.code, loaded.retryable, loaded.reason);
+        }
+        this.assertLease();
+        return { root: cursor.wallet, cursor, scan, transactions: loaded.transactions };
+      },
+    );
     const occurrences: RootOccurrence[] = scans.flatMap((rootScan) =>
       rootScan.transactions.map((row) => ({
         ...row,

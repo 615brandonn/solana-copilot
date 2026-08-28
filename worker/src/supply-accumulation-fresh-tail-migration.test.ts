@@ -228,6 +228,27 @@ test("mint enrollment is epoch-level, strict Pump creation proof with durable re
   assert.match(migration, /p_creation_slot <= v_epoch\.activation_slot/i);
   assert.match(migration, /create table if not exists public\.custody_fresh_tail_mint_rejections/i);
   assert.match(migration, /proof_unavailable_budget_exhausted/i);
+  assert.match(migration, /trigger_expired_before_enrollment/i);
+  assert.match(
+    migration,
+    /drop constraint if exists custody_fresh_tail_mint_rejections_rejection_code_check/i,
+  );
+});
+
+test("supply replay treats live SOL\/USD valuation as metadata, not canonical identity", () => {
+  const supply = migration.slice(
+    migration.indexOf("create or replace function public.record_custody_fresh_tail_supply_event("),
+    migration.indexOf("create or replace function public.record_custody_fresh_tail_custody_event("),
+  );
+  const fingerprint = supply.slice(
+    supply.indexOf("v_fingerprint :="),
+    supply.indexOf("select * into v_existing"),
+  );
+  assert.doesNotMatch(fingerprint, /marketCapUsd|valuationSlot|marketDataReliable/);
+  assert.match(supply, /retain the first accepted valuation for audit stability/i);
+  assert.match(supply, /v_existing\.amount_raw <> p_amount_raw/i);
+  assert.match(supply, /v_existing\.parser_abi_fingerprint <> v_abi/i);
+  assert.doesNotMatch(supply, /v_existing\.payload_fingerprint <> v_fingerprint/i);
 });
 
 test("fresh supply authorization never depends on legacy aggregate rows", () => {
@@ -476,7 +497,7 @@ test("post-entry exits are permanent exact-once evidence, not SQL money movement
   );
   assert.match(
     supplyWriter,
-    /payload_fingerprint <> v_fingerprint[\s\S]*insert into public\.custody_fresh_tail_exit_intents[\s\S]*'supply', v_existing\.id, 'terminal_outflow'[\s\S]*'payload_conflict'/i,
+    /v_existing\.amount_raw <> p_amount_raw[\s\S]*insert into public\.custody_fresh_tail_exit_intents[\s\S]*'supply', v_existing\.id, 'terminal_outflow'[\s\S]*'payload_conflict'/i,
   );
   assert.match(
     supplyWriter,
