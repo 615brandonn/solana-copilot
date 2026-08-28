@@ -26,13 +26,14 @@ particular, do not modify `rpc_wallet_cursors`, `custody_rpc_wallet_cursors`,
 `custody_fresh_tail_cursors`, or the active fresh-tail epoch. The new lane has
 its own finalized activation boundary; legacy catch-up must continue normally.
 
-## 2. Apply the two SQL migrations in order
+## 2. Apply the three SQL migrations in order
 
 In the Supabase SQL editor, run each checked-in file separately and wait for it
 to succeed before continuing:
 
-1. `supabase/sell-claim-recovery-migration.sql`
-2. `supabase/supply-accumulation-fresh-tail-migration.sql`
+1. `supabase/custody-pending-queue-capabilities-migration.sql`
+2. `supabase/sell-claim-recovery-migration.sql`
+3. `supabase/supply-accumulation-fresh-tail-migration.sql`
 
 Do not paste a service-role key into the SQL editor, shell history, or logs.
 The migrations are additive and do not enable Entries.

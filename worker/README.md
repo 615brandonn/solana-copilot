@@ -162,10 +162,14 @@ incomplete claims remain fail-closed for manual reconciliation.
 
 ### Finalized fresh-tail rollout
 
-The additive `supabase/supply-accumulation-fresh-tail-migration.sql` creates a
-separate FINALIZED, epoch-fenced observer. It does not import the executor,
-funding key, positions, or claims. Apply it only with global Entries OFF, then
-run the observer in mandatory shadow mode first:
+The additive `supabase/custody-pending-queue-capabilities-migration.sql` gives
+Doctor a constant-time, service-only proof of the required Custody v2 indexes.
+Apply it before `supabase/sell-claim-recovery-migration.sql` and
+`supabase/supply-accumulation-fresh-tail-migration.sql`, in the order shown in
+the live rollout checklist. The fresh-tail migration creates a separate
+FINALIZED, epoch-fenced observer. It does not import the executor, funding key,
+positions, or claims. Apply all three only with global Entries OFF, then run the
+observer in mandatory shadow mode first:
 
 ```bash
 cd worker

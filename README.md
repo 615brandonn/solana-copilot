@@ -144,6 +144,7 @@ Enabling it turns off the Conviction and Coordinated toggles.
 
 The optional finalized fresh-tail service is a separate observation-only path
 for post-activation Pump launches. With Entries OFF, apply
+`supabase/custody-pending-queue-capabilities-migration.sql` and
 `supabase/supply-accumulation-fresh-tail-migration.sql`, build the worker, and
 start `dist/fresh-tail-index.js` with `FRESH_TAIL_SHADOW=true`. It uses one
 finalized activation boundary, fenced leases, exact-signature cursors,
