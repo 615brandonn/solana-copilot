@@ -413,6 +413,62 @@ test("real current V2 buy produces exact Supply, logical target, transfer, and T
   assert.match(finalized.payloadFingerprint, /^[0-9a-f]{64}$/);
 });
 
+test("reviewed non-Trade Pump events do not hide or replace exact TradeEvent evidence", () => {
+  const tx = transaction(REAL_V2_FORWARDED_BUY);
+  const innerGroup = tx.meta!.innerInstructions![0]!;
+  // Full finalized ExtendAccountEvent and InitUserVolumeAccumulatorEvent CPIs
+  // observed before exact TradeEvents in current Pump transactions.
+  const nonTradeEventCpis = [
+    "21448NTnPMYUBkX8r9jEFxSm216C1QRscond6BVS1fdwGjU4eEvDKGJwaQ8hiMsdbMm8d4gm9LZZRtmDnGzf8i6MjajNipNVaEGoDwoJ65FX9PgeG22Fwin3yf6HR9vgisKdMpLHJc4RN5M",
+    "2qWhKzSZDTHi8CCCSxJtoJ2eWxV1pzFXLWPiD1sZdbiG3G7KbFSpnMwueBgfSZcBuRHTPQKKzWbm9cZebNwPVEMdDrY26A4MjGyxH4TXVaW1AaLXd8TRL6NmV",
+  ];
+  innerGroup.instructions.unshift(
+    ...nonTradeEventCpis.map(
+      (data) =>
+        ({
+          programId: PUMP_FUN_PROGRAM_ID,
+          accounts: [new PublicKey(EVENT_AUTHORITY)],
+          data,
+        }) as any,
+    ),
+  );
+
+  const discovery = discoverFreshTailRootPumpBuys(tx, REAL_V2_FORWARDED_BUY.signers[0]!);
+  assert.equal(discovery.ok, true);
+  if (discovery.ok) assert.equal(discovery.discoveries.length, 1);
+
+  const decoded = decodeFreshTailFinalizedTransaction(
+    tx,
+    contract(REAL_V2_FORWARDED_BUY),
+    REAL_V2_FORWARDED_BUY.signers[0]!,
+    "root",
+  );
+  assert.equal(decoded.ok, true);
+  if (decoded.ok) {
+    assert.equal(decoded.pumpTradeEventEvidence?.instructionName, "buy_exact_quote_in");
+  }
+});
+
+test("a Pump trade with a changed TradeEvent discriminator still fails closed", () => {
+  const fixture = structuredClone(REAL_V2_FORWARDED_BUY);
+  const eventData = Buffer.from(bs58.decode(fixture.eventData));
+  Buffer.from("86240d48e86582d8", "hex").copy(eventData, 8);
+  fixture.eventData = bs58.encode(eventData);
+
+  const discovery = discoverFreshTailRootPumpBuys(transaction(fixture), fixture.signers[0]!);
+  assert.equal(discovery.ok, false);
+  if (!discovery.ok) assert.match(discovery.reason, /0 exact TradeEvent creators/);
+
+  const decoded = decodeFreshTailFinalizedTransaction(
+    transaction(fixture),
+    contract(fixture),
+    fixture.signers[0]!,
+    "root",
+  );
+  assert.equal(decoded.ok, false);
+  if (!decoded.ok) assert.match(decoded.reason, /TradeEvent/);
+});
+
 test("unenrolled root discovery derives and rebinds exact V2 and legacy-buy contracts", () => {
   for (const fixture of [REAL_V2_FORWARDED_BUY, REAL_LEGACY_BUY]) {
     const discovered = discoverFreshTailRootPumpBuys(transaction(fixture), fixture.signers[0]!);

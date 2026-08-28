@@ -526,6 +526,16 @@ function parsePumpTradeEvent(instruction: InstructionView): PumpTradeEventParse 
   }
   const prefix = instruction.data.subarray(0, 8).toString("hex");
   if (prefix !== EVENT_CPI_DISCRIMINATOR) return { kind: "absent" };
+  if (instruction.data.length < 16) {
+    return { kind: "conflict", reason: "Pump event CPI header is malformed" };
+  }
+  // Pump emits several reviewed Anchor events through the same event-CPI
+  // envelope. Only TradeEvent belongs to the trade evidence contract. Ignore
+  // other event discriminators here; a Pump trade still fails closed later
+  // unless it has exactly one matching, fully decoded TradeEvent.
+  if (instruction.data.subarray(8, 16).toString("hex") !== TRADE_EVENT_DISCRIMINATOR) {
+    return { kind: "absent" };
+  }
   if (
     instruction.accounts.length !== 1 ||
     instruction.accounts[0] !== PUMP_EVENT_AUTHORITY.toBase58()
