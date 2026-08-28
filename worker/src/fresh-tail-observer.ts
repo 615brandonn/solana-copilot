@@ -315,24 +315,38 @@ function ensureDeadline(deadlineMs: number, nowMs: () => number, operation: stri
   }
 }
 
-async function mapWithConcurrency<T, R>(
+export async function mapWithConcurrency<T, R>(
   values: readonly T[],
   concurrency: number,
   visit: (value: T) => Promise<R>,
 ): Promise<R[]> {
   const output = new Array<R>(values.length);
   let nextIndex = 0;
+  let firstError: unknown;
+  let failed = false;
   const worker = async (): Promise<void> => {
-    while (true) {
+    while (!failed) {
       const index = nextIndex;
       nextIndex += 1;
       if (index >= values.length) return;
-      output[index] = await visit(values[index]!);
+      try {
+        output[index] = await visit(values[index]!);
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          firstError = error;
+        }
+        return;
+      }
     }
   };
+  // Workers catch locally so this barrier cannot reject early. Once any read
+  // fails, no new item starts, but every already in-flight RPC settles before
+  // the authoritative first error is propagated to cycle teardown.
   await Promise.all(
     Array.from({ length: Math.min(concurrency, values.length) }, () => worker()),
   );
+  if (failed) throw firstError;
   return output;
 }
 

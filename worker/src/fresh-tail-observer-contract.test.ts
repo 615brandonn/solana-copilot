@@ -8,6 +8,7 @@ import {
   freshTailRejectionFingerprint,
   freshTailTradeMarketCapUsd,
   freshTailTransactionLookupKeys,
+  mapWithConcurrency,
 } from "./fresh-tail-observer.js";
 
 const indexSource = readFileSync(new URL("../src/fresh-tail-index.ts", import.meta.url), "utf8");
@@ -203,6 +204,32 @@ test("expired enrollment rejects durably without invoking creation-proof RPC", a
   );
   assert.equal(result, null);
   assert.equal(rejections[0]?.rejectionCode, "trigger_expired_before_enrollment");
+});
+
+test("bounded root reads settle in-flight work before propagating the first failure", async () => {
+  const failure = new Error("read failed");
+  const started: number[] = [];
+  let releaseFirst!: () => void;
+  const firstFinished = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let returned = false;
+  const mapped = mapWithConcurrency([1, 2, 3], 2, async (value) => {
+    started.push(value);
+    if (value === 1) await firstFinished;
+    if (value === 2) throw failure;
+    return value;
+  }).finally(() => {
+    returned = true;
+  });
+
+  for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+  assert.deepEqual(started, [1, 2], "failure must stop dispatching queued RPC work");
+  assert.equal(returned, false, "helper returned while another RPC worker was still in flight");
+
+  releaseFirst();
+  await assert.rejects(mapped, (error: unknown) => error === failure);
+  assert.equal(returned, true);
 });
 
 test("root decoding indexes contracts by transaction mint/account evidence", () => {
