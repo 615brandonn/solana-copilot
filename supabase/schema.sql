@@ -13512,7 +13512,7 @@ begin
        where m.epoch_id = p_epoch_id and m.user_id = p_user_id
          and m.poisoned and (
            m.status <> 'active'
-           or m.poison_reason <> 'supply_payload_conflict'
+           or m.poison_reason is distinct from 'supply_payload_conflict'
            or not exists (
              select 1 from public.custody_fresh_tail_supply_events e
              where e.epoch_id = m.epoch_id and e.token_mint = m.token_mint
@@ -13530,7 +13530,7 @@ begin
          and e.quarantined and (
            e.conflict_count <= 0 or e.first_conflict_at is null
            or m.token_mint is null or not m.poisoned
-           or m.poison_reason <> 'supply_payload_conflict'
+           or m.poison_reason is distinct from 'supply_payload_conflict'
          )
      ) then
     return jsonb_build_object('ok', false, 'reason', 'valuation_replay_conflict_not_proven');

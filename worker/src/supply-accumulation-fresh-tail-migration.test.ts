@@ -357,6 +357,11 @@ test("failed-shadow invalidation preserves evidence and requires zero durable pr
   assert.match(invalidate, /from public\.entry_signal_claims/i);
   assert.match(invalidate, /from public\.positions/i);
   assert.match(invalidate, /from public\.custody_fresh_tail_exit_intents/i);
+  assert.equal(
+    invalidate.match(/poison_reason is distinct from 'supply_payload_conflict'/gi)?.length,
+    2,
+  );
+  assert.doesNotMatch(invalidate, /poison_reason\s*<>\s*'supply_payload_conflict'/i);
   assert.match(invalidate, /status = 'invalidated'/i);
   assert.match(invalidate, /failed_shadow_epoch_no_root_progress/i);
   assert.doesNotMatch(
