@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { BotConfigRow } from "./db.js";
-import { checkEntry, type TokenMeta } from "./filters.js";
+import { checkEntry, loadTokenMetaWithCurveFallback, type TokenMeta } from "./filters.js";
 import type { SwapEvent } from "./geyser.js";
 
 const NOW_MS = Date.UTC(2026, 7, 2, 0, 0, 0);
@@ -171,4 +171,47 @@ test("applies the existing minimum to a newly resolved target-buy value", () => 
     ),
     { pass: false, reason: "target buy $40 < min $50" },
   );
+});
+
+test("reviewed Pump curve fallback fills price and market cap but never invents age", async () => {
+  const loaded = await loadTokenMetaWithCurveFallback("curve-mint-pump", {
+    enabled: true,
+    loadDex: async () => ({
+      isPumpFun: true,
+      socials: {},
+      marketDataSource: "unavailable",
+    }),
+    loadCurve: async () => ({ complete: false, marketCapUsd: 12_500, priceUsd: 0.0000125 }),
+  });
+
+  assert.equal(loaded.marketCapUsd, 12_500);
+  assert.equal(loaded.priceUsd, 0.0000125);
+  assert.equal(loaded.marketDataSource, "pumpfun_curve");
+  assert.equal(loaded.pairCreatedAtMs, undefined);
+  assert.equal(loaded.tokenCreatedAtMs, undefined);
+});
+
+test("curve fallback never overrides Dex metadata or prices a completed curve", async () => {
+  let curveReads = 0;
+  const dex = { ...meta, marketDataSource: "dexscreener" as const };
+  assert.deepEqual(
+    await loadTokenMetaWithCurveFallback("mint", {
+      enabled: true,
+      loadDex: async () => dex,
+      loadCurve: async () => {
+        curveReads += 1;
+        return { complete: false, marketCapUsd: 1 };
+      },
+    }),
+    dex,
+  );
+  assert.equal(curveReads, 0);
+
+  const unavailable = await loadTokenMetaWithCurveFallback("curve-mint-pump", {
+    enabled: true,
+    loadDex: async () => ({ isPumpFun: true, socials: {}, marketDataSource: "unavailable" }),
+    loadCurve: async () => ({ complete: true, marketCapUsd: 12_500 }),
+  });
+  assert.equal(unavailable.marketCapUsd, undefined);
+  assert.equal(unavailable.marketDataSource, "unavailable");
 });

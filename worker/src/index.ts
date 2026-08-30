@@ -38,7 +38,12 @@ import {
   type EntryClaimStatus,
 } from "./entry-claim-policy.js";
 import { decryptPrivateKey } from "./crypto.js";
-import { checkEntry, loadTokenMeta, type TokenMeta } from "./filters.js";
+import {
+  checkEntry,
+  loadTokenMeta,
+  loadTokenMetaWithCurveFallback,
+  type TokenMeta,
+} from "./filters.js";
 import { RpcBackfillPoller } from "./poller.js";
 import { createSupabaseRpcCursorStore } from "./rpc-cursor.js";
 import { PendingTransferBuffer } from "./pending-transfer-buffer.js";
@@ -59,8 +64,20 @@ import {
   CoordinatedBuyTracker,
   inactivityDeadlineMs,
   shouldTriggerDistinctSellerExit,
+  type CoordinationDecision,
   type TargetBuyObservation,
 } from "./coordinated-mode.js";
+import {
+  PumpFunCreationTimeResolver,
+  type PumpFunCreationTimeProof,
+} from "./pump-fun-creation-time.js";
+import {
+  coordinatedCreationFinalityIsPending,
+  coordinatedClusterHasNoInterveningTargetSell,
+  coordinatedEntryAuthorizationIsCurrent as exactCoordinatedAuthorizationIsCurrent,
+  coordinatedFinalityRetryDelayMs,
+  type CoordinatedEntryAuthorization,
+} from "./coordinated-entry-authorization.js";
 import { isFlatPosition, proportionalMirrorSell } from "./follower-math.js";
 import { safeDiagnostic } from "./diagnostics.js";
 import {
@@ -159,6 +176,43 @@ const STABLECOIN_MINTS = new Set([
   "Es9vMFrzaCERmJfrF4H2FYD4KCo24RDUuUuJZq8bn6T", // USDT
 ]);
 const rpc = new Connection(env.RPC_URL, { commitment: "processed" });
+
+async function loadEntryTokenMeta(
+  tokenMint: string,
+  pumpFunHint = false,
+  minContextSlot?: number,
+): Promise<TokenMeta> {
+  return loadTokenMetaWithCurveFallback(tokenMint, {
+    enabled: env.CURVE_PRICING_ENABLED === true,
+    pumpFunHint,
+    loadCurve: async (mint) => {
+      const [snapshot, solPrice] = await Promise.all([
+        loadPumpFunSupplySnapshot(rpc, mint, {
+          commitment: "confirmed",
+          rpcCallTimeoutMs: 2_000,
+          ...(Number.isSafeInteger(minContextSlot) && Number(minContextSlot) > 0
+            ? { minContextSlot: Number(minContextSlot) }
+            : {}),
+        }),
+        priceUsd(WSOL),
+      ]);
+      if (
+        !snapshot ||
+        snapshot.complete ||
+        solPrice === undefined ||
+        (Number.isSafeInteger(minContextSlot) &&
+          Number(minContextSlot) > 0 &&
+          snapshot.observedSlot < Number(minContextSlot))
+      )
+        return null;
+      return {
+        complete: snapshot.complete,
+        marketCapUsd: pumpFunCurrentMarketCapUsd(snapshot, solPrice),
+        priceUsd: pumpFunTokenPriceUsd(snapshot, solPrice),
+      };
+    },
+  });
+}
 type RecipientClassification = "eligible" | "program_or_off_curve" | "unknown";
 const followerRecipientEligibility = new Map<string, RecipientClassification>();
 
@@ -171,10 +225,37 @@ type CopyBuyOptions = {
   supplyState?: SupplyAccumulationState;
   /** Frozen finalized custody certificate; initial Supply entries only. */
   freshTailCandidate?: FreshTailEntryCandidate;
+  /** Fresh metadata with finalized coordinated-age evidence already attached. */
+  coordinatedMeta?: TokenMeta;
+  /** Process-local fence against delayed target sells/config changes/stale market data. */
+  coordinatedAuthorization?: CoordinatedEntryAuthorization;
 };
+
+type ReadyCoordination = Extract<CoordinationDecision, { ready: true }>;
 
 function copyBuyEntryStrategy(options: CopyBuyOptions): AutomaticEntryStrategy {
   return options.entryStrategy ?? options.entryMode;
+}
+
+function coordinatedEntryConfigFingerprint(config: BotConfigRow): string {
+  return JSON.stringify([
+    config.enabled === true,
+    config.coordinated_mode_enabled === true,
+    Number(config.coordinated_window_seconds),
+    Number(config.coordinated_target_wallet_count),
+    Number(config.coordinated_target_buy_min_usd),
+    Number(config.coordinated_target_buy_max_usd),
+    config.coordinated_first_buy_only === true,
+    Number(config.coordinated_mc_min_usd),
+    Number(config.coordinated_mc_max_usd),
+    Number(config.coordinated_coin_age_min_minutes),
+    Number(config.coordinated_coin_age_max_minutes),
+    config.coordinated_once_per_token === true,
+    Number(config.coordinated_fixed_buy_usd),
+    Number(config.coordinated_three_wallet_buy_usd),
+    config.execution_route,
+    Number(config.jito_tip_sol),
+  ]);
 }
 
 type EntryClaimRow = {
@@ -539,6 +620,60 @@ async function main() {
   const currentCopyBuyMonitoringGate = (freshTailEntry: boolean) =>
     freshTailEntry ? currentFreshTailEntryMonitoringGate() : currentEntryMonitoringGate();
   const coordinatedBuys = new CoordinatedBuyTracker();
+  const coordinatedEntryBackground = new BoundedBackgroundQueue(8, 256);
+  const pumpFunCreationTimeResolver = new PumpFunCreationTimeResolver(rpc);
+  const coordinatedDeferredTimers = new Map<string, NodeJS.Timeout>();
+  const coordinatedResolutionAttempts = new Map<string, number>();
+  const coordinatedFinalityWaits = new Map<string, number>();
+  const coordinatedTargetSellState = new Map<string, { revision: number; highestSlot: number }>();
+  const COORDINATED_SELL_REVISION_CAP = 5_000;
+
+  const coordinatedTargetScopeFingerprint = () => configuredTargetWallets(cfg).sort().join("|");
+  const coordinatedSellStateFor = (tokenMint: string) =>
+    coordinatedTargetSellState.get(tokenMint) ?? { revision: 0, highestSlot: 0 };
+  const coordinatedSellRevisionFor = (tokenMint: string) =>
+    coordinatedSellStateFor(tokenMint).revision;
+  const observeCoordinatedTargetSell = (tokenMint: string, slot: number) => {
+    const current = coordinatedSellStateFor(tokenMint);
+    coordinatedTargetSellState.delete(tokenMint);
+    coordinatedTargetSellState.set(tokenMint, {
+      revision: current.revision + 1,
+      highestSlot: Math.max(current.highestSlot, Number.isSafeInteger(slot) ? slot : 0),
+    });
+    while (coordinatedTargetSellState.size > COORDINATED_SELL_REVISION_CAP) {
+      const oldest = coordinatedTargetSellState.keys().next();
+      if (oldest.done) break;
+      coordinatedTargetSellState.delete(oldest.value);
+    }
+  };
+  const coordinatedAuthorizationIsCurrent = (
+    tokenMint: string,
+    authorization: CoordinatedEntryAuthorization,
+    nowMs = Date.now(),
+  ) =>
+    exactCoordinatedAuthorizationIsCurrent(authorization, {
+      nowMs,
+      entriesEnabled: cfg.enabled === true,
+      configTransitioning: entryConfigTransitioning,
+      entryStrategy: automaticEntryStrategy(cfg),
+      targetScopeFingerprint: coordinatedTargetScopeFingerprint(),
+      configFingerprint: coordinatedEntryConfigFingerprint(cfg),
+      sellRevision: coordinatedSellRevisionFor(tokenMint),
+    });
+
+  function clearCoordinatedDeferredTimer(tokenMint: string): void {
+    const timer = coordinatedDeferredTimers.get(tokenMint);
+    if (timer) clearTimeout(timer);
+    coordinatedDeferredTimers.delete(tokenMint);
+  }
+
+  function cancelAllCoordinatedSignals(): void {
+    for (const timer of coordinatedDeferredTimers.values()) clearTimeout(timer);
+    coordinatedDeferredTimers.clear();
+    coordinatedResolutionAttempts.clear();
+    coordinatedFinalityWaits.clear();
+    coordinatedBuys.cancelAll();
+  }
   const supplyAccumulationStore = new SupplyAccumulationStore(db, cfg.user_id);
   const supplyAccumulationScaleStore = new SupplyAccumulationScaleStore(db, cfg.user_id);
   const freshTailEntryStore = createFreshTailEntryStore(db, cfg.user_id);
@@ -2375,6 +2510,8 @@ async function main() {
         Array.from(previousTargets).sort().join(",") !== Array.from(nextTargets).sort().join(",");
       const convictionConfigChanged = nextConvictionFingerprint !== convictionConfigFingerprint;
       const supplyConfigChanged = nextSupplyFingerprint !== supplyConfigFingerprint;
+      const coordinatedConfigChanged =
+        coordinatedEntryConfigFingerprint(cfg) !== coordinatedEntryConfigFingerprint(next);
       entryConfigTransitioning =
         previousEntryStrategy !== nextEntryStrategy ||
         (nextEntryStrategy === "conviction" && (targetsChanged || convictionConfigChanged)) ||
@@ -2386,6 +2523,14 @@ async function main() {
       // monitoring continue normally.
       if (convictionConfigChanged && nextEntryStrategy === "conviction") {
         await convictionRuntime.reconfigure(nextConvictionConfig);
+      }
+
+      if (
+        targetsChanged ||
+        coordinatedConfigChanged ||
+        previousEntryStrategy !== nextEntryStrategy
+      ) {
+        cancelAllCoordinatedSignals();
       }
 
       cfg = next;
@@ -3930,6 +4075,11 @@ async function main() {
           let supplyObservationError: unknown;
           let supplyObservationPromise: Promise<void> | undefined;
           if (targetWallets.has(event.wallet)) {
+            observeCoordinatedTargetSell(event.tokenMint, event.slot);
+            coordinatedBuys.onTargetSell(event.tokenMint);
+            clearCoordinatedDeferredTimer(event.tokenMint);
+            coordinatedResolutionAttempts.delete(event.tokenMint);
+            coordinatedFinalityWaits.delete(event.tokenMint);
             if (cfg.supply_accumulation_mode_enabled === true) {
               if (event.source === "geyser") {
                 // Register the mint tail synchronously before yielding the
@@ -6153,6 +6303,337 @@ async function main() {
     }
   }
 
+  const COORDINATED_SIGNAL_MAX_LIFETIME_MS = 5 * 60_000;
+  const COORDINATED_MARKET_DATA_MAX_AGE_MS = 15_000;
+  const COORDINATED_TRANSIENT_RETRY_MS = 5_000;
+  const COORDINATED_MAX_RESOLUTION_ATTEMPTS = 2;
+
+  function coordinatedSignalHardDeadline(coordination: ReadyCoordination): number {
+    return (
+      Math.max(...coordination.observations.map((observation) => observation.timestampMs)) +
+      COORDINATED_SIGNAL_MAX_LIFETIME_MS
+    );
+  }
+
+  function finishCoordinatedSignal(
+    event: SwapEvent,
+    coordination: ReadyCoordination,
+    reason: string,
+    meta?: TokenMeta,
+  ): void {
+    clearCoordinatedDeferredTimer(event.tokenMint);
+    coordinatedResolutionAttempts.delete(event.tokenMint);
+    coordinatedFinalityWaits.delete(event.tokenMint);
+    coordinatedBuys.commit(coordination.reservationId, Date.now());
+    recordStrategyDecision(event, "filtered", reason, {
+      market_cap_usd: meta?.marketCapUsd,
+      liquidity_usd: meta?.liquidityUsd,
+      metadata: {
+        entryMode: "coordinated",
+        marketDataSource: meta?.marketDataSource,
+        tokenAgeSource: meta?.tokenAgeSource,
+        tokenCreatedAtMs: meta?.tokenCreatedAtMs,
+        tokenAgeEvaluatedAtMs: meta?.tokenAgeEvaluatedAtMs,
+      },
+    });
+  }
+
+  function scheduleCoordinatedEvaluation(
+    event: SwapEvent,
+    coordination: ReadyCoordination,
+    deferredRetry: boolean,
+  ): void {
+    const scheduled = coordinatedEntryBackground.schedule(
+      `${event.tokenMint}:${coordination.reservationId}`,
+      async () => {
+        try {
+          await evaluateCoordinatedSignal(event, coordination);
+        } catch (err) {
+          finishCoordinatedSignal(
+            event,
+            coordination,
+            `coordinated${deferredRetry ? " deferred" : ""} evaluation failed closed: ${safeDiagnostic(err)}`,
+          );
+          log.error(
+            { err: safeDiagnostic(err), mint: event.tokenMint },
+            "coordinated background evaluation failed closed",
+          );
+        }
+      },
+    );
+    if (scheduled === "full") {
+      finishCoordinatedSignal(
+        event,
+        coordination,
+        "coordinated proof queue reached its safe bound",
+      );
+      log.warn(
+        { mint: event.tokenMint, queue: coordinatedEntryBackground.health() },
+        "coordinated proof queue full; signal failed closed",
+      );
+    }
+  }
+
+  function scheduleCoordinatedRetryTimer(event: SwapEvent, retryAtMs: number): void {
+    clearCoordinatedDeferredTimer(event.tokenMint);
+    const timer = setTimeout(
+      () => {
+        coordinatedDeferredTimers.delete(event.tokenMint);
+        const nowMs = Date.now();
+        const retried = coordinatedBuys.retry(
+          cfg,
+          event.tokenMint,
+          nowMs,
+          coordinatedTargetScopeFingerprint(),
+        );
+        if (!retried.ready) {
+          if (retried.retryAtMs !== undefined && retried.retryAtMs > nowMs) {
+            scheduleCoordinatedRetryTimer(event, retried.retryAtMs);
+            return;
+          }
+          coordinatedResolutionAttempts.delete(event.tokenMint);
+          coordinatedFinalityWaits.delete(event.tokenMint);
+          recordStrategyDecision(event, "filtered", retried.reason, {
+            metadata: { entryMode: "coordinated", deferredRetry: true },
+          });
+          return;
+        }
+        scheduleCoordinatedEvaluation(event, retried, true);
+      },
+      Math.max(1, retryAtMs - Date.now()),
+    );
+    timer.unref();
+    coordinatedDeferredTimers.set(event.tokenMint, timer);
+  }
+
+  function deferCoordinatedSignal(
+    event: SwapEvent,
+    coordination: ReadyCoordination,
+    delayMs: number,
+    reason: string,
+    meta?: TokenMeta,
+  ): boolean {
+    const nowMs = Date.now();
+    const expiresAtMs = coordinatedSignalHardDeadline(coordination);
+    const retryAtMs = nowMs + Math.max(1_000, Math.ceil(delayMs));
+    if (retryAtMs >= expiresAtMs) {
+      finishCoordinatedSignal(event, coordination, `${reason}; coordinated signal expired`, meta);
+      return false;
+    }
+    if (!coordinatedBuys.defer(coordination.reservationId, { retryAtMs, expiresAtMs }, nowMs)) {
+      coordinatedResolutionAttempts.delete(event.tokenMint);
+      coordinatedFinalityWaits.delete(event.tokenMint);
+      coordinatedBuys.cancelMint(event.tokenMint);
+      return false;
+    }
+
+    scheduleCoordinatedRetryTimer(event, retryAtMs);
+    recordStrategyDecision(event, "tracked", reason, {
+      market_cap_usd: meta?.marketCapUsd,
+      liquidity_usd: meta?.liquidityUsd,
+      metadata: {
+        entryMode: "coordinated",
+        deferred: true,
+        retryAtMs,
+        expiresAtMs,
+        marketDataSource: meta?.marketDataSource,
+        tokenAgeSource: meta?.tokenAgeSource,
+      },
+    });
+    return true;
+  }
+
+  async function evaluateCoordinatedSignal(
+    event: SwapEvent,
+    coordination: ReadyCoordination,
+  ): Promise<void> {
+    const nowMs = Date.now();
+    if (
+      !cfg.enabled ||
+      entryConfigTransitioning ||
+      automaticEntryStrategy(cfg) !== "coordinated" ||
+      !coordinatedBuys.isReservationActive(coordination.reservationId, nowMs)
+    ) {
+      coordinatedBuys.cancelMint(event.tokenMint);
+      clearCoordinatedDeferredTimer(event.tokenMint);
+      coordinatedResolutionAttempts.delete(event.tokenMint);
+      coordinatedFinalityWaits.delete(event.tokenMint);
+      return;
+    }
+    const currentTargets = new Set(configuredTargetWallets(cfg));
+    if (coordination.observations.some((observation) => !currentTargets.has(observation.wallet))) {
+      coordinatedBuys.cancelMint(event.tokenMint);
+      clearCoordinatedDeferredTimer(event.tokenMint);
+      coordinatedResolutionAttempts.delete(event.tokenMint);
+      coordinatedFinalityWaits.delete(event.tokenMint);
+      return;
+    }
+
+    const contributingSlots = coordination.observations.map((observation) => observation.slot);
+    const latestContributingSlot = Math.max(...contributingSlots);
+    if (
+      !coordinatedClusterHasNoInterveningTargetSell(
+        contributingSlots,
+        coordinatedSellStateFor(event.tokenMint).highestSlot,
+      )
+    ) {
+      coordinatedBuys.cancelMint(event.tokenMint);
+      clearCoordinatedDeferredTimer(event.tokenMint);
+      coordinatedResolutionAttempts.delete(event.tokenMint);
+      coordinatedFinalityWaits.delete(event.tokenMint);
+      recordStrategyDecision(
+        event,
+        "filtered",
+        "a target sell is ordered at or after the coordinated cluster began",
+        { metadata: { entryMode: "coordinated", targetSellBeforeEntry: true } },
+      );
+      return;
+    }
+
+    const attempt = (coordinatedResolutionAttempts.get(event.tokenMint) ?? 0) + 1;
+    let meta = await loadEntryTokenMeta(event.tokenMint, event.isPumpFun, latestContributingSlot);
+    let createProof: PumpFunCreationTimeProof | undefined;
+    let finalizedBuySignatures: string[] = [];
+    const requiresPumpProof = event.isPumpFun || meta.isPumpFun;
+    if (requiresPumpProof) {
+      const proofDeadlineMs = Math.min(
+        Date.now() + 12_000,
+        coordinatedSignalHardDeadline(coordination),
+      );
+      const resolution = await pumpFunCreationTimeResolver.resolve({
+        mint: event.tokenMint,
+        requiredFinalizedEvents: coordination.observations.map((observation) => ({
+          slot: observation.slot,
+          txSig: observation.txSig,
+        })),
+        deadlineMs: proofDeadlineMs,
+      });
+      if (!resolution.ok) {
+        if (coordinatedCreationFinalityIsPending(resolution)) {
+          const completedWaits = coordinatedFinalityWaits.get(event.tokenMint) ?? 0;
+          const finalityDelayMs = coordinatedFinalityRetryDelayMs(completedWaits);
+          if (finalityDelayMs !== null) {
+            coordinatedFinalityWaits.set(event.tokenMint, completedWaits + 1);
+            deferCoordinatedSignal(
+              event,
+              coordination,
+              finalityDelayMs,
+              `waiting for finalized coordinated buys: ${resolution.reason}`,
+              meta,
+            );
+            return;
+          }
+          finishCoordinatedSignal(
+            event,
+            coordination,
+            `finalized coordinated buys did not settle within the bounded retry schedule: ${resolution.reason}`,
+            meta,
+          );
+          return;
+        }
+        coordinatedResolutionAttempts.set(event.tokenMint, attempt);
+        const retryable =
+          resolution.retryable &&
+          resolution.code !== "signature_page_limit" &&
+          attempt < COORDINATED_MAX_RESOLUTION_ATTEMPTS;
+        if (retryable) {
+          deferCoordinatedSignal(
+            event,
+            coordination,
+            COORDINATED_TRANSIENT_RETRY_MS,
+            `finalized Pump age proof pending: ${resolution.reason}`,
+            meta,
+          );
+          return;
+        }
+        finishCoordinatedSignal(
+          event,
+          coordination,
+          `finalized Pump age proof unavailable: ${resolution.reason}`,
+          meta,
+        );
+        return;
+      }
+      coordinatedFinalityWaits.delete(event.tokenMint);
+      createProof = resolution.proof;
+      finalizedBuySignatures = resolution.finalizedEvents.map((proof) => proof.txSig).sort();
+      // Curve/Dex market data can move while an exhaustive creation proof is
+      // resolving. Reload it after the immutable proof so the entry gate uses
+      // a current market-cap snapshot.
+      meta = await loadEntryTokenMeta(event.tokenMint, true, latestContributingSlot);
+      meta = {
+        ...meta,
+        isPumpFun: true,
+        tokenCreatedAtMs: resolution.proof.blockTimeMs,
+        tokenAgeEvaluatedAtMs: resolution.evaluatedAtBlockTimeMs,
+        tokenAgeSource: "pump_finalized_create",
+      };
+    }
+
+    const marketDataObservedAtMs = Date.now();
+    const decision = checkCoordinatedEntry(cfg, meta, false, marketDataObservedAtMs);
+    if (!decision.pass) {
+      if (decision.code === "coin_too_young" && decision.retryAfterMs !== undefined) {
+        deferCoordinatedSignal(
+          event,
+          coordination,
+          decision.retryAfterMs + 1_500,
+          decision.reason,
+          meta,
+        );
+        return;
+      }
+      if (
+        (decision.code === "market_cap_unavailable" || decision.code === "coin_age_unavailable") &&
+        attempt < COORDINATED_MAX_RESOLUTION_ATTEMPTS
+      ) {
+        coordinatedResolutionAttempts.set(event.tokenMint, attempt);
+        deferCoordinatedSignal(
+          event,
+          coordination,
+          COORDINATED_TRANSIENT_RETRY_MS,
+          decision.reason,
+          meta,
+        );
+        return;
+      }
+      finishCoordinatedSignal(event, coordination, decision.reason, meta);
+      return;
+    }
+
+    const authorization: CoordinatedEntryAuthorization = {
+      expiresAtMs: coordinatedSignalHardDeadline(coordination),
+      marketDataExpiresAtMs: marketDataObservedAtMs + COORDINATED_MARKET_DATA_MAX_AGE_MS,
+      targetScopeFingerprint: coordinatedTargetScopeFingerprint(),
+      configFingerprint: coordinatedEntryConfigFingerprint(cfg),
+      sellRevision: coordinatedSellRevisionFor(event.tokenMint),
+      createProof,
+      finalizedBuySignatures,
+    };
+    if (
+      !coordinatedAuthorizationIsCurrent(event.tokenMint, authorization) ||
+      !coordinatedBuys.isReservationActive(coordination.reservationId, Date.now()) ||
+      !coordinatedBuys.commit(coordination.reservationId, Date.now())
+    ) {
+      coordinatedBuys.cancelMint(event.tokenMint);
+      clearCoordinatedDeferredTimer(event.tokenMint);
+      coordinatedResolutionAttempts.delete(event.tokenMint);
+      coordinatedFinalityWaits.delete(event.tokenMint);
+      return;
+    }
+    clearCoordinatedDeferredTimer(event.tokenMint);
+    coordinatedResolutionAttempts.delete(event.tokenMint);
+    coordinatedFinalityWaits.delete(event.tokenMint);
+    await tryCopyBuy(event, `coordinated ${coordination.observations.length}-wallet copy buy`, {
+      entryMode: "coordinated",
+      firstBuy: coordination.observations.every((observation) => observation.firstBuy),
+      targetBuyUsd: event.amountUsd,
+      coordinatedWallets: coordination.observations.map((observation) => observation.wallet),
+      coordinatedMeta: meta,
+      coordinatedAuthorization: authorization,
+    });
+  }
+
   async function processTargetBuy(
     event: SwapEvent,
     targetBuyUsd: number | undefined,
@@ -6218,7 +6699,11 @@ async function main() {
       slot: event.slot,
       decimals: event.decimals,
     };
-    const coordination = coordinatedBuys.record(cfg, observation);
+    const coordination = coordinatedBuys.record(
+      cfg,
+      observation,
+      coordinatedTargetScopeFingerprint(),
+    );
     if (!coordination.ready) {
       log.info(
         {
@@ -6245,12 +6730,10 @@ async function main() {
       return;
     }
 
-    await tryCopyBuy(event, `coordinated ${coordination.observations.length}-wallet copy buy`, {
-      entryMode: "coordinated",
-      firstBuy,
-      targetBuyUsd,
-      coordinatedWallets: coordination.observations.map((row) => row.wallet),
-    });
+    // Finalized proof resolution and any later execution run off the serial
+    // Geyser callback. A target sell can therefore arrive, bump the local
+    // fence, and revoke this signal while proof/RPC work is in flight.
+    scheduleCoordinatedEvaluation(event, coordination, false);
   }
 
   async function handleTransfer(ev: TransferEvent) {
@@ -6971,6 +7454,21 @@ async function main() {
     const expectedStrategy = copyBuyEntryStrategy(options);
     const freshTailEntry =
       expectedStrategy === "supply_accumulation" && options.freshTailCandidate !== undefined;
+    const coordinatedAuthorizationRequired =
+      expectedStrategy === "coordinated" && !env.REVIVAL_ONLY_MODE;
+    if (
+      coordinatedAuthorizationRequired &&
+      (!options.coordinatedAuthorization ||
+        !options.coordinatedMeta ||
+        !coordinatedAuthorizationIsCurrent(event.tokenMint, options.coordinatedAuthorization))
+    ) {
+      recordStrategyDecision(
+        event,
+        "skipped",
+        "coordinated entry proof expired or was revoked before queueing",
+      );
+      return null;
+    }
     if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy) {
       recordStrategyDecision(
         event,
@@ -7007,6 +7505,21 @@ async function main() {
     const expectedStrategy = copyBuyEntryStrategy(options);
     const freshTailEntry =
       expectedStrategy === "supply_accumulation" && options.freshTailCandidate !== undefined;
+    const coordinatedAuthorizationRequired =
+      expectedStrategy === "coordinated" && !env.REVIVAL_ONLY_MODE;
+    const coordinatedAuthorizationCurrent = () =>
+      !coordinatedAuthorizationRequired ||
+      (options.coordinatedAuthorization !== undefined &&
+        options.coordinatedMeta !== undefined &&
+        coordinatedAuthorizationIsCurrent(event.tokenMint, options.coordinatedAuthorization));
+    if (!coordinatedAuthorizationCurrent()) {
+      recordStrategyDecision(
+        event,
+        "skipped",
+        "coordinated entry proof expired or was revoked while queued",
+      );
+      return null;
+    }
     if (entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy) {
       log.info(
         { mint: event.tokenMint, expectedStrategy },
@@ -7101,7 +7614,7 @@ async function main() {
           isPumpFun: true,
           socials: {},
         }
-      : await loadTokenMeta(event.tokenMint);
+      : (options.coordinatedMeta ?? (await loadEntryTokenMeta(event.tokenMint, event.isPumpFun)));
 
     // Revival gate: only enter aged, dormant coins (a dead coin the target is
     // reviving), on the first signal. Applies only in revival-only mode.
@@ -7139,6 +7652,15 @@ async function main() {
         entryMode: options.entryMode,
         entryStrategy: expectedStrategy,
         pairCreatedAtMs: meta.pairCreatedAtMs,
+        tokenCreatedAtMs: meta.tokenCreatedAtMs,
+        tokenAgeEvaluatedAtMs: meta.tokenAgeEvaluatedAtMs,
+        tokenAgeSource: meta.tokenAgeSource,
+        marketDataSource: meta.marketDataSource,
+        creationProofTxSig: options.coordinatedAuthorization?.createProof?.txSig,
+        creationProofSlot: options.coordinatedAuthorization?.createProof?.slot,
+        creationProofBlockhash: options.coordinatedAuthorization?.createProof?.blockhash,
+        creationProofParserAbi: options.coordinatedAuthorization?.createProof?.parserAbi,
+        finalizedCoordinatedBuySignatures: options.coordinatedAuthorization?.finalizedBuySignatures,
         isPumpFun: meta.isPumpFun,
         firstBuy: options.firstBuy,
         marketDataObservedAtMs,
@@ -7161,7 +7683,7 @@ async function main() {
           ? ({ pass: true } as const)
           : ({ pass: false, reason: "supply accumulation state is not entry-ready" } as const)
       : options.entryMode === "coordinated"
-        ? checkCoordinatedEntry(cfg, meta, Boolean(prior), event.timestampMs)
+        ? checkCoordinatedEntry(cfg, meta, Boolean(prior), Date.now())
         : checkEntry(cfg, event, meta, { first: options.firstBuy, already: Boolean(prior) });
     if (!decision.pass) {
       log.info(
@@ -7349,6 +7871,15 @@ async function main() {
         );
         return null;
       }
+      if (!coordinatedAuthorizationCurrent()) {
+        recordStrategyDecision(
+          event,
+          "skipped",
+          "coordinated entry proof expired or was revoked before the durable claim",
+          metaPatch,
+        );
+        return null;
+      }
 
       const entryClaim = await claimEntrySubmission(
         event,
@@ -7405,19 +7936,29 @@ async function main() {
       const finalSubmissionGate = currentCopyBuyMonitoringGate(freshTailEntry);
       const strategyChangedAfterClaim =
         entryConfigTransitioning || automaticEntryStrategy(cfg) !== expectedStrategy;
-      if (!cfg.enabled || finalSubmissionGate.blocked || strategyChangedAfterClaim) {
+      const coordinatedAuthorizationChangedAfterClaim = !coordinatedAuthorizationCurrent();
+      if (
+        !cfg.enabled ||
+        finalSubmissionGate.blocked ||
+        strategyChangedAfterClaim ||
+        coordinatedAuthorizationChangedAfterClaim
+      ) {
         const gateReason = strategyChangedAfterClaim
           ? "automatic entry strategy changed after the durable claim"
-          : !cfg.enabled
-            ? "Entries turned off after the durable claim"
-            : `monitoring became unsafe after the durable claim: ${finalSubmissionGate.reasons.join("; ")}`;
+          : coordinatedAuthorizationChangedAfterClaim
+            ? "coordinated entry proof expired or was revoked after the durable claim"
+            : !cfg.enabled
+              ? "Entries turned off after the durable claim"
+              : `monitoring became unsafe after the durable claim: ${finalSubmissionGate.reasons.join("; ")}`;
         await updateEntryClaim(entryClaim.id, {
           status: "failed_pre_submit",
           error_code: strategyChangedAfterClaim
             ? "strategy-changed-after-claim"
-            : !cfg.enabled
-              ? "entries-disabled-after-claim"
-              : "monitoring-degraded-after-claim",
+            : coordinatedAuthorizationChangedAfterClaim
+              ? "coordinated-proof-revoked-after-claim"
+              : !cfg.enabled
+                ? "entries-disabled-after-claim"
+                : "monitoring-degraded-after-claim",
         });
         uncertainEntryMints.delete(event.tokenMint);
         recordStrategyDecision(event, "skipped", gateReason, metaPatch);
@@ -7486,6 +8027,7 @@ async function main() {
               cfg.enabled === true &&
               !entryConfigTransitioning &&
               automaticEntryStrategy(cfg) === expectedStrategy &&
+              coordinatedAuthorizationCurrent() &&
               !currentMonitoringGate().blocked;
             if (!genericGate) return false;
             if (!supplyEntry) return true;

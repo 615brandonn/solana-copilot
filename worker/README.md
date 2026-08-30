@@ -31,6 +31,7 @@ different transitive instruction builders.
 | `YELLOWSTONE_TOKEN`             | Helius API key (used as the gRPC auth token)                                                            |
 | `JUPITER_API_KEY`               | Paid Jupiter developer key for Price API v3 and the official Swap endpoint                              |
 | `PRICE_API_URL`                 | `https://api.jup.ag/price/v3`                                                                           |
+| `CURVE_PRICING_ENABLED`         | Reviewed Pump curve price/market-cap fallback; defaults to `true` and never supplies token age          |
 | `JITO_BLOCK_ENGINE_URL`         | e.g. `https://amsterdam.mainnet.block-engine.jito.wtf`                                                  |
 | `JITO_TIP_ACCOUNTS`             | CSV of the 8 Jito tip accounts (see Jito docs)                                                          |
 | `KEY_ENCRYPTION_KEY`            | Optional 32-byte AES key, base64. When set, it must match the dashboard server value                    |
