@@ -168,6 +168,14 @@ function uuid(value: unknown, field: string): string {
   return parsed;
 }
 
+function userUuid(value: unknown): string {
+  const parsed = text(value, "userId").toLowerCase();
+  // The production identity is a legacy nil UUID stored in PostgreSQL. Keep
+  // that compatibility exception scoped to user identity; evidence UUIDs
+  // continue through the strict RFC validator above.
+  return parsed === "00000000-0000-0000-0000-000000000000" ? parsed : uuid(parsed, "userId");
+}
+
 function base58Bytes(value: unknown, field: string, bytes: number): string {
   const parsed = text(value, field);
   try {
@@ -395,7 +403,7 @@ export function freshTailCandidateIsUsable(
 }
 
 export function createFreshTailEntryStore(client: FreshTailEntryDbClient, userId: string) {
-  const canonicalUserId = uuid(userId, "userId");
+  const canonicalUserId = userUuid(userId);
   const invoke = async (
     name: string,
     parameters: Record<string, unknown>,
