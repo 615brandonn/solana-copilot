@@ -6,12 +6,34 @@ import type { SwapEvent } from "./geyser.js";
 
 export type TokenMeta = {
   symbol?: string;
+  priceUsd?: number;
   marketCapUsd?: number;
   liquidityUsd?: number;
   volumeH24Usd?: number;
   pairCreatedAtMs?: number;
+  /** Exact Pump create time when a finalized on-chain proof was resolved. */
+  tokenCreatedAtMs?: number;
+  /** Finalized chain time at which tokenCreatedAtMs was evaluated. */
+  tokenAgeEvaluatedAtMs?: number;
+  tokenAgeSource?: "pump_finalized_create" | "dexscreener_pair";
+  marketDataSource?: "dexscreener" | "pumpfun_curve" | "unavailable";
   isPumpFun: boolean;
   socials: { website?: string; twitter?: string; telegram?: string };
+};
+
+export type CurvePriceSnapshot = {
+  complete: boolean;
+  marketCapUsd?: number;
+  priceUsd?: number;
+};
+
+export type TokenMetaCurveFallback = {
+  enabled: boolean;
+  /** Reviewed transaction decoder classification when Dex has no pair yet. */
+  pumpFunHint?: boolean;
+  /** Test/adapter seam; production defaults to loadTokenMeta. */
+  loadDex?: (mint: string) => Promise<TokenMeta>;
+  loadCurve: (mint: string) => Promise<CurvePriceSnapshot | null>;
 };
 
 function normalizedTimestampMs(value: unknown): number | undefined {
@@ -35,7 +57,12 @@ export async function loadTokenMeta(mint: string): Promise<TokenMeta> {
     const j = (await r.json()) as any;
     const pairs = Array.isArray(j?.pairs) ? j.pairs : [];
     const pair = pairs[0];
-    if (!pair) return { isPumpFun: mint.endsWith("pump"), socials: {} };
+    if (!pair)
+      return {
+        isPumpFun: mint.endsWith("pump"),
+        socials: {},
+        marketDataSource: "unavailable",
+      };
     const pairCreatedAtValues = pairs
       .map((candidate: any) => normalizedTimestampMs(candidate?.pairCreatedAt))
       .filter((timestamp: number | undefined): timestamp is number => timestamp !== undefined);
@@ -55,6 +82,8 @@ export async function loadTokenMeta(mint: string): Promise<TokenMeta> {
       volumeH24Usd: finiteNumber(pair?.volume?.h24),
       pairCreatedAtMs:
         pairCreatedAtValues.length > 0 ? Math.min(...pairCreatedAtValues) : undefined,
+      tokenAgeSource: pairCreatedAtValues.length > 0 ? ("dexscreener_pair" as const) : undefined,
+      marketDataSource: "dexscreener",
       isPumpFun: (pair?.dexId ?? "").toLowerCase() === "pumpfun" || mint.endsWith("pump"),
       socials: {
         website: pair?.info?.websites?.[0]?.url,
@@ -63,8 +92,53 @@ export async function loadTokenMeta(mint: string): Promise<TokenMeta> {
       },
     };
   } catch {
-    return { isPumpFun: mint.endsWith("pump"), socials: {} };
+    return {
+      isPumpFun: mint.endsWith("pump"),
+      socials: {},
+      marketDataSource: "unavailable",
+    };
   }
+}
+
+/**
+ * Preserves DexScreener metadata and fills only missing Pump price/market-cap
+ * fields from the reviewed on-chain bonding-curve decoder. The curve is never
+ * treated as a creation-time source; age must come from DexScreener or an exact
+ * finalized Pump Create proof.
+ */
+export async function loadTokenMetaWithCurveFallback(
+  mint: string,
+  fallback: TokenMetaCurveFallback,
+): Promise<TokenMeta> {
+  const dex = await (fallback.loadDex ?? loadTokenMeta)(mint);
+  const isPumpFun = dex.isPumpFun || fallback.pumpFunHint === true;
+  if (!fallback.enabled || dex.marketCapUsd !== undefined || !isPumpFun) return dex;
+
+  let curve: CurvePriceSnapshot | null;
+  try {
+    curve = await fallback.loadCurve(mint);
+  } catch {
+    return dex;
+  }
+  if (
+    !curve ||
+    curve.complete ||
+    curve.marketCapUsd === undefined ||
+    !Number.isFinite(curve.marketCapUsd) ||
+    curve.marketCapUsd <= 0
+  ) {
+    return dex;
+  }
+  return {
+    ...dex,
+    priceUsd:
+      curve.priceUsd !== undefined && Number.isFinite(curve.priceUsd) && curve.priceUsd > 0
+        ? curve.priceUsd
+        : undefined,
+    marketCapUsd: curve.marketCapUsd,
+    marketDataSource: "pumpfun_curve",
+    isPumpFun: true,
+  };
 }
 
 export type FilterDecision = { pass: true } | { pass: false; reason: string };

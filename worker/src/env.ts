@@ -23,6 +23,14 @@ const Env = z.object({
   PRICE_API_URL: z.string().url().default("https://api.jup.ag/price/v3"),
   JUPITER_API_KEY: z.string().min(1).optional(),
 
+  // Reviewed Pump bonding-curve pricing fills only missing Dex market cap and
+  // price fields. It never supplies token age; coordinated age is separately
+  // proven from finalized Pump Create history.
+  CURVE_PRICING_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true" || v === "1"),
+
   // DFlow aggregator (the venue Alien fills through). When DFLOW_ENABLED is
   // true the executor tries DFlow FIRST and falls back to the full Jupiter →
   // Pump.fun chain on any failure, so leaving it off changes nothing. The

@@ -1536,6 +1536,19 @@ async function main() {
   } else {
     pass("Legacy REVIVAL_ONLY_MODE", "OFF — Revival Campaign collection remains observation-only");
   }
+  if (cfg.coordinated_mode_enabled === true) {
+    if (env.CURVE_PRICING_ENABLED) {
+      pass(
+        "Coordinated Pump metadata fallback",
+        "ON — reviewed curve pricing is separate from finalized on-chain creation-time proof",
+      );
+    } else {
+      warn(
+        "Coordinated Pump metadata fallback",
+        "OFF — curve-only Pump candidates remain fail-closed when Dex market cap is unavailable",
+      );
+    }
+  }
   if (!(await checkRevivalTrackerSchema(cfg))) return;
   if (!(await checkSupplyAccumulationSchema(cfg, targets.length))) return;
 
@@ -1657,6 +1670,8 @@ async function main() {
       cfg.coordinated_coin_age_min_minutes,
       cfg.coordinated_coin_age_max_minutes,
     ],
+    finalized_pump_creation_age_required: true,
+    reviewed_curve_pricing_enabled: env.CURVE_PRICING_ENABLED,
     coordinated_target_buy_range_usd: [
       cfg.coordinated_target_buy_min_usd,
       cfg.coordinated_target_buy_max_usd,
