@@ -7,6 +7,7 @@ import {
 } from "./fresh-tail-exit-store.js";
 
 const USER = "00000000-0000-4000-8000-000000000001";
+const NIL_USER = "00000000-0000-0000-0000-000000000000";
 const INTENT = "00000000-0000-4000-8000-000000000002";
 const TOKEN = "00000000-0000-4000-8000-000000000003";
 const ENTRY = "00000000-0000-4000-8000-000000000004";
@@ -47,6 +48,40 @@ function row(status: "claimed" | "uncertain" = "claimed") {
     priorErrorCode: null,
   };
 }
+
+test("passes a legacy nil PostgreSQL user UUID through unchanged", async () => {
+  let parameters: Record<string, unknown> | undefined;
+  const store = createFreshTailExitStore(
+    {
+      rpc: (_name, args) => {
+        parameters = args;
+        return Promise.resolve({ data: { ok: true, reason: "claimed", intents: [] }, error: null });
+      },
+    },
+    NIL_USER,
+    "worker-1",
+  );
+  assert.deepEqual(await store.claim(1, 180), []);
+  assert.deepEqual(parameters, {
+    p_user_id: NIL_USER,
+    p_worker_id: "worker-1",
+    p_limit: 1,
+    p_claim_seconds: 180,
+  });
+  assert.throws(
+    () =>
+      createFreshTailExitStore(
+        { rpc: () => Promise.resolve({ data: null, error: null }) },
+        `${NIL_USER}0`,
+        "worker-1",
+      ),
+    /fresh-tail exit userId is not a UUID/,
+  );
+  assert.throws(
+    () => parseFreshTailExitIntent({ ...row(), intentId: NIL_USER }),
+    /fresh-tail exit intentId is not a UUID/,
+  );
+});
 
 test("fresh-tail exit parser preserves exact raw values and rejects unsigned uncertainty", () => {
   assert.equal(parseFreshTailExitIntent(row()).amountRaw, "900719925474099312345");

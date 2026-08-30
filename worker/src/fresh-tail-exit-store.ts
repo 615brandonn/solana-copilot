@@ -91,6 +91,14 @@ function uuid(value: unknown, field: string): string {
   return parsed;
 }
 
+function userUuid(value: unknown): string {
+  const parsed = text(value, "userId").toLowerCase();
+  // The production identity is a legacy nil UUID stored in PostgreSQL. Keep
+  // that compatibility exception scoped to user identity; evidence UUIDs
+  // continue through the strict RFC validator above.
+  return parsed === "00000000-0000-0000-0000-000000000000" ? parsed : uuid(parsed, "userId");
+}
+
 function publicKey(value: unknown, field: string): string {
   try {
     return new PublicKey(text(value, field)).toBase58();
@@ -195,7 +203,7 @@ export function createFreshTailExitStore(
   userId: string,
   workerId: string,
 ) {
-  const canonicalUserId = uuid(userId, "userId");
+  const canonicalUserId = userUuid(userId);
   const canonicalWorkerId = text(workerId, "workerId");
   const invoke = async (name: string, parameters: Record<string, unknown>) => {
     const response = await client.rpc(name, parameters);

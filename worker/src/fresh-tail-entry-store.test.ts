@@ -11,6 +11,7 @@ import {
 } from "./fresh-tail-entry-store.js";
 
 const USER_ID = "11111111-1111-4111-8111-111111111111";
+const NIL_USER_ID = "00000000-0000-0000-0000-000000000000";
 const EPOCH_ID = "22222222-2222-4222-8222-222222222222";
 const REQUEST_ID = "33333333-3333-4333-8333-333333333333";
 const CLAIM_ID = "44444444-4444-4444-8444-444444444444";
@@ -99,6 +100,33 @@ function fakeClient(
     },
   };
 }
+
+test("passes a legacy nil PostgreSQL user UUID through unchanged", async () => {
+  let parameters: Record<string, unknown> | undefined;
+  const store = createFreshTailEntryStore(
+    fakeClient((_name, args) => {
+      parameters = args;
+      return { ok: true, reason: "loaded", candidates: [] };
+    }),
+    NIL_USER_ID,
+  );
+  assert.deepEqual(await store.loadCandidates(1), []);
+  assert.deepEqual(parameters, { p_user_id: NIL_USER_ID, p_limit: 1 });
+  assert.throws(
+    () => createFreshTailEntryStore(fakeClient(() => null), `${NIL_USER_ID}0`),
+    /fresh-tail userId is not a UUID/,
+  );
+
+  const strictEvidenceStore = createFreshTailEntryStore(
+    fakeClient(() => ({
+      ok: true,
+      reason: "loaded",
+      candidates: [candidate({ epochId: NIL_USER_ID })],
+    })),
+    USER_ID,
+  );
+  await assert.rejects(strictEvidenceStore.loadCandidates(1), /fresh-tail epochId is not a UUID/);
+});
 
 test("loads only a pinned, internally consistent fresh custody certificate", async () => {
   let parameters: Record<string, unknown> | undefined;
